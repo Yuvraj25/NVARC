@@ -27,8 +27,9 @@ def local_worker(rank, queue, end_time):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--end-time", type=float, default=0.0)
+    parser.add_argument("--end-time", type=float, default=None)
     args = parser.parse_args()
+    end_time = args.end_time if args.end_time is not None else time.time() + 12 * 3600
 
     rerun_mode = True
     if rerun_mode:
@@ -47,4 +48,4 @@ if __name__ == "__main__":
     for _ in range(4):
         queue.put(None)
 
-    mp.spawn(local_worker, args=(queue, args.end_time), nprocs=4)
+    mp.spawn(local_worker, args=(queue, end_time), nprocs=4)

@@ -1,3 +1,4 @@
+import copy
 from dataclasses import dataclass
 
 import torch
@@ -108,10 +109,14 @@ class PrefixCachedRescorer:
         suffix_input = torch.tensor([answer_tokens[:-1]], device=self.model.device, dtype=torch.long)
         prefix_len = len(entry.query_tokens)
         position_ids = torch.arange(prefix_len, prefix_len + suffix_input.size(1), device=self.model.device, dtype=torch.long).unsqueeze(0)
+        # Some Transformers cache implementations are mutable and get extended
+        # even when we only want to score a fixed suffix. Clone the cached
+        # prefix state so different candidates do not contaminate each other.
+        past_key_values = copy.deepcopy(entry.past_key_values)
         outputs = self.model(
             input_ids=suffix_input,
             position_ids=position_ids,
-            past_key_values=entry.past_key_values,
+            past_key_values=past_key_values,
             return_dict=True,
             use_cache=False,
         )
