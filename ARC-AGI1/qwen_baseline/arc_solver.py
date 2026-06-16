@@ -1,5 +1,6 @@
 import bz2
 import gc
+import hashlib
 import io
 import logging
 import os
@@ -62,6 +63,11 @@ class QwenDataCollatorForCompletionOnlyLM(DataCollatorForLanguageModeling):
                     end += 1
                     batch["labels"][i, start:end] = labels[start:end]
         return batch
+
+
+def stable_seed_from_key(key: str) -> int:
+    digest = hashlib.blake2b(key.encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(digest, "big") % (1024**2)
 
 
 def worker(rank, queue, end_time):
@@ -253,7 +259,7 @@ def worker(rank, queue, end_time):
                             base_key=bk,
                             max_seq_length=max_seq_length,
                             max_new_tokens=max_new_tokens,
-                            seed=hash(bk) % 1024**2,
+                            seed=stable_seed_from_key(bk),
                         )
 
                     for beam_score, beam_tokens in scored_beams:
