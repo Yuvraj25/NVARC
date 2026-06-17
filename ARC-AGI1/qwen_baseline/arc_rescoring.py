@@ -46,6 +46,12 @@ class PrefixCacheEntry:
     past_key_values: object
 
 
+@dataclass
+class FullPassEntry:
+    key: str
+    query_text: str
+
+
 class BaseRescorer:
     def __init__(self, model, tokenizer, formatter: QwenFormatter, puzzle_ds_multi: ArcDataset, base_key: str, max_seq_length: int, max_new_tokens: int, seed: int):
         self.model = model
@@ -56,9 +62,8 @@ class BaseRescorer:
         self.max_seq_length = max_seq_length
         self.max_new_tokens = max_new_tokens
         self.seed = seed
-        self.entries = self._build_entries()
 
-    def _build_entries(self):
+    def _build_template(self):
         template = ArcDataset(
             keys=[self.base_key],
             queries={self.base_key: self.puzzle_ds_multi.queries.get(self.base_key)},
@@ -70,9 +75,48 @@ class BaseRescorer:
             name="input",
             max_len=self.max_seq_length - self.max_new_tokens,
         )
+        return template
 
+
+class FullPassRescorer(BaseRescorer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.entries = self._build_entries()
+
+    def _build_entries(self):
         entries = []
-        for sample in template.as_list(self.formatter):
+        for sample in self._build_template().as_list(self.formatter):
+            entries.append(
+                FullPassEntry(
+                    key=sample["key"],
+                    query_text=sample["input"],
+                )
+            )
+        return entries
+
+    @torch.no_grad()
+    def score_solution(self, solution):
+        queries = []
+        answers = []
+        solution_list = solution.tolist()
+        for entry in self.entries:
+            augmented_solution = ArcDataset.forward_mod(solution_list, entry.key)
+            queries.append(entry.query_text)
+            answers.append(self.formatter.fmt_reply([augmented_solution]))
+        scores = []
+        for offset in range(0, len(queries), 4):
+            scores.extend(calc_scores(queries[offset : offset + 4], answers[offset : offset + 4], tokenizer=self.tokenizer, model=self.model))
+        return scores
+
+
+class PrefixCachedRescorer(BaseRescorer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.entries = self._build_entries()
+
+    def _build_entries(self):
+        entries = []
+        for sample in self._build_template().as_list(self.formatter):
             query_tokens = self.tokenizer.encode(sample["input"])
             input_ids = torch.tensor([query_tokens], device=self.model.device, dtype=torch.long)
             outputs = self.model(input_ids=input_ids, return_dict=True, use_cache=True)
@@ -86,22 +130,6 @@ class BaseRescorer:
                 )
             )
         return entries
-
-
-class FullPassRescorer(BaseRescorer):
-    @torch.no_grad()
-    def score_solution(self, solution):
-        queries = []
-        answers = []
-        solution_list = solution.tolist()
-        for entry in self.entries:
-            augmented_solution = ArcDataset.forward_mod(solution_list, entry.key)
-            queries.append(entry.query_text)
-            answers.append(self.formatter.fmt_reply([augmented_solution]))
-        return calc_scores(queries, answers, tokenizer=self.tokenizer, model=self.model)
-
-
-class PrefixCachedRescorer(BaseRescorer):
 
     @torch.no_grad()
     def score_solution(self, solution):
