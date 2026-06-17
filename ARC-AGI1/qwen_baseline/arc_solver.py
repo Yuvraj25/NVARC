@@ -39,6 +39,9 @@ def runtime_config():
         "use_prefix_cached_rescoring": _env_flag("ARC_USE_PREFIX_CACHED_RESCORING", default=False),
         "use_speculative_dfs": _env_flag("ARC_USE_SPECULATIVE_DFS", default=False),
         "dfs_prob_threshold": dfs_prob_threshold,
+        "model_path": os.environ.get("ARC_MODEL_PATH", "../input/qwen3_4b_grids15_sft139/"),
+        "test_path": os.environ.get("ARC_TEST_PATH", "../input/arc-prize-2024/arc-agi_evaluation_challenges.json"),
+        "output_dir": os.environ.get("ARC_OUTPUT_DIR", "../inference_outputs"),
     }
 
 
@@ -135,7 +138,7 @@ def worker(rank, queue, end_time):
     max_seq_length = 8192
 
     model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name="../input/qwen3_4b_grids15_sft139/",
+        model_name=config["model_path"],
         full_finetuning=False,
         load_in_4bit=False,
         local_files_only=True,
@@ -165,13 +168,8 @@ def worker(rank, queue, end_time):
         f"speculative_dfs={config['use_speculative_dfs']} dfs_prob_threshold={config['dfs_prob_threshold']}"
     )
 
-    if rerun_mode:
-        test_path = "../input/arc-prize-2024/arc-agi_evaluation_challenges.json"
-    else:
-        test_path = "../input/arc-prize-2024/arc-agi_evaluation_challenges.json"
-
-    arc_test_set = ArcDataset.from_file(test_path)
-    dir_outputs = "../inference_outputs"
+    arc_test_set = ArcDataset.from_file(config["test_path"])
+    dir_outputs = config["output_dir"]
     os.makedirs(dir_outputs, exist_ok=True)
 
     while not queue.empty():
