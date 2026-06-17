@@ -18,10 +18,28 @@ from transformers import DataCollatorForLanguageModeling
 from unsloth import FastLanguageModel, UnslothTrainer, UnslothTrainingArguments
 
 from arc_loader import ArcDataset, QwenFormatter
-from arc_rescoring import PrefixCachedRescorer
+from arc_rescoring import FullPassRescorer, PrefixCachedRescorer
 from arc_search import ASSISTANT_TOKEN_ID, EOS_ID, USER_TOKEN_ID, default_max_score, inference_turbo_dfs
 
 logging.disable(logging.WARNING)
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def runtime_config():
+    dfs_prob_threshold = float(os.environ.get("ARC_DFS_PROB_THRESHOLD", "0.2"))
+    if not 0.0 < dfs_prob_threshold < 1.0:
+        raise ValueError(f"ARC_DFS_PROB_THRESHOLD must be in (0, 1), got {dfs_prob_threshold}")
+    return {
+        "use_prefix_cached_rescoring": _env_flag("ARC_USE_PREFIX_CACHED_RESCORING", default=False),
+        "use_speculative_dfs": _env_flag("ARC_USE_SPECULATIVE_DFS", default=False),
+        "dfs_prob_threshold": dfs_prob_threshold,
+    }
 
 
 class UnslothFixedTrainer(UnslothTrainer):
@@ -71,6 +89,10 @@ def stable_seed_from_key(key: str) -> int:
 
 
 def worker(rank, queue, end_time):
+    config = runtime_config()
+    if config["use_speculative_dfs"]:
+        raise NotImplementedError("Speculative DFS is feature-flagged but not implemented yet")
+
     rerun_mode = True
 
     peft_params = dict(
@@ -136,7 +158,12 @@ def worker(rank, queue, end_time):
 
     formatter = QwenFormatter(tokenizer=tokenizer)
     max_new_tokens = formatter.max_new_tokens()
-    max_score = default_max_score()
+    max_score = default_max_score(config["dfs_prob_threshold"])
+    rescoring_cls = PrefixCachedRescorer if config["use_prefix_cached_rescoring"] else FullPassRescorer
+    print(
+        f"[Rank {rank}] config: prefix_cached_rescoring={config['use_prefix_cached_rescoring']} "
+        f"speculative_dfs={config['use_speculative_dfs']} dfs_prob_threshold={config['dfs_prob_threshold']}"
+    )
 
     if rerun_mode:
         test_path = "../input/arc-prize-2024/arc-agi_evaluation_challenges.json"
@@ -251,7 +278,7 @@ def worker(rank, queue, end_time):
                     decoded_result = []
 
                     if bk not in rescorers:
-                        rescorers[bk] = PrefixCachedRescorer(
+                        rescorers[bk] = rescoring_cls(
                             model=model,
                             tokenizer=tokenizer,
                             formatter=formatter,

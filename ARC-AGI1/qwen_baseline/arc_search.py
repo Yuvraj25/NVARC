@@ -1,4 +1,5 @@
 from collections import defaultdict
+import os
 import time
 
 import numpy as np
@@ -25,6 +26,45 @@ USER_TOKEN_ID = 11
 ASSISTANT_TOKEN_ID = 12
 PAD_ID = 13
 EOS_ID = 15
+ASSERT_IMMUTABLE_DFS_CACHE = os.environ.get("ARC_ASSERT_IMMUTABLE_DFS_CACHE") == "1"
+
+
+def _iter_cache_tensors(cache):
+    if cache is None:
+        return
+    if isinstance(cache, torch.Tensor):
+        yield cache
+        return
+    if isinstance(cache, (tuple, list)):
+        for item in cache:
+            yield from _iter_cache_tensors(item)
+        return
+    if hasattr(cache, "layers"):
+        for layer in cache.layers:
+            yield from _iter_cache_tensors(layer)
+        return
+    for attr in ("keys", "values", "key_cache", "value_cache"):
+        if hasattr(cache, attr):
+            yield from _iter_cache_tensors(getattr(cache, attr))
+
+
+def _cache_fingerprint(cache):
+    fp = []
+    for tensor in _iter_cache_tensors(cache):
+        if tensor is None:
+            continue
+        item = (
+            tuple(tensor.shape),
+            tuple(tensor.stride()),
+            str(tensor.dtype),
+            str(tensor.device),
+            tensor.data_ptr(),
+        )
+        if tensor.numel() > 0:
+            sample = tensor.reshape(-1)[: min(8, tensor.numel())].detach().float().cpu()
+            item = item + (tuple(sample.tolist()),)
+        fp.append(item)
+    return tuple(fp)
 
 
 def turbo_dfs(model, logits, max_new_tokens, max_score, scores, pos, cache, start_time, end_time) -> dict:
@@ -65,6 +105,8 @@ def turbo_dfs(model, logits, max_new_tokens, max_score, scores, pos, cache, star
         if num_alive_beams == 0:
             break
 
+        cache_fp = _cache_fingerprint(cache) if ASSERT_IMMUTABLE_DFS_CACHE else None
+
         outputs = model(
             input_ids=torch.tensor(batch_tokens, device=model.device, dtype=torch.long).view(-1, 1),
             position_ids=torch.full((n, 1), pos, device=model.device),
@@ -72,6 +114,10 @@ def turbo_dfs(model, logits, max_new_tokens, max_score, scores, pos, cache, star
             return_dict=True,
             use_cache=True,
         )
+
+        if ASSERT_IMMUTABLE_DFS_CACHE:
+            updated_fp = _cache_fingerprint(cache)
+            assert updated_fp == cache_fp, "DFS input cache mutated in-place across sibling branch expansion"
 
         next_suffixes = turbo_dfs(
             model,
@@ -114,5 +160,5 @@ def inference_turbo_dfs(model, prefix_tokens, max_new_tokens, max_score, end_tim
     return result
 
 
-def default_max_score():
-    return -np.log(0.2)
+def default_max_score(prob_threshold=0.2):
+    return -np.log(prob_threshold)

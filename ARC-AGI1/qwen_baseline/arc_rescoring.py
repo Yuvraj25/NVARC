@@ -46,7 +46,7 @@ class PrefixCacheEntry:
     past_key_values: object
 
 
-class PrefixCachedRescorer:
+class BaseRescorer:
     def __init__(self, model, tokenizer, formatter: QwenFormatter, puzzle_ds_multi: ArcDataset, base_key: str, max_seq_length: int, max_new_tokens: int, seed: int):
         self.model = model
         self.tokenizer = tokenizer
@@ -86,6 +86,22 @@ class PrefixCachedRescorer:
                 )
             )
         return entries
+
+
+class FullPassRescorer(BaseRescorer):
+    @torch.no_grad()
+    def score_solution(self, solution):
+        queries = []
+        answers = []
+        solution_list = solution.tolist()
+        for entry in self.entries:
+            augmented_solution = ArcDataset.forward_mod(solution_list, entry.key)
+            queries.append(entry.query_text)
+            answers.append(self.formatter.fmt_reply([augmented_solution]))
+        return calc_scores(queries, answers, tokenizer=self.tokenizer, model=self.model)
+
+
+class PrefixCachedRescorer(BaseRescorer):
 
     @torch.no_grad()
     def score_solution(self, solution):

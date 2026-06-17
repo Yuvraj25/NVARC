@@ -28,8 +28,20 @@ def local_worker(rank, queue, end_time):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--end-time", type=float, default=None)
+    parser.add_argument("--use-prefix-cached-rescoring", action="store_true")
+    parser.add_argument("--use-speculative-dfs", action="store_true")
+    parser.add_argument("--dfs-prob-threshold", type=float, default=0.2)
     args = parser.parse_args()
     end_time = args.end_time if args.end_time is not None else time.time() + 12 * 3600
+    os.environ["ARC_USE_PREFIX_CACHED_RESCORING"] = "1" if args.use_prefix_cached_rescoring else "0"
+    os.environ["ARC_USE_SPECULATIVE_DFS"] = "1" if args.use_speculative_dfs else "0"
+    os.environ["ARC_DFS_PROB_THRESHOLD"] = str(args.dfs_prob_threshold)
+    print(
+        "runtime flags:",
+        f"prefix_cached_rescoring={os.environ['ARC_USE_PREFIX_CACHED_RESCORING']}",
+        f"speculative_dfs={os.environ['ARC_USE_SPECULATIVE_DFS']}",
+        f"dfs_prob_threshold={os.environ['ARC_DFS_PROB_THRESHOLD']}",
+    )
 
     rerun_mode = True
     if rerun_mode:
