@@ -55,11 +55,13 @@ if __name__ == "__main__":
     parser.add_argument("--use-prefix-cached-rescoring", action="store_true")
     parser.add_argument("--use-speculative-dfs", action="store_true")
     parser.add_argument("--dfs-prob-threshold", type=float, default=0.2)
+    parser.add_argument("--profile-timings", action="store_true")
     args = parser.parse_args()
     end_time = args.end_time if args.end_time is not None else time.time() + 12 * 3600
     os.environ["ARC_USE_PREFIX_CACHED_RESCORING"] = "1" if args.use_prefix_cached_rescoring else "0"
     os.environ["ARC_USE_SPECULATIVE_DFS"] = "1" if args.use_speculative_dfs else "0"
     os.environ["ARC_DFS_PROB_THRESHOLD"] = str(args.dfs_prob_threshold)
+    os.environ["ARC_PROFILE_TIMINGS"] = "1" if args.profile_timings else "0"
     os.environ["ARC_TEST_PATH"] = args.test_path
     os.environ["ARC_MODEL_PATH"] = args.model_path
     os.environ["ARC_OUTPUT_DIR"] = args.output_dir
@@ -68,6 +70,7 @@ if __name__ == "__main__":
         f"prefix_cached_rescoring={os.environ['ARC_USE_PREFIX_CACHED_RESCORING']}",
         f"speculative_dfs={os.environ['ARC_USE_SPECULATIVE_DFS']}",
         f"dfs_prob_threshold={os.environ['ARC_DFS_PROB_THRESHOLD']}",
+        f"profile_timings={os.environ['ARC_PROFILE_TIMINGS']}",
         f"test_path={os.environ['ARC_TEST_PATH']}",
         f"model_path={os.environ['ARC_MODEL_PATH']}",
         f"output_dir={os.environ['ARC_OUTPUT_DIR']}",

@@ -1,4 +1,5 @@
 import copy
+import time
 from dataclasses import dataclass
 
 import torch
@@ -62,6 +63,14 @@ class BaseRescorer:
         self.max_seq_length = max_seq_length
         self.max_new_tokens = max_new_tokens
         self.seed = seed
+        self.stats = {
+            "score_calls": 0,
+            "score_time_s": 0.0,
+            "answers_scored": 0,
+            "answer_tokens": 0,
+            "query_tokens": 0,
+            "prefix_build_time_s": 0.0,
+        }
 
     def _build_template(self):
         template = ArcDataset(
@@ -76,6 +85,22 @@ class BaseRescorer:
             max_len=self.max_seq_length - self.max_new_tokens,
         )
         return template
+
+    def format_stats(self):
+        stats = self.stats
+        avg_answer_tokens = stats["answer_tokens"] / stats["answers_scored"] if stats["answers_scored"] else 0.0
+        avg_query_tokens = stats["query_tokens"] / stats["answers_scored"] if stats["answers_scored"] else 0.0
+        avg_score_ms = 1000.0 * stats["score_time_s"] / stats["score_calls"] if stats["score_calls"] else 0.0
+        return (
+            f"{self.__class__.__name__}(base_key={self.base_key}, "
+            f"prefix_build_time_s={stats['prefix_build_time_s']:.3f}, "
+            f"score_calls={stats['score_calls']}, "
+            f"answers_scored={stats['answers_scored']}, "
+            f"score_time_s={stats['score_time_s']:.3f}, "
+            f"avg_score_ms={avg_score_ms:.1f}, "
+            f"avg_query_tokens={avg_query_tokens:.1f}, "
+            f"avg_answer_tokens={avg_answer_tokens:.1f})"
+        )
 
 
 class FullPassRescorer(BaseRescorer):
@@ -96,6 +121,7 @@ class FullPassRescorer(BaseRescorer):
 
     @torch.no_grad()
     def score_solution(self, solution):
+        started_at = time.perf_counter()
         queries = []
         answers = []
         solution_list = solution.tolist()
@@ -106,6 +132,12 @@ class FullPassRescorer(BaseRescorer):
         scores = []
         for offset in range(0, len(queries), 4):
             scores.extend(calc_scores(queries[offset : offset + 4], answers[offset : offset + 4], tokenizer=self.tokenizer, model=self.model))
+        elapsed = time.perf_counter() - started_at
+        self.stats["score_calls"] += 1
+        self.stats["score_time_s"] += elapsed
+        self.stats["answers_scored"] += len(answers)
+        self.stats["query_tokens"] += sum(len(self.tokenizer.encode(query)) for query in queries)
+        self.stats["answer_tokens"] += sum(len(self.tokenizer.encode(answer)) for answer in answers)
         return scores
 
 
@@ -115,6 +147,7 @@ class PrefixCachedRescorer(BaseRescorer):
         self.entries = self._build_entries()
 
     def _build_entries(self):
+        started_at = time.perf_counter()
         entries = []
         for sample in self._build_template().as_list(self.formatter):
             query_tokens = self.tokenizer.encode(sample["input"])
@@ -129,17 +162,27 @@ class PrefixCachedRescorer(BaseRescorer):
                     past_key_values=outputs.past_key_values,
                 )
             )
+        self.stats["prefix_build_time_s"] += time.perf_counter() - started_at
         return entries
 
     @torch.no_grad()
     def score_solution(self, solution):
+        started_at = time.perf_counter()
         scores = []
         solution_list = solution.tolist()
+        total_answer_tokens = 0
         for entry in self.entries:
             augmented_solution = ArcDataset.forward_mod(solution_list, entry.key)
             answer_text = self.formatter.fmt_reply([augmented_solution])
             answer_tokens = self.tokenizer.encode(answer_text)
+            total_answer_tokens += len(answer_tokens)
             scores.append(self._score_answer_tokens(entry, answer_tokens))
+        elapsed = time.perf_counter() - started_at
+        self.stats["score_calls"] += 1
+        self.stats["score_time_s"] += elapsed
+        self.stats["answers_scored"] += len(self.entries)
+        self.stats["query_tokens"] += sum(len(entry.query_tokens) for entry in self.entries)
+        self.stats["answer_tokens"] += total_answer_tokens
         return scores
 
     def _score_answer_tokens(self, entry: PrefixCacheEntry, answer_tokens: list[int]):

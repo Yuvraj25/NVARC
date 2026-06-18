@@ -38,6 +38,7 @@ def runtime_config():
     return {
         "use_prefix_cached_rescoring": _env_flag("ARC_USE_PREFIX_CACHED_RESCORING", default=False),
         "use_speculative_dfs": _env_flag("ARC_USE_SPECULATIVE_DFS", default=False),
+        "profile_timings": _env_flag("ARC_PROFILE_TIMINGS", default=False),
         "dfs_prob_threshold": dfs_prob_threshold,
         "model_path": os.environ.get("ARC_MODEL_PATH", "../input/qwen3_4b_grids15_sft139/"),
         "test_path": os.environ.get("ARC_TEST_PATH", "../input/arc-prize-2024/arc-agi_evaluation_challenges.json"),
@@ -182,7 +183,10 @@ def worker(rank, queue, end_time):
             break
 
         start_time = time.time()
+        puzzle_started_at = time.perf_counter()
         torch.cuda.reset_peak_memory_stats()
+        timing_stats = defaultdict(float)
+        count_stats = defaultdict(int)
 
         set_peft_model_state_dict(
             model,
@@ -195,6 +199,7 @@ def worker(rank, queue, end_time):
         train_ds = puzzle_ds.augment(n=16, shfl_keys=True, seed=1)
         train_ds = train_ds.cut_to_len(formatter=formatter, name="text", max_len=max_seq_length)
 
+        training_started_at = time.perf_counter()
         with io.StringIO() as buf, redirect_stdout(buf), redirect_stderr(buf):
             trainer = UnslothFixedTrainer(
                 model=model,
@@ -209,7 +214,9 @@ def worker(rank, queue, end_time):
             stats = trainer.train()
             model = trainer.accelerator.unwrap_model(model, keep_fp32_wrapper=False)
             del trainer
+        timing_stats["training_s"] += time.perf_counter() - training_started_at
 
+        prep_started_at = time.perf_counter()
         model = FastLanguageModel.for_inference(model)
         gc.collect()
         torch.cuda.empty_cache()
@@ -222,6 +229,7 @@ def worker(rank, queue, end_time):
         puzzle_ds_multi = puzzle_ds.split_multi_replies()
         eval_ds = puzzle_ds_multi.augment(n=2, seed=2)
         eval_ds = eval_ds.cut_to_len(formatter=formatter, name="input", max_len=max_seq_length - max_new_tokens)
+        timing_stats["eval_prep_s"] += time.perf_counter() - prep_started_at
 
         test_id_to_subkeys = defaultdict(list)
         for subkey in sorted(eval_ds.keys):
@@ -262,20 +270,28 @@ def worker(rank, queue, end_time):
                     break
 
                 print(f"[Rank {rank}] decoding {subkeys}")
+                count_stats["batches"] += 1
 
+                tokenize_started_at = time.perf_counter()
                 tokens = []
                 for subkey in subkeys:
                     data = eval_ds.get(subkey, formatter)
                     tokens.append(tokenizer.encode(data["input"]))
+                timing_stats["tokenize_inputs_s"] += time.perf_counter() - tokenize_started_at
 
+                dfs_started_at = time.perf_counter()
                 dfs_result = inference_turbo_dfs(model, tokens, max_new_tokens, max_score, end_time)
+                timing_stats["dfs_s"] += time.perf_counter() - dfs_started_at
+                count_stats["dfs_calls"] += 1
 
                 for subkey_id, scored_beams in dfs_result:
                     subkey = subkeys[subkey_id]
                     bk = subkey.split(".")[0]
                     decoded_result = []
+                    count_stats["subkeys_scored"] += 1
 
                     if bk not in rescorers:
+                        rescorer_started_at = time.perf_counter()
                         rescorers[bk] = rescoring_cls(
                             model=model,
                             tokenizer=tokenizer,
@@ -286,21 +302,30 @@ def worker(rank, queue, end_time):
                             max_new_tokens=max_new_tokens,
                             seed=stable_seed_from_key(bk),
                         )
+                        timing_stats["rescorer_init_s"] += time.perf_counter() - rescorer_started_at
+                        count_stats["rescorers_created"] += 1
 
                     for beam_score, beam_tokens in scored_beams:
+                        count_stats["beam_candidates_seen"] += 1
                         array = formatter.convert_tokens_to_array(beam_tokens)
                         if array is None:
+                            count_stats["beam_candidates_invalid"] += 1
                             continue
 
                         solution = puzzle_ds_multi.invert_mod(array, subkey, inv_perm=True)
                         grid_id = (bk, tuple(map(tuple, solution)))
+                        count_stats["beam_candidates_valid"] += 1
 
                         if grid_id in known_scores:
                             augmented_scores = known_scores[grid_id]
+                            count_stats["rescoring_cache_hits"] += 1
                         else:
                             print(f"[Rank {rank}] scoring {subkey} #{len(decoded_result)}")
+                            rescore_started_at = time.perf_counter()
                             augmented_scores = rescorers[bk].score_solution(solution)
+                            timing_stats["rescoring_s"] += time.perf_counter() - rescore_started_at
                             known_scores[grid_id] = augmented_scores
+                            count_stats["rescoring_cache_misses"] += 1
 
                         decoded_result.append(
                             {
@@ -311,11 +336,46 @@ def worker(rank, queue, end_time):
                         )
 
                     if len(decoded_result):
+                        write_started_at = time.perf_counter()
                         with bz2.BZ2File(os.path.join(dir_outputs, subkey), "w") as f:
                             pickle.dump(decoded_result, f)
+                        timing_stats["write_results_s"] += time.perf_counter() - write_started_at
+                        count_stats["subkeys_written"] += 1
 
         memory_allocated = torch.cuda.max_memory_allocated() // 1024**2
         print(f"[Rank {rank}] allocated {memory_allocated}MB for inference")
 
         spend_time = time.time() - start_time
         print(f"[Rank {rank}] finished {key} in {spend_time:.1f}s")
+        if config["profile_timings"]:
+            timing_stats["total_wall_s"] = time.perf_counter() - puzzle_started_at
+            ordered_timings = [
+                "training_s",
+                "eval_prep_s",
+                "tokenize_inputs_s",
+                "dfs_s",
+                "rescorer_init_s",
+                "rescoring_s",
+                "write_results_s",
+                "total_wall_s",
+            ]
+            timings_text = " ".join(f"{name}={timing_stats[name]:.3f}s" for name in ordered_timings)
+            counts_text = " ".join(
+                f"{name}={count_stats[name]}"
+                for name in [
+                    "batches",
+                    "dfs_calls",
+                    "subkeys_scored",
+                    "subkeys_written",
+                    "beam_candidates_seen",
+                    "beam_candidates_valid",
+                    "beam_candidates_invalid",
+                    "rescoring_cache_hits",
+                    "rescoring_cache_misses",
+                    "rescorers_created",
+                ]
+            )
+            print(f"[Rank {rank}] timing summary for {key}: {timings_text}")
+            print(f"[Rank {rank}] count summary for {key}: {counts_text}")
+            for base_key, rescorer in sorted(rescorers.items()):
+                print(f"[Rank {rank}] rescorer summary for {base_key}: {rescorer.format_stats()}")
