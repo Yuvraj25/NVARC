@@ -60,6 +60,13 @@ def _get_logprob(logprobs_by_token, token_id):
     return float(_logprob_value(logprobs_by_token[token_id]))
 
 
+def _filter_kwargs(fn, kwargs):
+    params = inspect.signature(fn).parameters
+    if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()):
+        return kwargs
+    return {key: value for key, value in kwargs.items() if key in params}
+
+
 @dataclass
 class VllmConfig:
     model_path: str
@@ -75,9 +82,9 @@ class ArcVllmBackend:
         self.config = config
         LLM, SamplingParams, LoRARequest = _import_vllm()
         self.SamplingParams = SamplingParams
-        self.llm = _timed(
-            "engine_init",
-            lambda: LLM(
+        llm_kwargs = _filter_kwargs(
+            LLM,
+            dict(
                 model=config.model_path,
                 enable_lora=True,
                 enable_prefix_caching=config.enable_prefix_caching,
@@ -88,6 +95,10 @@ class ArcVllmBackend:
                 max_model_len=config.max_model_len,
                 skip_tokenizer_init=True,
             ),
+        )
+        self.llm = _timed(
+            "engine_init",
+            lambda: LLM(**llm_kwargs),
         )
         _gpu_mem("after_engine_init")
         self.lora_request = LoRARequest(
@@ -116,7 +127,8 @@ class ArcVllmBackend:
             f"tensor_parallel_size={config.tensor_parallel_size} "
             f"gpu_memory_utilization={config.gpu_memory_utilization:.2f} "
             f"max_model_len={config.max_model_len} "
-            f"dfs_logprob_mode={'arc_tokens' if self._uses_logprob_token_ids else 'full_vocab'}",
+            f"dfs_logprob_mode={'arc_tokens' if self._uses_logprob_token_ids else 'full_vocab'} "
+            f"llm_kwargs={sorted(llm_kwargs)}",
             flush=True,
         )
         self._lora_warmed = False

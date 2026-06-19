@@ -243,6 +243,8 @@ def worker(rank, queue, end_time):
             model.save_pretrained(adapter_path)
             timing_stats["adapter_save_s"] += time.perf_counter() - prep_started_at
             del model
+            del default_weights
+            del collator
             gc.collect()
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats()
@@ -393,6 +395,9 @@ def worker(rank, queue, end_time):
             if backend is not None:
                 backend.close()
                 del backend
+            if config["use_vllm"]:
+                del tokenizer
+                del formatter
 
         memory_allocated = torch.cuda.max_memory_allocated() // 1024**2
         print(f"[Rank {rank}] allocated {memory_allocated}MB for inference")
