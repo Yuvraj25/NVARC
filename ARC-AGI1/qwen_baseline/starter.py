@@ -53,12 +53,23 @@ if __name__ == "__main__":
     parser.add_argument("--limit-keys", type=int, default=None)
     parser.add_argument("--nprocs", type=int, default=4)
     parser.add_argument("--use-prefix-cached-rescoring", action="store_true")
+    parser.add_argument("--use-vllm", action="store_true")
+    parser.add_argument("--vllm-adapter-dir", type=str, default=None)
+    parser.add_argument("--vllm-tensor-parallel-size", type=int, default=1)
+    parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.90)
+    parser.add_argument("--no-vllm-prefix-caching", action="store_true")
     parser.add_argument("--use-speculative-dfs", action="store_true")
     parser.add_argument("--dfs-prob-threshold", type=float, default=0.2)
     parser.add_argument("--profile-timings", action="store_true")
     args = parser.parse_args()
     end_time = args.end_time if args.end_time is not None else time.time() + 12 * 3600
     os.environ["ARC_USE_PREFIX_CACHED_RESCORING"] = "1" if args.use_prefix_cached_rescoring else "0"
+    os.environ["ARC_USE_VLLM"] = "1" if args.use_vllm else "0"
+    os.environ["ARC_VLLM_TENSOR_PARALLEL_SIZE"] = str(args.vllm_tensor_parallel_size)
+    os.environ["ARC_VLLM_GPU_MEMORY_UTILIZATION"] = str(args.vllm_gpu_memory_utilization)
+    os.environ["ARC_VLLM_ENABLE_PREFIX_CACHING"] = "0" if args.no_vllm_prefix_caching else "1"
+    if args.vllm_adapter_dir is not None:
+        os.environ["ARC_VLLM_ADAPTER_DIR"] = args.vllm_adapter_dir
     os.environ["ARC_USE_SPECULATIVE_DFS"] = "1" if args.use_speculative_dfs else "0"
     os.environ["ARC_DFS_PROB_THRESHOLD"] = str(args.dfs_prob_threshold)
     os.environ["ARC_PROFILE_TIMINGS"] = "1" if args.profile_timings else "0"
@@ -68,6 +79,10 @@ if __name__ == "__main__":
     print(
         "runtime flags:",
         f"prefix_cached_rescoring={os.environ['ARC_USE_PREFIX_CACHED_RESCORING']}",
+        f"use_vllm={os.environ['ARC_USE_VLLM']}",
+        f"vllm_tensor_parallel_size={os.environ['ARC_VLLM_TENSOR_PARALLEL_SIZE']}",
+        f"vllm_gpu_memory_utilization={os.environ['ARC_VLLM_GPU_MEMORY_UTILIZATION']}",
+        f"vllm_prefix_caching={os.environ['ARC_VLLM_ENABLE_PREFIX_CACHING']}",
         f"speculative_dfs={os.environ['ARC_USE_SPECULATIVE_DFS']}",
         f"dfs_prob_threshold={os.environ['ARC_DFS_PROB_THRESHOLD']}",
         f"profile_timings={os.environ['ARC_PROFILE_TIMINGS']}",
