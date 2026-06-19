@@ -20,6 +20,7 @@ from unsloth import FastLanguageModel, UnslothTrainer, UnslothTrainingArguments
 from arc_loader import ArcDataset, QwenFormatter
 from arc_rescoring import FullPassRescorer, PrefixCachedRescorer
 from arc_search import ASSISTANT_TOKEN_ID, EOS_ID, USER_TOKEN_ID, default_max_score, inference_turbo_dfs
+from arc_vllm import ArcVllmBackend, VllmConfig, VllmRescorer, inference_vllm_dfs
 
 logging.disable(logging.WARNING)
 
@@ -37,6 +38,11 @@ def runtime_config():
         raise ValueError(f"ARC_DFS_PROB_THRESHOLD must be in (0, 1), got {dfs_prob_threshold}")
     return {
         "use_prefix_cached_rescoring": _env_flag("ARC_USE_PREFIX_CACHED_RESCORING", default=False),
+        "use_vllm": _env_flag("ARC_USE_VLLM", default=False),
+        "vllm_adapter_dir": os.environ.get("ARC_VLLM_ADAPTER_DIR"),
+        "vllm_tensor_parallel_size": int(os.environ.get("ARC_VLLM_TENSOR_PARALLEL_SIZE", "1")),
+        "vllm_gpu_memory_utilization": float(os.environ.get("ARC_VLLM_GPU_MEMORY_UTILIZATION", "0.90")),
+        "vllm_enable_prefix_caching": _env_flag("ARC_VLLM_ENABLE_PREFIX_CACHING", default=True),
         "use_speculative_dfs": _env_flag("ARC_USE_SPECULATIVE_DFS", default=False),
         "profile_timings": _env_flag("ARC_PROFILE_TIMINGS", default=False),
         "dfs_prob_threshold": dfs_prob_threshold,
@@ -138,35 +144,42 @@ def worker(rank, queue, end_time):
 
     max_seq_length = 8192
 
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=config["model_path"],
-        full_finetuning=False,
-        load_in_4bit=False,
-        local_files_only=True,
-        use_gradient_checkpointing=False,
-        max_seq_length=max_seq_length,
-    )
+    def load_training_model():
+        loaded_model, loaded_tokenizer = FastLanguageModel.from_pretrained(
+            model_name=config["model_path"],
+            full_finetuning=False,
+            load_in_4bit=False,
+            local_files_only=True,
+            use_gradient_checkpointing=False,
+            max_seq_length=max_seq_length,
+        )
 
-    model = FastLanguageModel.get_peft_model(model, **peft_params)
-    for _name, param in model.named_parameters():
-        if param.dtype == torch.float32:
-            param.data = param.data.to(torch.bfloat16)
+        loaded_model = FastLanguageModel.get_peft_model(loaded_model, **peft_params)
+        for _name, param in loaded_model.named_parameters():
+            if param.dtype == torch.float32:
+                param.data = param.data.to(torch.bfloat16)
 
-    default_weights = get_peft_model_state_dict(model, adapter_name="default")
-    default_weights = {k: v.clone().detach() for k, v in default_weights.items()}
+        weights = get_peft_model_state_dict(loaded_model, adapter_name="default")
+        weights = {k: v.detach().cpu().clone() for k, v in weights.items()}
 
-    collator = QwenDataCollatorForCompletionOnlyLM(
-        tokenizer=tokenizer,
-        mlm=False,
-    )
+        loaded_collator = QwenDataCollatorForCompletionOnlyLM(
+            tokenizer=loaded_tokenizer,
+            mlm=False,
+        )
+        loaded_formatter = QwenFormatter(tokenizer=loaded_tokenizer)
+        return loaded_model, loaded_tokenizer, weights, loaded_collator, loaded_formatter, loaded_formatter.max_new_tokens()
 
-    formatter = QwenFormatter(tokenizer=tokenizer)
-    max_new_tokens = formatter.max_new_tokens()
+    if config["use_vllm"]:
+        model = tokenizer = default_weights = collator = formatter = max_new_tokens = None
+    else:
+        model, tokenizer, default_weights, collator, formatter, max_new_tokens = load_training_model()
+
     max_score = default_max_score(config["dfs_prob_threshold"])
     rescoring_cls = PrefixCachedRescorer if config["use_prefix_cached_rescoring"] else FullPassRescorer
     print(
         f"[Rank {rank}] config: prefix_cached_rescoring={config['use_prefix_cached_rescoring']} "
-        f"speculative_dfs={config['use_speculative_dfs']} dfs_prob_threshold={config['dfs_prob_threshold']}"
+        f"use_vllm={config['use_vllm']} speculative_dfs={config['use_speculative_dfs']} "
+        f"dfs_prob_threshold={config['dfs_prob_threshold']}"
     )
 
     arc_test_set = ArcDataset.from_file(config["test_path"])
@@ -187,6 +200,9 @@ def worker(rank, queue, end_time):
         torch.cuda.reset_peak_memory_stats()
         timing_stats = defaultdict(float)
         count_stats = defaultdict(int)
+
+        if config["use_vllm"]:
+            model, tokenizer, default_weights, collator, formatter, max_new_tokens = load_training_model()
 
         set_peft_model_state_dict(
             model,
@@ -217,9 +233,25 @@ def worker(rank, queue, end_time):
         timing_stats["training_s"] += time.perf_counter() - training_started_at
 
         prep_started_at = time.perf_counter()
-        model = FastLanguageModel.for_inference(model)
-        gc.collect()
-        torch.cuda.empty_cache()
+        backend = None
+        adapter_path = None
+
+        if config["use_vllm"]:
+            adapter_root = config["vllm_adapter_dir"] or os.path.join(config["output_dir"], "vllm_adapters")
+            adapter_path = os.path.join(adapter_root, key)
+            os.makedirs(adapter_path, exist_ok=True)
+            model.save_pretrained(adapter_path)
+            timing_stats["adapter_save_s"] += time.perf_counter() - prep_started_at
+            del model
+            del default_weights
+            del collator
+            gc.collect()
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+        else:
+            model = FastLanguageModel.for_inference(model)
+            gc.collect()
+            torch.cuda.empty_cache()
 
         memory_allocated = torch.cuda.max_memory_allocated() // 1024**2
         print(f"[Rank {rank}] allocated {memory_allocated}MB for training")
@@ -260,6 +292,18 @@ def worker(rank, queue, end_time):
             batches.append(batch)
 
         with torch.inference_mode():
+            if config["use_vllm"]:
+                backend = ArcVllmBackend(
+                    VllmConfig(
+                        model_path=config["model_path"],
+                        adapter_path=adapter_path,
+                        tensor_parallel_size=config["vllm_tensor_parallel_size"],
+                        gpu_memory_utilization=config["vllm_gpu_memory_utilization"],
+                        enable_prefix_caching=config["vllm_enable_prefix_caching"],
+                        max_model_len=max_seq_length,
+                    )
+                )
+
             known_scores = {}
             rescorers = {}
 
@@ -280,7 +324,10 @@ def worker(rank, queue, end_time):
                 timing_stats["tokenize_inputs_s"] += time.perf_counter() - tokenize_started_at
 
                 dfs_started_at = time.perf_counter()
-                dfs_result = inference_turbo_dfs(model, tokens, max_new_tokens, max_score, end_time)
+                if config["use_vllm"]:
+                    dfs_result = inference_vllm_dfs(backend, tokens, max_new_tokens, max_score, end_time)
+                else:
+                    dfs_result = inference_turbo_dfs(model, tokens, max_new_tokens, max_score, end_time)
                 timing_stats["dfs_s"] += time.perf_counter() - dfs_started_at
                 count_stats["dfs_calls"] += 1
 
@@ -292,8 +339,7 @@ def worker(rank, queue, end_time):
 
                     if bk not in rescorers:
                         rescorer_started_at = time.perf_counter()
-                        rescorers[bk] = rescoring_cls(
-                            model=model,
+                        rescorer_kwargs = dict(
                             tokenizer=tokenizer,
                             formatter=formatter,
                             puzzle_ds_multi=puzzle_ds_multi,
@@ -302,6 +348,10 @@ def worker(rank, queue, end_time):
                             max_new_tokens=max_new_tokens,
                             seed=stable_seed_from_key(bk),
                         )
+                        if config["use_vllm"]:
+                            rescorers[bk] = VllmRescorer(backend=backend, **rescorer_kwargs)
+                        else:
+                            rescorers[bk] = rescoring_cls(model=model, **rescorer_kwargs)
                         timing_stats["rescorer_init_s"] += time.perf_counter() - rescorer_started_at
                         count_stats["rescorers_created"] += 1
 
@@ -341,6 +391,13 @@ def worker(rank, queue, end_time):
                             pickle.dump(decoded_result, f)
                         timing_stats["write_results_s"] += time.perf_counter() - write_started_at
                         count_stats["subkeys_written"] += 1
+
+            if backend is not None:
+                backend.close()
+                del backend
+            if config["use_vllm"]:
+                del tokenizer
+                del formatter
 
         memory_allocated = torch.cuda.max_memory_allocated() // 1024**2
         print(f"[Rank {rank}] allocated {memory_allocated}MB for inference")
