@@ -1,4 +1,5 @@
 import gc
+import inspect
 import os
 import time
 from collections import defaultdict
@@ -93,12 +94,16 @@ class ArcVllmBackend:
             lora_int_id=1,
             lora_path=config.adapter_path,
         )
-        self._dfs_params = SamplingParams(
+        sampling_params_fields = inspect.signature(SamplingParams).parameters
+        self._uses_logprob_token_ids = "logprob_token_ids" in sampling_params_fields
+        dfs_params = dict(
             max_tokens=1,
             temperature=0.0,
-            logprobs=len(ARC_TOKENS),
-            logprob_token_ids=ARC_TOKENS,
+            logprobs=len(ARC_TOKENS) if self._uses_logprob_token_ids else -1,
         )
+        if self._uses_logprob_token_ids:
+            dfs_params["logprob_token_ids"] = ARC_TOKENS
+        self._dfs_params = SamplingParams(**dfs_params)
         self._score_params = SamplingParams(
             max_tokens=1,
             temperature=0.0,
@@ -109,7 +114,8 @@ class ArcVllmBackend:
             f"prefix_caching_enabled={config.enable_prefix_caching} "
             f"tensor_parallel_size={config.tensor_parallel_size} "
             f"gpu_memory_utilization={config.gpu_memory_utilization:.2f} "
-            f"max_model_len={config.max_model_len}",
+            f"max_model_len={config.max_model_len} "
+            f"dfs_logprob_mode={'arc_tokens' if self._uses_logprob_token_ids else 'full_vocab'}",
             flush=True,
         )
         self._lora_warmed = False
