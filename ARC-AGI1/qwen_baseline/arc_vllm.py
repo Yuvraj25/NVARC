@@ -84,6 +84,7 @@ class ArcVllmBackend:
                 trust_remote_code=True,
                 tensor_parallel_size=config.tensor_parallel_size,
                 gpu_memory_utilization=config.gpu_memory_utilization,
+                max_lora_rank=256,
                 max_model_len=config.max_model_len,
                 skip_tokenizer_init=True,
             ),
