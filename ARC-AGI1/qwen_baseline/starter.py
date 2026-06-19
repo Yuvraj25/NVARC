@@ -8,7 +8,10 @@ import torch.multiprocessing as mp
 
 
 def local_worker(rank, queue, end_time):
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(rank)
+    use_vllm = os.environ.get("ARC_USE_VLLM") == "1"
+    vllm_tensor_parallel_size = int(os.environ.get("ARC_VLLM_TENSOR_PARALLEL_SIZE", "1"))
+    if not (use_vllm and vllm_tensor_parallel_size > 1):
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(rank)
     torch.set_default_device("cpu")
 
     if rank > 0:
@@ -62,6 +65,8 @@ if __name__ == "__main__":
     parser.add_argument("--dfs-prob-threshold", type=float, default=0.2)
     parser.add_argument("--profile-timings", action="store_true")
     args = parser.parse_args()
+    if args.use_vllm and args.vllm_tensor_parallel_size > 1 and args.nprocs != 1:
+        raise ValueError("--use-vllm with tensor_parallel_size > 1 requires --nprocs 1 so vLLM can see all GPUs")
     end_time = args.end_time if args.end_time is not None else time.time() + 12 * 3600
     os.environ["ARC_USE_PREFIX_CACHED_RESCORING"] = "1" if args.use_prefix_cached_rescoring else "0"
     os.environ["ARC_USE_VLLM"] = "1" if args.use_vllm else "0"

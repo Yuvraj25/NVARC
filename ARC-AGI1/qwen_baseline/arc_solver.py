@@ -160,7 +160,7 @@ def worker(rank, queue, end_time):
                 param.data = param.data.to(torch.bfloat16)
 
         weights = get_peft_model_state_dict(loaded_model, adapter_name="default")
-        weights = {k: v.clone().detach() for k, v in weights.items()}
+        weights = {k: v.detach().cpu().clone() for k, v in weights.items()}
 
         loaded_collator = QwenDataCollatorForCompletionOnlyLM(
             tokenizer=loaded_tokenizer,
