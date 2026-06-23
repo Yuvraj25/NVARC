@@ -362,7 +362,8 @@ def worker_sglang(rank, queue, end_time, config):
             print(f"[Rank {rank}] allocated {memory_allocated}MB for sglang inference")
         finally:
             backend.close()
-            shutil.rmtree(adapter_path, ignore_errors=True)
+            if os.environ.get("ARC_KEEP_SGLANG_ADAPTERS") != "1":
+                shutil.rmtree(adapter_path, ignore_errors=True)
             del tokenizer
             del formatter
             gc.collect()
