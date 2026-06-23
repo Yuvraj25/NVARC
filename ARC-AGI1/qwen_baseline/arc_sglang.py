@@ -121,23 +121,24 @@ class ArcSglangBackend:
             sampling_params={"temperature": 0.0, "max_new_tokens": 0},
             return_logprob=True,
             logprob_start_len=logprob_start_lens,
+            token_ids_logprob=[ARC_TOKENS for _ in input_ids],
             lora_path=[self.config.lora_name for _ in input_ids],
         )
         scores = []
         for output, answer in zip(_as_batch(outputs), answer_tokens):
             meta = output.get("meta_info", {})
-            token_logprobs = meta.get("input_token_logprobs")
-            if token_logprobs is None:
-                raise RuntimeError(f"SGLang did not return input_token_logprobs; meta keys={sorted(meta.keys())}")
-            answer_rows = token_logprobs[-len(answer) :] if answer else []
+            token_id_logprobs = meta.get("input_token_ids_logprobs")
+            if token_id_logprobs is None:
+                raise RuntimeError(f"SGLang did not return input_token_ids_logprobs; meta keys={sorted(meta.keys())}")
+            answer_rows = token_id_logprobs[1 : 1 + len(answer)] if answer else []
             if len(answer_rows) != len(answer):
                 raise RuntimeError(f"SGLang returned {len(answer_rows)} answer logprobs for {len(answer)} answer tokens")
             total = 0.0
             for row, expected_token_id in zip(answer_rows, answer):
-                logprob, token_id, _ = row
-                if int(token_id) != int(expected_token_id):
-                    raise RuntimeError(f"SGLang logprob token mismatch: got {token_id}, expected {expected_token_id}")
-                total += float(logprob)
+                logprobs = {int(token_id): float(logprob) for logprob, token_id in _iter_token_logprobs(row)}
+                if expected_token_id not in logprobs:
+                    raise RuntimeError(f"SGLang did not return logprob for ARC token {expected_token_id}")
+                total += logprobs[expected_token_id]
             scores.append(-total)
         return scores
 
