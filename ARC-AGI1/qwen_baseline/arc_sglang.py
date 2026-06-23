@@ -34,6 +34,23 @@ def _timed(label: str, fn):
     return result
 
 
+def _iter_token_logprobs(row):
+    if row is None:
+        return
+    if (
+        len(row) in (2, 3)
+        and isinstance(row[0], (list, tuple))
+        and isinstance(row[1], (list, tuple))
+        and all(isinstance(token_id, int) for token_id in row[1])
+    ):
+        for logprob, token_id in zip(row[0], row[1]):
+            yield logprob, token_id
+        return
+    for item in row:
+        logprob, token_id = item[:2]
+        yield logprob, token_id
+
+
 class ArcSglangBackend:
     def __init__(self, config: SglangConfig):
         self.config = config
@@ -80,7 +97,7 @@ class ArcSglangBackend:
             rows = meta.get("output_token_ids_logprobs")
             if not rows or rows[0] is None:
                 raise RuntimeError(f"SGLang did not return output_token_ids_logprobs; meta keys={sorted(meta.keys())}")
-            result.append({int(token_id): float(logprob) for logprob, token_id, _ in rows[0]})
+            result.append({int(token_id): float(logprob) for logprob, token_id in _iter_token_logprobs(rows[0])})
         return result
 
     def score_answers(self, query_tokens: list[list[int]], answer_tokens: list[list[int]]) -> list[float]:
