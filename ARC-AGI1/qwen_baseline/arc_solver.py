@@ -242,7 +242,8 @@ def worker_sglang(rank, queue, end_time, config):
                 )
             )
         except Exception:
-            shutil.rmtree(adapter_path, ignore_errors=True)
+            if os.environ.get("ARC_KEEP_SGLANG_ADAPTERS") != "1":
+                shutil.rmtree(adapter_path, ignore_errors=True)
             raise
 
         try:

@@ -54,7 +54,7 @@ def _iter_token_logprobs(row):
 class ArcSglangBackend:
     def __init__(self, config: SglangConfig):
         self.config = config
-        sglang = _timed("import", lambda: __import__("sglang"))
+        sglang = _timed("import", self._import_sglang)
         engine_kwargs = {
             "model_path": config.model_path,
             "skip_tokenizer_init": True,
@@ -71,6 +71,15 @@ class ArcSglangBackend:
         if config.mem_fraction_static is not None:
             engine_kwargs["mem_fraction_static"] = config.mem_fraction_static
         self.engine = _timed("engine_init", lambda: sglang.Engine(**engine_kwargs))
+
+    @staticmethod
+    def _import_sglang():
+        import sys
+
+        arc_stack = "/kaggle/working/arc_stack"
+        if arc_stack not in sys.path:
+            sys.path.append(arc_stack)
+        return __import__("sglang")
 
     def close(self):
         if getattr(self, "engine", None) is not None:
