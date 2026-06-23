@@ -110,7 +110,7 @@ def worker_sglang(rank, queue, end_time, config):
 
     peft_params = dict(
         r=256,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj", "embed_tokens", "lm_head"],
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
         lora_alpha=32,
         lora_dropout=0.0,
         bias="none",
@@ -417,7 +417,7 @@ def worker(rank, queue, end_time):
 
     peft_params = dict(
         r=256,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj", "embed_tokens", "lm_head"],
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
         lora_alpha=32,
         lora_dropout=0.0,
         bias="none",
