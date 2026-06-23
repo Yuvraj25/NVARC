@@ -6,6 +6,7 @@ import logging
 import os
 import pickle
 import re
+import shutil
 import time
 from collections import defaultdict
 from contextlib import redirect_stderr, redirect_stdout
@@ -230,15 +231,19 @@ def worker_sglang(rank, queue, end_time, config):
         gc.collect()
         torch.cuda.empty_cache()
 
-        backend = ArcSglangBackend(
-            SglangConfig(
-                model_path=config["model_path"],
-                adapter_path=adapter_path,
-                tensor_parallel_size=config["sglang_tensor_parallel_size"],
-                mem_fraction_static=config["sglang_mem_fraction_static"],
-                max_model_len=max_seq_length,
+        try:
+            backend = ArcSglangBackend(
+                SglangConfig(
+                    model_path=config["model_path"],
+                    adapter_path=adapter_path,
+                    tensor_parallel_size=config["sglang_tensor_parallel_size"],
+                    mem_fraction_static=config["sglang_mem_fraction_static"],
+                    max_model_len=max_seq_length,
+                )
             )
-        )
+        except Exception:
+            shutil.rmtree(adapter_path, ignore_errors=True)
+            raise
 
         try:
             test_id_to_subkeys = defaultdict(list)
@@ -356,6 +361,7 @@ def worker_sglang(rank, queue, end_time, config):
             print(f"[Rank {rank}] allocated {memory_allocated}MB for sglang inference")
         finally:
             backend.close()
+            shutil.rmtree(adapter_path, ignore_errors=True)
             del tokenizer
             del formatter
             gc.collect()
