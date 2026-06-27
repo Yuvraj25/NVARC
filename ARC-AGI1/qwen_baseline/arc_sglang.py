@@ -20,6 +20,7 @@ class SglangConfig:
     max_model_len: int = 8192
     lora_name: str = "arc_adapter"
     max_lora_rank: int = 256
+    speculative_repeat_len: int = 4
 
 
 def _as_batch(outputs):
@@ -33,6 +34,12 @@ def _timed(label: str, fn):
     result = fn()
     print(f"[sglang] {label} took {time.perf_counter() - started_at:.2f}s")
     return result
+
+
+def _bump_count(count_stats, key, amount=1):
+    if count_stats is None:
+        return
+    count_stats[key] = count_stats.get(key, 0) + amount
 
 
 def _patch_sglang_rslora(sglang):
@@ -191,6 +198,164 @@ def inference_sglang_dfs(
                     candidates.append((next_score, token_id))
             for next_score, token_id in sorted(candidates, key=lambda item: item[0], reverse=True):
                 stack.insert(0, (batch_id, suffix + [token_id], next_score, remaining - 1))
+    return [(batch_id, sorted(beams, key=lambda item: item[0])) for batch_id, beams in enumerate(suffixes) if beams]
+
+
+def _insert_frames(stack, frames):
+    for batch_id, suffix, score, remaining in sorted(frames, key=lambda item: item[2], reverse=True):
+        stack.insert(0, (batch_id, suffix, score, remaining))
+
+
+def _branch_from_logprobs(
+    batch_id: int,
+    suffix: list[int],
+    score: float,
+    remaining: int,
+    logprobs: dict[int, float],
+    max_score: float,
+):
+    eos_beams = []
+    candidates = []
+    for token_id in ARC_TOKENS:
+        logprob = logprobs.get(token_id, float("-inf"))
+        next_score = score - logprob
+        if next_score >= max_score:
+            continue
+        if token_id == EOS_ID:
+            eos_beams.append((next_score, suffix + [token_id]))
+        elif remaining > 1:
+            candidates.append((next_score, token_id))
+    return eos_beams, candidates
+
+
+def _speculate_repeated_branch(
+    backend: ArcSglangBackend,
+    prefix_tokens: list[list[int]],
+    batch_id: int,
+    suffix: list[int],
+    score: float,
+    remaining: int,
+    repeat_token_id: int,
+    max_score: float,
+    end_time: float,
+    suffixes: list[list[tuple[float, list[int]]]],
+    count_stats: dict[str, int] | None,
+):
+    _bump_count(count_stats, "spec_frames_started")
+
+    if remaining <= 1 or backend.config.speculative_repeat_len <= 1:
+        return [(batch_id, suffix, score, remaining)]
+
+    active = [(batch_id, suffix, score, remaining, 1)]
+    returned_frames = []
+    while active and time.time() < end_time:
+        prompts = [prefix_tokens[cur_batch_id] + cur_suffix for cur_batch_id, cur_suffix, _score, _remaining, _accepted in active]
+        logprob_rows = backend.next_arc_logprobs(prompts)
+        next_active = []
+        for (cur_batch_id, cur_suffix, cur_score, cur_remaining, accepted_count), logprobs in zip(active, logprob_rows):
+            eos_beams, candidates = _branch_from_logprobs(
+                batch_id=cur_batch_id,
+                suffix=cur_suffix,
+                score=cur_score,
+                remaining=cur_remaining,
+                logprobs=logprobs,
+                max_score=max_score,
+            )
+            if eos_beams:
+                suffixes[cur_batch_id].extend(eos_beams)
+
+            side_frames = []
+            repeat_candidate = None
+            for next_score, token_id in candidates:
+                if token_id == repeat_token_id:
+                    repeat_candidate = (next_score, token_id)
+                else:
+                    side_frames.append((cur_batch_id, cur_suffix + [token_id], next_score, cur_remaining - 1))
+            _bump_count(count_stats, "spec_side_frames_enqueued", len(side_frames))
+            returned_frames.extend(side_frames)
+
+            if repeat_candidate is None:
+                repeat_logprob = logprobs.get(repeat_token_id, float("-inf"))
+                repeat_next_score = cur_score - repeat_logprob
+                if repeat_next_score >= max_score:
+                    _bump_count(count_stats, "spec_stop_threshold")
+                else:
+                    _bump_count(count_stats, "spec_stop_repeat_invalid")
+                continue
+
+            next_score, _ = repeat_candidate
+            _bump_count(count_stats, "spec_tokens_attempted")
+            _bump_count(count_stats, "spec_tokens_accepted")
+
+            next_suffix = cur_suffix + [repeat_token_id]
+            next_remaining = cur_remaining - 1
+            next_accepted_count = accepted_count + 1
+
+            if next_remaining <= 1:
+                _bump_count(count_stats, "spec_stop_remaining_exhausted")
+                returned_frames.append((cur_batch_id, next_suffix, next_score, next_remaining))
+                continue
+
+            if next_accepted_count >= backend.config.speculative_repeat_len:
+                _bump_count(count_stats, "spec_stop_depth_limit")
+                returned_frames.append((cur_batch_id, next_suffix, next_score, next_remaining))
+                continue
+
+            next_active.append((cur_batch_id, next_suffix, next_score, next_remaining, next_accepted_count))
+        active = next_active
+
+    if active:
+        returned_frames.extend((cur_batch_id, cur_suffix, cur_score, cur_remaining) for cur_batch_id, cur_suffix, cur_score, cur_remaining, _accepted in active)
+    return returned_frames
+
+
+def inference_sglang_speculative_dfs(
+    backend: ArcSglangBackend,
+    prefix_tokens: list[list[int]],
+    max_new_tokens: int,
+    max_score: float,
+    end_time: float,
+    count_stats: dict[str, int] | None = None,
+):
+    suffixes: list[list[tuple[float, list[int]]]] = [[] for _ in prefix_tokens]
+    stack: list[tuple[int, list[int], float, int]] = [(i, [], 0.0, max_new_tokens) for i in range(len(prefix_tokens))]
+    started_at = time.time()
+    while stack and time.time() - started_at < 540 and time.time() < end_time:
+        batch = stack[:64]
+        del stack[:64]
+        prompts = [prefix_tokens[batch_id] + suffix for batch_id, suffix, _score, _remaining in batch]
+        logprob_rows = backend.next_arc_logprobs(prompts)
+        new_frames = []
+        for (batch_id, suffix, score, remaining), logprobs in zip(batch, logprob_rows):
+            eos_beams, candidates = _branch_from_logprobs(
+                batch_id=batch_id,
+                suffix=suffix,
+                score=score,
+                remaining=remaining,
+                logprobs=logprobs,
+                max_score=max_score,
+            )
+            if eos_beams:
+                suffixes[batch_id].extend(eos_beams)
+                _bump_count(count_stats, "spec_stop_eos", len(eos_beams))
+            for next_score, token_id in candidates:
+                branch_suffix = suffix + [token_id]
+                branch_remaining = remaining - 1
+                branch_frames = _speculate_repeated_branch(
+                    backend=backend,
+                    prefix_tokens=prefix_tokens,
+                    batch_id=batch_id,
+                    suffix=branch_suffix,
+                    score=next_score,
+                    remaining=branch_remaining,
+                    repeat_token_id=token_id,
+                    max_score=max_score,
+                    end_time=end_time,
+                    suffixes=suffixes,
+                    count_stats=count_stats,
+                )
+                new_frames.extend(branch_frames)
+        _insert_frames(stack, new_frames)
     return [(batch_id, sorted(beams, key=lambda item: item[0])) for batch_id, beams in enumerate(suffixes) if beams]
 
 

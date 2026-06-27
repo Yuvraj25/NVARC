@@ -21,7 +21,7 @@ from unsloth import FastLanguageModel, UnslothTrainer, UnslothTrainingArguments
 
 from arc_loader import ArcDataset, QwenFormatter
 from arc_rescoring import FullPassRescorer
-from arc_sglang import ArcSglangBackend, SglangConfig, SglangRescorer, inference_sglang_dfs
+from arc_sglang import ArcSglangBackend, SglangConfig, SglangRescorer, inference_sglang_dfs, inference_sglang_speculative_dfs
 from arc_search import ASSISTANT_TOKEN_ID, EOS_ID, USER_TOKEN_ID, default_max_score, inference_turbo_dfs
 
 logging.disable(logging.WARNING)
@@ -50,6 +50,7 @@ def runtime_config():
         "sglang_tensor_parallel_size": int(os.environ.get("ARC_SGLANG_TP_SIZE", "1")),
         "sglang_mem_fraction_static": float(sglang_mem_fraction) if sglang_mem_fraction else None,
         "sglang_adapter_dir": os.environ.get("ARC_SGLANG_ADAPTER_DIR", "../sglang_adapters"),
+        "sglang_speculative_repeat_len": int(os.environ.get("ARC_SGLANG_SPECULATIVE_REPEAT_LEN", "4")),
     }
 
 
@@ -104,9 +105,6 @@ def _safe_path_key(key: str) -> str:
 
 
 def worker_sglang(rank, queue, end_time, config):
-    if config["use_speculative_dfs"]:
-        raise NotImplementedError("Speculative DFS is feature-flagged but not implemented yet")
-
     peft_params = dict(
         r=256,
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
@@ -148,7 +146,8 @@ def worker_sglang(rank, queue, end_time, config):
     max_score = default_max_score(config["dfs_prob_threshold"])
     print(
         f"[Rank {rank}] config: use_sglang=True tp_size={config['sglang_tensor_parallel_size']} "
-        f"mem_fraction_static={config['sglang_mem_fraction_static']} dfs_prob_threshold={config['dfs_prob_threshold']}"
+        f"mem_fraction_static={config['sglang_mem_fraction_static']} dfs_prob_threshold={config['dfs_prob_threshold']} "
+        f"speculative_dfs={config['use_speculative_dfs']} sglang_speculative_repeat_len={config['sglang_speculative_repeat_len']}"
     )
 
     arc_test_set = ArcDataset.from_file(config["test_path"])
@@ -238,6 +237,7 @@ def worker_sglang(rank, queue, end_time, config):
                     tensor_parallel_size=config["sglang_tensor_parallel_size"],
                     mem_fraction_static=config["sglang_mem_fraction_static"],
                     max_model_len=max_seq_length,
+                    speculative_repeat_len=config["sglang_speculative_repeat_len"],
                 )
             )
         except Exception:
@@ -294,7 +294,17 @@ def worker_sglang(rank, queue, end_time, config):
                 timing_stats["tokenize_inputs_s"] += time.perf_counter() - tokenize_started_at
 
                 dfs_started_at = time.perf_counter()
-                dfs_result = inference_sglang_dfs(backend, tokens, max_new_tokens, max_score, end_time)
+                if config["use_speculative_dfs"]:
+                    dfs_result = inference_sglang_speculative_dfs(
+                        backend,
+                        tokens,
+                        max_new_tokens,
+                        max_score,
+                        end_time,
+                        count_stats=count_stats,
+                    )
+                else:
+                    dfs_result = inference_sglang_dfs(backend, tokens, max_new_tokens, max_score, end_time)
                 timing_stats["dfs_s"] += time.perf_counter() - dfs_started_at
                 count_stats["dfs_calls"] += 1
 
@@ -396,6 +406,15 @@ def worker_sglang(rank, queue, end_time, config):
                     "rescoring_cache_hits",
                     "rescoring_cache_misses",
                     "rescorers_created",
+                    "spec_frames_started",
+                    "spec_tokens_attempted",
+                    "spec_tokens_accepted",
+                    "spec_side_frames_enqueued",
+                    "spec_stop_repeat_invalid",
+                    "spec_stop_threshold",
+                    "spec_stop_eos",
+                    "spec_stop_remaining_exhausted",
+                    "spec_stop_depth_limit",
                 ]
             )
             print(f"[Rank {rank}] timing summary for {key}: {timings_text}")

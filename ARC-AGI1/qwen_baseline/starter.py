@@ -57,6 +57,7 @@ if __name__ == "__main__":
     parser.add_argument("--sglang-tp-size", type=int, default=1)
     parser.add_argument("--sglang-mem-fraction-static", type=float, default=None)
     parser.add_argument("--sglang-adapter-dir", type=str, default="../sglang_adapters")
+    parser.add_argument("--sglang-speculative-repeat-len", type=int, default=4)
     parser.add_argument("--dfs-prob-threshold", type=float, default=0.2)
     parser.add_argument("--profile-timings", action="store_true")
     args = parser.parse_args()
@@ -71,6 +72,7 @@ if __name__ == "__main__":
     else:
         os.environ.pop("ARC_SGLANG_MEM_FRACTION_STATIC", None)
     os.environ["ARC_SGLANG_ADAPTER_DIR"] = args.sglang_adapter_dir
+    os.environ["ARC_SGLANG_SPECULATIVE_REPEAT_LEN"] = str(args.sglang_speculative_repeat_len)
     os.environ["ARC_DFS_PROB_THRESHOLD"] = str(args.dfs_prob_threshold)
     os.environ["ARC_PROFILE_TIMINGS"] = "1" if args.profile_timings else "0"
     os.environ["ARC_TEST_PATH"] = args.test_path
@@ -83,6 +85,7 @@ if __name__ == "__main__":
         f"sglang_tp_size={os.environ['ARC_SGLANG_TP_SIZE']}",
         f"sglang_mem_fraction_static={os.environ.get('ARC_SGLANG_MEM_FRACTION_STATIC')}",
         f"sglang_adapter_dir={os.environ['ARC_SGLANG_ADAPTER_DIR']}",
+        f"sglang_speculative_repeat_len={os.environ['ARC_SGLANG_SPECULATIVE_REPEAT_LEN']}",
         f"dfs_prob_threshold={os.environ['ARC_DFS_PROB_THRESHOLD']}",
         f"profile_timings={os.environ['ARC_PROFILE_TIMINGS']}",
         f"test_path={os.environ['ARC_TEST_PATH']}",
