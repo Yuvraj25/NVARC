@@ -1,4 +1,5 @@
 import gc
+import math
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -32,6 +33,23 @@ def _timed(label: str, fn):
     result = fn()
     print(f"[sglang] {label} took {time.perf_counter() - started_at:.2f}s")
     return result
+
+
+def _patch_sglang_rslora(sglang):
+    from sglang.srt.lora.lora import LoRAAdapter
+
+    if getattr(LoRAAdapter, "_arc_rslora_patched", False):
+        return
+
+    original_init = LoRAAdapter.__init__
+
+    def patched_init(self, uid, config, base_hf_config, load_config, lora_backend):
+        original_init(self, uid, config, base_hf_config, load_config, lora_backend)
+        if self.config.hf_config.get("use_rslora"):
+            self.scaling = self.config.lora_alpha / math.sqrt(self.config.r)
+
+    LoRAAdapter.__init__ = patched_init
+    LoRAAdapter._arc_rslora_patched = True
 
 
 def _iter_token_logprobs(row):
@@ -79,7 +97,9 @@ class ArcSglangBackend:
         arc_stack = "/kaggle/working/arc_stack"
         if arc_stack not in sys.path:
             sys.path.append(arc_stack)
-        return __import__("sglang")
+        sglang = __import__("sglang")
+        _patch_sglang_rslora(sglang)
+        return sglang
 
     def close(self):
         if getattr(self, "engine", None) is not None:
