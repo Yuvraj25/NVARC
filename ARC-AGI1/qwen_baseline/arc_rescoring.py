@@ -1,4 +1,3 @@
-import copy
 import time
 from dataclasses import dataclass
 
@@ -39,15 +38,6 @@ def calc_scores(queries, answers, tokenizer, model):
 
 
 @dataclass
-class PrefixCacheEntry:
-    key: str
-    query_tokens: list[int]
-    query_text: str
-    prefix_next_logprobs: torch.Tensor
-    past_key_values: object
-
-
-@dataclass
 class FullPassEntry:
     key: str
     query_text: str
@@ -69,7 +59,6 @@ class BaseRescorer:
             "answers_scored": 0,
             "answer_tokens": 0,
             "query_tokens": 0,
-            "prefix_build_time_s": 0.0,
         }
 
     def _build_template(self):
@@ -93,7 +82,6 @@ class BaseRescorer:
         avg_score_ms = 1000.0 * stats["score_time_s"] / stats["score_calls"] if stats["score_calls"] else 0.0
         return (
             f"{self.__class__.__name__}(base_key={self.base_key}, "
-            f"prefix_build_time_s={stats['prefix_build_time_s']:.3f}, "
             f"score_calls={stats['score_calls']}, "
             f"answers_scored={stats['answers_scored']}, "
             f"score_time_s={stats['score_time_s']:.3f}, "
@@ -139,74 +127,3 @@ class FullPassRescorer(BaseRescorer):
         self.stats["query_tokens"] += sum(len(self.tokenizer.encode(query)) for query in queries)
         self.stats["answer_tokens"] += sum(len(self.tokenizer.encode(answer)) for answer in answers)
         return scores
-
-
-class PrefixCachedRescorer(BaseRescorer):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.entries = self._build_entries()
-
-    def _build_entries(self):
-        started_at = time.perf_counter()
-        entries = []
-        for sample in self._build_template().as_list(self.formatter):
-            query_tokens = self.tokenizer.encode(sample["input"])
-            input_ids = torch.tensor([query_tokens], device=self.model.device, dtype=torch.long)
-            outputs = self.model(input_ids=input_ids, return_dict=True, use_cache=True)
-            entries.append(
-                PrefixCacheEntry(
-                    key=sample["key"],
-                    query_tokens=query_tokens,
-                    query_text=sample["input"],
-                    prefix_next_logprobs=outputs.logits[0, -1].float().cpu().log_softmax(-1),
-                    past_key_values=outputs.past_key_values,
-                )
-            )
-        self.stats["prefix_build_time_s"] += time.perf_counter() - started_at
-        return entries
-
-    @torch.no_grad()
-    def score_solution(self, solution):
-        started_at = time.perf_counter()
-        scores = []
-        solution_list = solution.tolist()
-        total_answer_tokens = 0
-        for entry in self.entries:
-            augmented_solution = ArcDataset.forward_mod(solution_list, entry.key)
-            answer_text = self.formatter.fmt_reply([augmented_solution])
-            answer_tokens = self.tokenizer.encode(answer_text)
-            total_answer_tokens += len(answer_tokens)
-            scores.append(self._score_answer_tokens(entry, answer_tokens))
-        elapsed = time.perf_counter() - started_at
-        self.stats["score_calls"] += 1
-        self.stats["score_time_s"] += elapsed
-        self.stats["answers_scored"] += len(self.entries)
-        self.stats["query_tokens"] += sum(len(entry.query_tokens) for entry in self.entries)
-        self.stats["answer_tokens"] += total_answer_tokens
-        return scores
-
-    def _score_answer_tokens(self, entry: PrefixCacheEntry, answer_tokens: list[int]):
-        if not answer_tokens:
-            return 0.0
-
-        total_logprob = entry.prefix_next_logprobs[answer_tokens[0]].item()
-        if len(answer_tokens) == 1:
-            return -total_logprob
-
-        suffix_input = torch.tensor([answer_tokens[:-1]], device=self.model.device, dtype=torch.long)
-        prefix_len = len(entry.query_tokens)
-        position_ids = torch.arange(prefix_len, prefix_len + suffix_input.size(1), device=self.model.device, dtype=torch.long).unsqueeze(0)
-        # Some Transformers cache implementations are mutable and get extended
-        # even when we only want to score a fixed suffix. Clone the cached
-        # prefix state so different candidates do not contaminate each other.
-        past_key_values = copy.deepcopy(entry.past_key_values)
-        outputs = self.model(
-            input_ids=suffix_input,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            return_dict=True,
-            use_cache=False,
-        )
-        suffix_logprobs = outputs.logits[0].float().cpu().log_softmax(-1)
-        total_logprob += suffix_logprobs[torch.arange(len(answer_tokens) - 1), answer_tokens[1:]].sum().item()
-        return -total_logprob

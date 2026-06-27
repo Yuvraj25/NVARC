@@ -20,7 +20,7 @@ from transformers import DataCollatorForLanguageModeling
 from unsloth import FastLanguageModel, UnslothTrainer, UnslothTrainingArguments
 
 from arc_loader import ArcDataset, QwenFormatter
-from arc_rescoring import FullPassRescorer, PrefixCachedRescorer
+from arc_rescoring import FullPassRescorer
 from arc_sglang import ArcSglangBackend, SglangConfig, SglangRescorer, inference_sglang_dfs
 from arc_search import ASSISTANT_TOKEN_ID, EOS_ID, USER_TOKEN_ID, default_max_score, inference_turbo_dfs
 
@@ -40,7 +40,6 @@ def runtime_config():
         raise ValueError(f"ARC_DFS_PROB_THRESHOLD must be in (0, 1), got {dfs_prob_threshold}")
     sglang_mem_fraction = os.environ.get("ARC_SGLANG_MEM_FRACTION_STATIC")
     return {
-        "use_prefix_cached_rescoring": _env_flag("ARC_USE_PREFIX_CACHED_RESCORING", default=False),
         "use_speculative_dfs": _env_flag("ARC_USE_SPECULATIVE_DFS", default=False),
         "use_sglang": _env_flag("ARC_USE_SGLANG", default=False),
         "profile_timings": _env_flag("ARC_PROFILE_TIMINGS", default=False),
@@ -479,10 +478,9 @@ def worker(rank, queue, end_time):
     formatter = QwenFormatter(tokenizer=tokenizer)
     max_new_tokens = formatter.max_new_tokens()
     max_score = default_max_score(config["dfs_prob_threshold"])
-    rescoring_cls = PrefixCachedRescorer if config["use_prefix_cached_rescoring"] else FullPassRescorer
     print(
-        f"[Rank {rank}] config: prefix_cached_rescoring={config['use_prefix_cached_rescoring']} "
-        f"speculative_dfs={config['use_speculative_dfs']} dfs_prob_threshold={config['dfs_prob_threshold']}"
+        f"[Rank {rank}] config: speculative_dfs={config['use_speculative_dfs']} "
+        f"dfs_prob_threshold={config['dfs_prob_threshold']}"
     )
 
     arc_test_set = ArcDataset.from_file(config["test_path"])
@@ -608,7 +606,7 @@ def worker(rank, queue, end_time):
 
                     if bk not in rescorers:
                         rescorer_started_at = time.perf_counter()
-                        rescorers[bk] = rescoring_cls(
+                        rescorers[bk] = FullPassRescorer(
                             model=model,
                             tokenizer=tokenizer,
                             formatter=formatter,

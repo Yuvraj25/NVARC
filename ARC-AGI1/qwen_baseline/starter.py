@@ -52,7 +52,6 @@ if __name__ == "__main__":
     parser.add_argument("--keys-json", type=str, default=None)
     parser.add_argument("--limit-keys", type=int, default=None)
     parser.add_argument("--nprocs", type=int, default=4)
-    parser.add_argument("--use-prefix-cached-rescoring", action="store_true")
     parser.add_argument("--use-speculative-dfs", action="store_true")
     parser.add_argument("--use-sglang", action="store_true")
     parser.add_argument("--sglang-tp-size", type=int, default=1)
@@ -64,7 +63,6 @@ if __name__ == "__main__":
     if args.use_sglang and args.sglang_tp_size > 1 and args.nprocs != 1:
         raise ValueError("--use-sglang with --sglang-tp-size > 1 must run with --nprocs 1 so one SGLang engine can see all GPUs")
     end_time = args.end_time if args.end_time is not None else time.time() + 12 * 3600
-    os.environ["ARC_USE_PREFIX_CACHED_RESCORING"] = "1" if args.use_prefix_cached_rescoring else "0"
     os.environ["ARC_USE_SPECULATIVE_DFS"] = "1" if args.use_speculative_dfs else "0"
     os.environ["ARC_USE_SGLANG"] = "1" if args.use_sglang else "0"
     os.environ["ARC_SGLANG_TP_SIZE"] = str(args.sglang_tp_size)
@@ -80,7 +78,6 @@ if __name__ == "__main__":
     os.environ["ARC_OUTPUT_DIR"] = args.output_dir
     print(
         "runtime flags:",
-        f"prefix_cached_rescoring={os.environ['ARC_USE_PREFIX_CACHED_RESCORING']}",
         f"speculative_dfs={os.environ['ARC_USE_SPECULATIVE_DFS']}",
         f"use_sglang={os.environ['ARC_USE_SGLANG']}",
         f"sglang_tp_size={os.environ['ARC_SGLANG_TP_SIZE']}",
