@@ -29,8 +29,6 @@ def local_worker(rank, queue, end_time):
 
 
 def _load_selected_keys(args, data):
-    if args.sglang_infer_from_manifest:
-        raise ValueError("selected keys are not used with --sglang-infer-from-manifest")
     if args.keys_json:
         selected = json.loads(args.keys_json)
         assert isinstance(selected, list), "--keys-json must decode to a JSON list"
@@ -48,6 +46,14 @@ def _load_manifest_jobs(args):
     with open(args.sglang_infer_from_manifest, "r") as f:
         data = json.load(f)
     entries = data.get("entries", [])
+    selected = None
+    if args.keys_json:
+        selected = json.loads(args.keys_json)
+        assert isinstance(selected, list), "--keys-json must decode to a JSON list"
+        selected = set(selected)
+    elif args.keys_file:
+        with open(args.keys_file, "r") as f:
+            selected = {line.strip() for line in f if line.strip()}
     jobs = []
     for entry in entries:
         if entry.get("status") != "ready":
@@ -56,6 +62,8 @@ def _load_manifest_jobs(args):
         adapter_path = entry.get("adapter_path")
         if not key or not adapter_path:
             raise ValueError(f"Invalid manifest entry: {entry}")
+        if selected is not None and key not in selected:
+            continue
         jobs.append({"key": key, "adapter_path": adapter_path})
     jobs.sort(key=lambda item: item["key"])
     if args.limit_keys is not None:

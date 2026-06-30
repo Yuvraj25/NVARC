@@ -139,7 +139,8 @@ def _load_manifest_file(manifest_path: str):
 
 
 def _upsert_manifest_entry(manifest_path: str, entry: dict[str, Any]):
-    os.makedirs(os.path.dirname(manifest_path), exist_ok=True)
+    manifest_dir = os.path.dirname(manifest_path) or "."
+    os.makedirs(manifest_dir, exist_ok=True)
     lock_path = f"{manifest_path}.lock"
     with open(lock_path, "a+") as lock_file:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
@@ -149,7 +150,7 @@ def _upsert_manifest_entry(manifest_path: str, entry: dict[str, Any]):
         filtered.append(entry)
         filtered.sort(key=lambda item: item.get("key", ""))
         data["entries"] = filtered
-        with tempfile.NamedTemporaryFile("w", delete=False, dir=os.path.dirname(manifest_path), prefix=".manifest.", suffix=".tmp") as tmp_file:
+        with tempfile.NamedTemporaryFile("w", delete=False, dir=manifest_dir, prefix=".manifest.", suffix=".tmp") as tmp_file:
             json.dump(data, tmp_file, indent=2, sort_keys=True)
             tmp_file.write("\n")
             tmp_path = tmp_file.name
