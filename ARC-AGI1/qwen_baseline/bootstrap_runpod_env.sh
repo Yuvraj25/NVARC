@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 ACTION="${1:-bootstrap}"
-VENV_DIR="${VENV_DIR:-/root/arc311}"
+VENV_DIR="${VENV_DIR:-/root/311}"
 PYTHON_BIN="${PYTHON_BIN:-python3.11}"
 UNSLOTH_TREE="${UNSLOTH_TREE:-/workspace/kaggle_artifacts/pip-install-unsloth-flash-patch_output}"
 SGLANG_WHEEL_DIR="${SGLANG_WHEEL_DIR:-/workspace/kaggle_artifacts/notebookc4ca2ea220_output/offline_pkgs}"
@@ -50,20 +50,30 @@ install_sglang_wheels() {
     ninja==1.13.0 \
     pybase64==1.4.2 \
     pydantic==2.11.7 \
+    pyzmq==27.0.2 \
+    fastapi==0.116.1 \
+    orjson==3.11.3 \
+    openai==1.99.1 \
+    uvicorn==0.35.0 \
+    uvloop==0.21.0 \
+    partial_json_parser==0.2.1.1.post6 \
     sglang==0.5.1.post3
 }
 
 verify_env() {
   activate_env
+  cd "$ROOT_DIR"
   python - <<'PY'
 import torch
 import unsloth
 import sglang
+from sglang.srt.lora.lora import LoRAAdapter
 
 print("torch", torch.__version__)
 print("cuda", torch.version.cuda)
 print("sglang", sglang.__version__)
 print("unsloth_ok", hasattr(unsloth, "__file__"))
+print("lora_adapter_ok", LoRAAdapter.__name__)
 PY
 }
 
