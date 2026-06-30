@@ -9,6 +9,7 @@ import os
 import pickle
 import re
 import shutil
+import tempfile
 import time
 from collections import defaultdict
 from contextlib import redirect_stderr, redirect_stdout
@@ -139,20 +140,19 @@ def _load_manifest_file(manifest_path: str):
 
 def _upsert_manifest_entry(manifest_path: str, entry: dict[str, Any]):
     os.makedirs(os.path.dirname(manifest_path), exist_ok=True)
-    with open(manifest_path, "a+") as lock_file:
+    lock_path = f"{manifest_path}.lock"
+    with open(lock_path, "a+") as lock_file:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-        lock_file.seek(0)
-        raw = lock_file.read()
-        data = json.loads(raw) if raw.strip() else _manifest_skeleton()
+        data = _load_manifest_file(manifest_path)
         entries = data.get("entries", [])
         filtered = [existing for existing in entries if existing.get("key") != entry["key"]]
         filtered.append(entry)
         filtered.sort(key=lambda item: item.get("key", ""))
         data["entries"] = filtered
-        tmp_path = f"{manifest_path}.tmp"
-        with open(tmp_path, "w") as tmp_file:
+        with tempfile.NamedTemporaryFile("w", delete=False, dir=os.path.dirname(manifest_path), prefix=".manifest.", suffix=".tmp") as tmp_file:
             json.dump(data, tmp_file, indent=2, sort_keys=True)
             tmp_file.write("\n")
+            tmp_path = tmp_file.name
         os.replace(tmp_path, manifest_path)
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
@@ -632,8 +632,6 @@ def worker_sglang(rank, queue, end_time, config):
                         print(f"[Rank {rank}] saved adapter for puzzle {key} to {adapter_path}")
                         print(f"[Rank {rank}] adapter manifest updated: {manifest_path}")
                         print(f"[Rank {rank}] finished adapter-only pass for {key} in {spend_time:.1f}s")
-                        del tokenizer
-                        del formatter
                         gc.collect()
                         torch.cuda.empty_cache()
                         continue
