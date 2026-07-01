@@ -77,6 +77,12 @@ def _default_submission_path(output_dir: Path) -> Path:
     return output_dir.parent / "submission.json"
 
 
+def _clear_worker_sentinels() -> None:
+    for path in ROOT_DIR.parent.glob("worker*"):
+        if path.is_file():
+            path.unlink()
+
+
 def _starter_common_args(args, chunk_keys: list[str]) -> list[str]:
     cmd = [
         "--use-sglang",
@@ -136,6 +142,7 @@ def _run_starter(args, chunk_keys: list[str], phase: str) -> None:
         )
     else:
         raise ValueError(f"Unknown phase: {phase}")
+    _clear_worker_sentinels()
     print(f"[chunked] running {phase}: {' '.join(cmd)}", flush=True)
     subprocess.run(cmd, cwd=ROOT_DIR, check=True, env=os.environ.copy())
 
@@ -235,12 +242,16 @@ def main():
     parser = build_parser()
     args = parser.parse_args()
 
+    test_path = Path(args.test_path).resolve()
+    model_path = Path(args.model_path).resolve()
     output_dir = Path(args.output_dir).resolve()
     adapter_dir = Path(args.sglang_adapter_dir).resolve()
     manifest_path = Path(args.sglang_adapter_manifest).resolve() if args.sglang_adapter_manifest else _default_manifest_path(adapter_dir)
     state_path = Path(args.state_path).resolve() if args.state_path else _default_state_path(output_dir)
     submission_path = Path(args.submission_path).resolve() if args.submission_path else _default_submission_path(output_dir)
 
+    args.test_path = str(test_path)
+    args.model_path = str(model_path)
     args.output_dir = str(output_dir)
     args.sglang_adapter_dir = str(adapter_dir)
     args.sglang_adapter_manifest = str(manifest_path)
