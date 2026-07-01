@@ -242,6 +242,10 @@ def main():
     parser = build_parser()
     args = parser.parse_args()
 
+    if args.sglang_tp_size > 1:
+        args.train_nprocs = 1
+        args.infer_workers = 1
+
     test_path = Path(args.test_path).resolve()
     model_path = Path(args.model_path).resolve()
     output_dir = Path(args.output_dir).resolve()
