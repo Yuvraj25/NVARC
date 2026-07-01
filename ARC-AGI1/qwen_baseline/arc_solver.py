@@ -18,9 +18,6 @@ from typing import Any, Union
 import numpy as np
 import torch
 from datasets import Dataset
-from peft import get_peft_model_state_dict, set_peft_model_state_dict
-from transformers import AutoTokenizer, DataCollatorForLanguageModeling
-from unsloth import FastLanguageModel, UnslothTrainer, UnslothTrainingArguments
 
 from arc_loader import ArcDataset, QwenFormatter
 from arc_rescoring import FullPassRescorer
@@ -62,45 +59,73 @@ def runtime_config():
     }
 
 
-class UnslothFixedTrainer(UnslothTrainer):
-    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        if self.label_smoother is not None and "labels" in inputs:
-            labels = inputs.pop("labels")
-        else:
-            labels = None
-        outputs = model(**inputs)
-        if labels is not None:
-            unwrapped_model = self.accelerator.unwrap_model(model)
-            if hasattr(unwrapped_model, "_get_name") and "unsloth" in unwrapped_model._get_name().lower():
-                loss = self.label_smoother(outputs, labels, shift_labels=True)
+def _get_auto_tokenizer():
+    from transformers import AutoTokenizer
+
+    return AutoTokenizer
+
+
+def _make_unsloth_fixed_trainer_class(UnslothTrainer):
+    class UnslothFixedTrainer(UnslothTrainer):
+        def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+            if self.label_smoother is not None and "labels" in inputs:
+                labels = inputs.pop("labels")
             else:
-                loss = self.label_smoother(outputs, labels)
-        else:
-            loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
-        if hasattr(loss, "clone"):
-            loss = loss.clone()
-        if self.accelerator.num_processes > 1:
-            loss = loss * self.accelerator.num_processes
-        return (loss, outputs) if return_outputs else loss
+                labels = None
+            outputs = model(**inputs)
+            if labels is not None:
+                unwrapped_model = self.accelerator.unwrap_model(model)
+                if hasattr(unwrapped_model, "_get_name") and "unsloth" in unwrapped_model._get_name().lower():
+                    loss = self.label_smoother(outputs, labels, shift_labels=True)
+                else:
+                    loss = self.label_smoother(outputs, labels)
+            else:
+                loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+            if hasattr(loss, "clone"):
+                loss = loss.clone()
+            if self.accelerator.num_processes > 1:
+                loss = loss * self.accelerator.num_processes
+            return (loss, outputs) if return_outputs else loss
+
+    return UnslothFixedTrainer
 
 
-class QwenDataCollatorForCompletionOnlyLM(DataCollatorForLanguageModeling):
-    def torch_call(self, examples: list[Union[list[int], Any, dict[str, Any]]]) -> dict[str, Any]:
-        batch = super().torch_call(examples)
-        for i in range(len(examples)):
-            labels = batch["input_ids"][i].clone()
-            user_start_idx = np.where(labels == USER_TOKEN_ID)[0].tolist()
-            assistant_start_idx = np.where(labels == ASSISTANT_TOKEN_ID)[0].tolist()
-            start_idx = sorted(user_start_idx + assistant_start_idx)
-            end_idx = np.where(labels == EOS_ID)[0]
-            batch["labels"][i, :] = -100
-            for j, (start, end) in enumerate(zip(start_idx, end_idx)):
-                assert start < end
-                if j % 2 == 1:
-                    start += 2
-                    end += 1
-                    batch["labels"][i, start:end] = labels[start:end]
-        return batch
+def _make_qwen_data_collator_class(DataCollatorForLanguageModeling):
+    class QwenDataCollatorForCompletionOnlyLM(DataCollatorForLanguageModeling):
+        def torch_call(self, examples: list[Union[list[int], Any, dict[str, Any]]]) -> dict[str, Any]:
+            batch = super().torch_call(examples)
+            for i in range(len(examples)):
+                labels = batch["input_ids"][i].clone()
+                user_start_idx = np.where(labels == USER_TOKEN_ID)[0].tolist()
+                assistant_start_idx = np.where(labels == ASSISTANT_TOKEN_ID)[0].tolist()
+                start_idx = sorted(user_start_idx + assistant_start_idx)
+                end_idx = np.where(labels == EOS_ID)[0]
+                batch["labels"][i, :] = -100
+                for j, (start, end) in enumerate(zip(start_idx, end_idx)):
+                    assert start < end
+                    if j % 2 == 1:
+                        start += 2
+                        end += 1
+                        batch["labels"][i, start:end] = labels[start:end]
+            return batch
+
+    return QwenDataCollatorForCompletionOnlyLM
+
+
+def _get_unsloth_training_stack():
+    from unsloth import FastLanguageModel, UnslothTrainer, UnslothTrainingArguments
+    from peft import get_peft_model_state_dict, set_peft_model_state_dict
+    from transformers import AutoTokenizer, DataCollatorForLanguageModeling
+
+    return {
+        "FastLanguageModel": FastLanguageModel,
+        "UnslothTrainingArguments": UnslothTrainingArguments,
+        "UnslothFixedTrainer": _make_unsloth_fixed_trainer_class(UnslothTrainer),
+        "QwenDataCollatorForCompletionOnlyLM": _make_qwen_data_collator_class(DataCollatorForLanguageModeling),
+        "get_peft_model_state_dict": get_peft_model_state_dict,
+        "set_peft_model_state_dict": set_peft_model_state_dict,
+        "AutoTokenizer": AutoTokenizer,
+    }
 
 
 def stable_seed_from_key(key: str) -> int:
@@ -471,6 +496,7 @@ def worker_sglang(rank, queue, end_time, config):
     persistent_formatter = None
     persistent_max_new_tokens = None
     if config["sglang_persistent_infer"]:
+        AutoTokenizer = _get_auto_tokenizer()
         persistent_tokenizer = AutoTokenizer.from_pretrained(
             config["model_path"],
             trust_remote_code=True,
@@ -539,6 +565,7 @@ def worker_sglang(rank, queue, end_time, config):
                 elif config["sglang_reuse_adapters"]:
                     if not os.path.isdir(adapter_path):
                         raise FileNotFoundError(f"Saved adapter not found for {key}: {adapter_path}")
+                    AutoTokenizer = _get_auto_tokenizer()
                     tokenizer = AutoTokenizer.from_pretrained(
                         config["model_path"],
                         trust_remote_code=True,
@@ -563,6 +590,11 @@ def worker_sglang(rank, queue, end_time, config):
                     )
                     timing_stats["engine_init_s"] = backend.engine_init_s
                 else:
+                    training_stack = _get_unsloth_training_stack()
+                    FastLanguageModel = training_stack["FastLanguageModel"]
+                    UnslothTrainingArguments = training_stack["UnslothTrainingArguments"]
+                    UnslothFixedTrainer = training_stack["UnslothFixedTrainer"]
+                    QwenDataCollatorForCompletionOnlyLM = training_stack["QwenDataCollatorForCompletionOnlyLM"]
                     model, tokenizer = FastLanguageModel.from_pretrained(
                         model_name=config["model_path"],
                         full_finetuning=False,
@@ -754,6 +786,13 @@ def worker(rank, queue, end_time):
     )
 
     max_seq_length = 8192
+    training_stack = _get_unsloth_training_stack()
+    FastLanguageModel = training_stack["FastLanguageModel"]
+    UnslothTrainingArguments = training_stack["UnslothTrainingArguments"]
+    UnslothFixedTrainer = training_stack["UnslothFixedTrainer"]
+    QwenDataCollatorForCompletionOnlyLM = training_stack["QwenDataCollatorForCompletionOnlyLM"]
+    get_peft_model_state_dict = training_stack["get_peft_model_state_dict"]
+    set_peft_model_state_dict = training_stack["set_peft_model_state_dict"]
 
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=config["model_path"],
