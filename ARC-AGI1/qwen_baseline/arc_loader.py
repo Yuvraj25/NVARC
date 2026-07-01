@@ -1,7 +1,7 @@
 import json
+from typing import Any
 
 import numpy as np
-from transformers import AutoTokenizer
 
 
 def convert_grid_to_string(grid) -> str:
@@ -43,7 +43,7 @@ def permute_rnd_all_(_query):
 
 
 class QwenFormatter:
-    def __init__(self, tokenizer: AutoTokenizer):
+    def __init__(self, tokenizer: Any):
         self.tokenizer = tokenizer
 
     def fmt_query(self, query) -> str:
