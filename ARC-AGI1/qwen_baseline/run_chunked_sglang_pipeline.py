@@ -153,6 +153,32 @@ def _cleanup_adapters(adapter_dir: Path, chunk_keys: list[str]) -> None:
         shutil.rmtree(path, ignore_errors=True)
 
 
+def _expected_output_base_keys(test_path: str, puzzle_keys: list[str]) -> dict[str, set[str]]:
+    with open(test_path, "r") as f:
+        data = json.load(f)
+    return {key: {f"{key}_{i}" for i in range(len(data[key]["test"]))} for key in puzzle_keys}
+
+
+def _observed_output_base_keys(output_dir: Path) -> set[str]:
+    if not output_dir.exists():
+        return set()
+    return {path.name.split(".")[0] for path in output_dir.iterdir() if path.is_file()}
+
+
+def _partition_completed_keys(test_path: str, output_dir: Path, puzzle_keys: list[str]) -> tuple[list[str], dict[str, list[str]]]:
+    expected = _expected_output_base_keys(test_path, puzzle_keys)
+    observed = _observed_output_base_keys(output_dir)
+    completed = []
+    missing = {}
+    for key in puzzle_keys:
+        missing_outputs = sorted(expected[key] - observed)
+        if missing_outputs:
+            missing[key] = missing_outputs
+        else:
+            completed.append(key)
+    return completed, missing
+
+
 def _write_submission(test_path: str, output_dir: Path, submission_path: Path, selection_algorithm: str) -> None:
     dataset = ArcDataset.from_file(test_path)
     decoder = ArcDecoder(dataset, n_guesses=2)
@@ -245,22 +271,40 @@ def main():
         _run_starter(args, chunk_keys, phase="train")
         _run_starter(args, chunk_keys, phase="infer")
         _write_submission(args.test_path, output_dir, submission_path, args.selection_algorithm)
+        completed_keys, missing_outputs = _partition_completed_keys(args.test_path, output_dir, chunk_keys)
+        incomplete_keys = [key for key in chunk_keys if key not in completed_keys]
 
         state.setdefault("history", []).append(
             {
                 "chunk_index": chunk_index,
                 "keys": chunk_keys,
+                "completed_keys": completed_keys,
+                "incomplete_keys": incomplete_keys,
+                "missing_outputs": missing_outputs,
                 "completed_at": time.time(),
             }
         )
-        done_keys.update(chunk_keys)
+        done_keys.update(completed_keys)
         state["done_keys"] = sorted(done_keys)
         _save_state(state_path, state)
 
-        if not args.keep_adapters:
-            _cleanup_adapters(adapter_dir, chunk_keys)
-            _prune_manifest(manifest_path, chunk_keys)
-            print(f"[chunked] cleaned adapters for chunk {chunk_index}", flush=True)
+        if incomplete_keys:
+            print(
+                f"[chunked] chunk {chunk_index} incomplete; completed_keys={completed_keys} "
+                f"incomplete_keys={incomplete_keys} missing_outputs={missing_outputs}",
+                flush=True,
+            )
+        else:
+            print(f"[chunked] chunk {chunk_index} complete for all keys", flush=True)
+
+        if not args.keep_adapters and completed_keys:
+            _cleanup_adapters(adapter_dir, completed_keys)
+            _prune_manifest(manifest_path, completed_keys)
+            print(f"[chunked] cleaned adapters for completed keys in chunk {chunk_index}", flush=True)
+
+        if incomplete_keys:
+            print("[chunked] stopping after partial chunk so unfinished keys can be resumed safely", flush=True)
+            break
 
     _write_submission(args.test_path, output_dir, submission_path, args.selection_algorithm)
     print(f"[chunked] complete; final submission at {submission_path}", flush=True)
