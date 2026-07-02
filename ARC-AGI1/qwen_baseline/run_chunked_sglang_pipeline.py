@@ -312,14 +312,13 @@ def main():
         else:
             print(f"[chunked] chunk {chunk_index} complete for all keys", flush=True)
 
-        if not args.keep_adapters and completed_keys:
-            _cleanup_adapters(adapter_dir, completed_keys)
-            _prune_manifest(manifest_path, completed_keys)
-            print(f"[chunked] cleaned adapters for completed keys in chunk {chunk_index}", flush=True)
+        if not args.keep_adapters and chunk_keys:
+            _cleanup_adapters(adapter_dir, chunk_keys)
+            _prune_manifest(manifest_path, chunk_keys)
+            print(f"[chunked] cleaned adapters for processed keys in chunk {chunk_index}", flush=True)
 
         if incomplete_keys:
-            print("[chunked] stopping after partial chunk so unfinished keys can be resumed safely", flush=True)
-            break
+            print("[chunked] continuing after partial chunk; incomplete keys remain pending for future reruns", flush=True)
 
     _write_submission(args.test_path, output_dir, submission_path, args.selection_algorithm)
     print(f"[chunked] complete; final submission at {submission_path}", flush=True)

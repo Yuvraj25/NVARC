@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import tempfile
 import time
 
 import torch
@@ -13,6 +14,13 @@ def local_worker(rank, queue, end_time):
     if not (use_sglang and sglang_tp_size > 1):
         os.environ["CUDA_VISIBLE_DEVICES"] = str(rank)
     torch.set_default_device("cpu")
+
+    # Unsloth dynamically generates RL trainer modules during import.
+    # With multiple spawned workers, the shared default compile cache can race
+    # and intermittently produce missing Unsloth*Trainer attributes.
+    compile_root = os.path.join(tempfile.gettempdir(), f"unsloth_compile_rank{rank}_pid{os.getpid()}")
+    os.makedirs(compile_root, exist_ok=True)
+    os.environ["UNSLOTH_COMPILE_LOCATION"] = compile_root
 
     if rank > 0:
         while not os.path.exists(f"../worker{rank - 1}"):
