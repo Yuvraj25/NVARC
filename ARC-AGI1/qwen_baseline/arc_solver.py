@@ -490,6 +490,8 @@ def worker_sglang(rank, queue, end_time, config):
     arc_test_set = ArcDataset.from_file(config["test_path"])
     dir_outputs = config["output_dir"]
     os.makedirs(dir_outputs, exist_ok=True)
+    if config["sglang_train_adapters_only"]:
+        os.makedirs(config["sglang_adapter_dir"], exist_ok=True)
     os.makedirs(config["sglang_adapter_dir"], exist_ok=True)
     persistent_backend = None
     persistent_tokenizer = None
@@ -870,6 +872,32 @@ def worker(rank, queue, end_time):
             model = trainer.accelerator.unwrap_model(model, keep_fp32_wrapper=False)
             del trainer
         timing_stats["training_s"] += time.perf_counter() - training_started_at
+
+        if config["sglang_train_adapters_only"]:
+            adapter_path = _sglang_adapter_path(config, key)
+            model.save_pretrained(adapter_path)
+            manifest_path = _default_sglang_manifest_path(config)
+            _upsert_manifest_entry(
+                manifest_path,
+                {
+                    "key": key,
+                    "adapter_path": adapter_path,
+                    "size_bytes": _path_size_bytes(adapter_path),
+                    "status": "ready",
+                    "updated_at": time.time(),
+                },
+            )
+            memory_allocated = torch.cuda.max_memory_allocated() // 1024**2
+            print(f"[Rank {rank}] allocated {memory_allocated}MB for training")
+            torch.cuda.reset_peak_memory_stats()
+            print(f"[Rank {rank}] training stats for puzzle {key}: {stats}")
+            spend_time = time.time() - start_time
+            print(f"[Rank {rank}] saved adapter for puzzle {key} to {adapter_path}")
+            print(f"[Rank {rank}] adapter manifest updated: {manifest_path}")
+            print(f"[Rank {rank}] finished adapter-only pass for {key} in {spend_time:.1f}s")
+            gc.collect()
+            torch.cuda.empty_cache()
+            continue
 
         prep_started_at = time.perf_counter()
         model = FastLanguageModel.for_inference(model)
