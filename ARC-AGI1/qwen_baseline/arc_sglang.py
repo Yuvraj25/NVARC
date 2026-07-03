@@ -2,6 +2,7 @@ import gc
 import math
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 import torch
@@ -48,7 +49,32 @@ def _bump_count(count_stats, key, amount=1):
 
 
 def _patch_sglang_rslora(sglang):
+    import sys
+
     from sglang.srt.lora.lora import LoRAAdapter
+
+    module = sys.modules.get(LoRAAdapter.__module__)
+    source_path = getattr(module, "__file__", None)
+    if source_path and source_path.endswith(".py"):
+        path = Path(source_path)
+        text = path.read_text()
+        old_variants = [
+            "self.scaling = self.config.lora_alpha / self.config.r",
+            "self.scaling: float = self.config.lora_alpha / self.config.r",
+        ]
+        new = (
+            "self.scaling: float = (self.config.lora_alpha / (self.config.r ** 0.5) "
+            "if getattr(self.config, 'hf_config', {}).get('use_rslora') "
+            "else self.config.lora_alpha / self.config.r)"
+        )
+        if new not in text:
+            for old in old_variants:
+                if old in text:
+                    path.write_text(text.replace(old, new))
+                    print(f"[sglang] patched rsLoRA scaling in {path}")
+                    break
+            else:
+                raise RuntimeError(f"Could not patch SGLang rsLoRA scaling in {path}")
 
     if getattr(LoRAAdapter, "_arc_rslora_patched", False):
         return
