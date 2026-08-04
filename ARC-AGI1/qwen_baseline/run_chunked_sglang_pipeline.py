@@ -209,6 +209,32 @@ def _save_state(state_path: Path, state: dict) -> None:
     _save_json_atomic(state_path, state)
 
 
+def _validate_inference_manifest(manifest_path: Path, selected_keys: list[str]) -> None:
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"Inference-only adapter manifest not found: {manifest_path}")
+
+    manifest = _load_json(manifest_path, {"entries": []})
+    entries = {
+        entry.get("key"): entry
+        for entry in manifest.get("entries", [])
+        if entry.get("status") == "ready" and entry.get("key")
+    }
+    missing_keys = [key for key in selected_keys if key not in entries]
+    if missing_keys:
+        raise ValueError(f"Inference-only manifest has no ready adapter for keys: {missing_keys}")
+
+    missing_paths = [
+        (key, entries[key].get("adapter_path"))
+        for key in selected_keys
+        if not entries[key].get("adapter_path") or not Path(entries[key]["adapter_path"]).is_dir()
+    ]
+    if missing_paths:
+        raise FileNotFoundError(
+            "Inference-only adapter paths are missing. Rebase paths from the original "
+            f"/kaggle/working location to the attached input: {missing_paths}"
+        )
+
+
 def build_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument("--end-time", type=float, default=None)
@@ -235,6 +261,11 @@ def build_parser():
     parser.add_argument("--submission-path", type=str, default=None)
     parser.add_argument("--max-chunks", type=int, default=None)
     parser.add_argument("--keep-adapters", action="store_true")
+    parser.add_argument(
+        "--inference-only",
+        action="store_true",
+        help="Skip adapter training and infer from the supplied adapter manifest.",
+    )
     return parser
 
 
@@ -261,16 +292,23 @@ def main():
     args.sglang_adapter_manifest = str(manifest_path)
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    adapter_dir.mkdir(parents=True, exist_ok=True)
+    if args.inference_only:
+        if not adapter_dir.is_dir():
+            raise FileNotFoundError(f"Inference-only adapter directory not found: {adapter_dir}")
+    else:
+        adapter_dir.mkdir(parents=True, exist_ok=True)
 
     state = _load_state(state_path)
     done_keys = set(state.get("done_keys", []))
     selected_keys = _load_selected_keys(args)
+    if args.inference_only:
+        _validate_inference_manifest(manifest_path, selected_keys)
     pending_keys = [key for key in selected_keys if key not in done_keys]
 
     print(
         f"[chunked] total_keys={len(selected_keys)} done_keys={len(done_keys)} pending_keys={len(pending_keys)} "
-        f"chunk_size={args.chunk_size} train_nprocs={args.train_nprocs} infer_workers={args.infer_workers}",
+        f"chunk_size={args.chunk_size} train_nprocs={args.train_nprocs} infer_workers={args.infer_workers} "
+        f"inference_only={args.inference_only}",
         flush=True,
     )
 
@@ -283,7 +321,8 @@ def main():
             break
 
         print(f"[chunked] chunk {chunk_index}: {chunk_keys}", flush=True)
-        _run_starter(args, chunk_keys, phase="train")
+        if not args.inference_only:
+            _run_starter(args, chunk_keys, phase="train")
         _run_starter(args, chunk_keys, phase="infer")
         _write_submission(args.test_path, output_dir, submission_path, args.selection_algorithm)
         completed_keys, missing_outputs = _partition_completed_keys(args.test_path, output_dir, chunk_keys)
@@ -312,7 +351,7 @@ def main():
         else:
             print(f"[chunked] chunk {chunk_index} complete for all keys", flush=True)
 
-        if not args.keep_adapters and chunk_keys:
+        if not args.inference_only and not args.keep_adapters and chunk_keys:
             _cleanup_adapters(adapter_dir, chunk_keys)
             _prune_manifest(manifest_path, chunk_keys)
             print(f"[chunked] cleaned adapters for processed keys in chunk {chunk_index}", flush=True)

@@ -355,18 +355,27 @@ def _print_sglang_profile(rank, key, timing_stats, count_stats, backend, rescore
     backend_next_arc_calls = int(backend.stats["next_arc_logprobs_calls"])
     backend_next_arc_prompts = int(backend.stats["next_arc_logprobs_prompts"])
     backend_next_arc_prompt_tokens = int(backend.stats["next_arc_logprobs_prompt_tokens"])
+    backend_next_arc_cached_tokens = int(backend.stats["next_arc_logprobs_cached_tokens"])
     backend_next_arc_max_batch = int(backend.stats["next_arc_logprobs_max_batch"])
     backend_draft_arc_s = backend.stats["draft_arc_logprobs_time_s"]
     backend_draft_arc_calls = int(backend.stats["draft_arc_logprobs_calls"])
     backend_draft_arc_prompts = int(backend.stats["draft_arc_logprobs_prompts"])
     backend_draft_arc_prompt_tokens = int(backend.stats["draft_arc_logprobs_prompt_tokens"])
     backend_draft_arc_tokens = int(backend.stats["draft_arc_logprobs_draft_tokens"])
+    backend_draft_arc_cached_tokens = int(backend.stats["draft_arc_logprobs_cached_tokens"])
     backend_draft_arc_max_batch = int(backend.stats["draft_arc_logprobs_max_batch"])
     backend_total_calls = backend_next_arc_calls + backend_draft_arc_calls
     backend_total_positions = backend_next_arc_prompts + backend_draft_arc_tokens
+    backend_total_prompt_tokens = (
+        backend_next_arc_prompt_tokens + backend_draft_arc_prompt_tokens + backend_draft_arc_tokens
+    )
+    backend_total_cached_tokens = backend_next_arc_cached_tokens + backend_draft_arc_cached_tokens
     backend_total_time_s = backend_next_arc_s + backend_draft_arc_s
     backend_max_batch = max(backend_next_arc_max_batch, backend_draft_arc_max_batch)
     backend_avg_positions_per_call = backend_total_positions / backend_total_calls if backend_total_calls else 0.0
+    backend_cache_fraction = (
+        backend_total_cached_tokens / backend_total_prompt_tokens if backend_total_prompt_tokens else 0.0
+    )
     timing_stats["dfs_backend_next_arc_s"] = backend_total_time_s
     timing_stats["dfs_python_overhead_s"] = max(timing_stats["dfs_s"] - backend_total_time_s, 0.0)
     ordered_timings = [
@@ -429,10 +438,31 @@ def _print_sglang_profile(rank, key, timing_stats, count_stats, backend, rescore
         f"calls_total={backend_total_calls} "
         f"prompts_evaluated={backend_total_positions} "
         f"next_prompt_tokens={backend_next_arc_prompt_tokens} "
+        f"next_cached_tokens={backend_next_arc_cached_tokens} "
         f"draft_prompt_tokens={backend_draft_arc_prompt_tokens} "
         f"draft_tokens_verified={backend_draft_arc_tokens} "
+        f"draft_cached_tokens={backend_draft_arc_cached_tokens} "
+        f"cache_fraction={backend_cache_fraction:.6f} "
         f"avg_positions_per_call={backend_avg_positions_per_call:.2f} "
         f"max_batch_size={backend_max_batch}"
+    )
+    backend_score_calls = int(backend.stats["score_arc_logprobs_calls"])
+    backend_score_prompts = int(backend.stats["score_arc_logprobs_prompts"])
+    backend_score_prompt_tokens = int(backend.stats["score_arc_logprobs_prompt_tokens"])
+    backend_score_answer_tokens = int(backend.stats["score_arc_logprobs_answer_tokens"])
+    backend_score_cached_tokens = int(backend.stats["score_arc_logprobs_cached_tokens"])
+    backend_score_input_tokens = backend_score_prompt_tokens + backend_score_answer_tokens
+    backend_score_cache_fraction = (
+        backend_score_cached_tokens / backend_score_input_tokens if backend_score_input_tokens else 0.0
+    )
+    print(
+        f"[Rank {rank}] rescore backend summary for {key}: "
+        f"calls={backend_score_calls} "
+        f"prompts={backend_score_prompts} "
+        f"prompt_tokens={backend_score_prompt_tokens} "
+        f"answer_tokens={backend_score_answer_tokens} "
+        f"cached_tokens={backend_score_cached_tokens} "
+        f"cache_fraction={backend_score_cache_fraction:.6f}"
     )
     for base_key, rescorer in sorted(rescorers.items()):
         print(f"[Rank {rank}] rescorer summary for {base_key}: {rescorer.format_stats()}")
@@ -752,7 +782,17 @@ def worker(rank, queue, end_time):
 
     peft_params = dict(
         r=256,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        target_modules=[
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+            "embed_tokens",
+            "lm_head",
+        ],
         lora_alpha=32,
         lora_dropout=0.0,
         bias="none",

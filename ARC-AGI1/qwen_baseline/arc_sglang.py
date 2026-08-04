@@ -119,18 +119,21 @@ class ArcSglangBackend:
             "next_arc_logprobs_calls": 0,
             "next_arc_logprobs_prompts": 0,
             "next_arc_logprobs_prompt_tokens": 0,
+            "next_arc_logprobs_cached_tokens": 0,
             "next_arc_logprobs_max_batch": 0,
             "next_arc_logprobs_time_s": 0.0,
             "draft_arc_logprobs_calls": 0,
             "draft_arc_logprobs_prompts": 0,
             "draft_arc_logprobs_prompt_tokens": 0,
             "draft_arc_logprobs_draft_tokens": 0,
+            "draft_arc_logprobs_cached_tokens": 0,
             "draft_arc_logprobs_max_batch": 0,
             "draft_arc_logprobs_time_s": 0.0,
             "score_arc_logprobs_calls": 0,
             "score_arc_logprobs_prompts": 0,
             "score_arc_logprobs_prompt_tokens": 0,
             "score_arc_logprobs_answer_tokens": 0,
+            "score_arc_logprobs_cached_tokens": 0,
             "score_arc_logprobs_max_batch": 0,
             "score_arc_logprobs_time_s": 0.0,
         }
@@ -234,8 +237,12 @@ class ArcSglangBackend:
         self.stats["next_arc_logprobs_prompt_tokens"] += sum(len(tokens) for tokens in prefix_tokens)
         self.stats["next_arc_logprobs_max_batch"] = max(self.stats["next_arc_logprobs_max_batch"], len(prefix_tokens))
         self.stats["next_arc_logprobs_time_s"] += elapsed
+        output_batch = _as_batch(outputs)
+        self.stats["next_arc_logprobs_cached_tokens"] += sum(
+            int(output.get("meta_info", {}).get("cached_tokens", 0) or 0) for output in output_batch
+        )
         result = []
-        for output in _as_batch(outputs):
+        for output in output_batch:
             meta = output.get("meta_info", {})
             rows = meta.get("output_token_ids_logprobs")
             if not rows or rows[0] is None:
@@ -273,8 +280,12 @@ class ArcSglangBackend:
         self.stats[f"{stats_prefix}_{token_key}"] += sum(len(tokens) for tokens in answer_tokens)
         self.stats[f"{stats_prefix}_max_batch"] = max(self.stats[f"{stats_prefix}_max_batch"], len(query_tokens))
         self.stats[f"{stats_prefix}_time_s"] += elapsed
+        output_batch = _as_batch(outputs)
+        self.stats[f"{stats_prefix}_cached_tokens"] += sum(
+            int(output.get("meta_info", {}).get("cached_tokens", 0) or 0) for output in output_batch
+        )
         result = []
-        for output, answer in zip(_as_batch(outputs), answer_tokens):
+        for output, answer in zip(output_batch, answer_tokens):
             meta = output.get("meta_info", {})
             token_id_logprobs = meta.get("input_token_ids_logprobs")
             if token_id_logprobs is None:
