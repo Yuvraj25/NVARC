@@ -77,8 +77,8 @@ def _default_submission_path(output_dir: Path) -> Path:
     return output_dir.parent / "submission.json"
 
 
-def _clear_worker_sentinels() -> None:
-    for path in ROOT_DIR.parent.glob("worker*"):
+def _clear_worker_sentinels(prefix: str) -> None:
+    for path in ROOT_DIR.parent.glob(f"{prefix}*"):
         if path.is_file():
             path.unlink()
 
@@ -118,7 +118,14 @@ def _starter_common_args(args, chunk_keys: list[str]) -> list[str]:
     return cmd
 
 
-def _run_starter(args, chunk_keys: list[str], phase: str) -> None:
+def _start_starter(
+    args,
+    chunk_keys: list[str],
+    phase: str,
+    *,
+    cuda_device_offset: int = 0,
+    producer_done_path: Path | None = None,
+) -> subprocess.Popen:
     cmd = [sys.executable, "starter.py"]
     cmd.extend(_starter_common_args(args, chunk_keys))
     if phase == "train":
@@ -129,6 +136,7 @@ def _run_starter(args, chunk_keys: list[str], phase: str) -> None:
                 str(args.train_nprocs),
             ]
         )
+        sentinel_prefix = "worker_train_"
     elif phase == "infer":
         cmd.extend(
             [
@@ -140,9 +148,28 @@ def _run_starter(args, chunk_keys: list[str], phase: str) -> None:
                 "1",
             ]
         )
+        sentinel_prefix = "worker_infer_"
+    elif phase == "stream-infer":
+        if producer_done_path is None:
+            raise ValueError("stream-infer requires producer_done_path")
+        cmd.extend(
+            [
+                "--sglang-stream-manifest",
+                args.sglang_adapter_manifest,
+                "--sglang-producer-done",
+                str(producer_done_path),
+                "--sglang-consume-adapters",
+                "--sglang-infer-workers",
+                str(args.infer_workers),
+                "--nprocs",
+                "1",
+            ]
+        )
+        sentinel_prefix = "worker_infer_"
     else:
         raise ValueError(f"Unknown phase: {phase}")
-    _clear_worker_sentinels()
+    cmd.extend(["--cuda-device-offset", str(cuda_device_offset)])
+    _clear_worker_sentinels(sentinel_prefix)
     print(f"[chunked] running {phase}: {' '.join(cmd)}", flush=True)
     env = os.environ.copy()
     stack_path = env.get("ARC_SGLANG_STACK_PATH")
@@ -150,13 +177,20 @@ def _run_starter(args, chunk_keys: list[str], phase: str) -> None:
         pythonpath = [entry for entry in env.get("PYTHONPATH", "").split(os.pathsep) if entry]
         excluded = {stack_path, "/kaggle/working/arc_stack"}
         pythonpath = [entry for entry in pythonpath if entry not in excluded]
-        if phase == "infer":
+        if phase in {"infer", "stream-infer"}:
             pythonpath.append(stack_path)
         if pythonpath:
             env["PYTHONPATH"] = os.pathsep.join(pythonpath)
         else:
             env.pop("PYTHONPATH", None)
-    subprocess.run(cmd, cwd=ROOT_DIR, check=True, env=env)
+    return subprocess.Popen(cmd, cwd=ROOT_DIR, env=env)
+
+
+def _run_starter(args, chunk_keys: list[str], phase: str) -> None:
+    process = _start_starter(args, chunk_keys, phase)
+    return_code = process.wait()
+    if return_code:
+        raise subprocess.CalledProcessError(return_code, process.args)
 
 
 def _prune_manifest(manifest_path: Path, chunk_keys: list[str]) -> None:
@@ -247,6 +281,130 @@ def _validate_inference_manifest(manifest_path: Path, selected_keys: list[str]) 
         )
 
 
+def _resident_adapter_count(adapter_dir: Path) -> int:
+    return sum(path.is_dir() for path in adapter_dir.iterdir()) if adapter_dir.exists() else 0
+
+
+def _wait_for_adapter_capacity(
+    adapter_dir: Path,
+    max_resident: int,
+    incoming: int,
+    inference_process: subprocess.Popen,
+    end_time: float | None,
+) -> bool:
+    last_report = 0.0
+    while _resident_adapter_count(adapter_dir) + incoming > max_resident:
+        return_code = inference_process.poll()
+        if return_code is not None:
+            if return_code:
+                raise subprocess.CalledProcessError(return_code, inference_process.args)
+            raise RuntimeError("Streaming inference exited before adapter production completed")
+        if end_time is not None and time.time() > end_time:
+            return False
+        if time.time() - last_report >= 30:
+            print(
+                f"[stream] waiting for adapter capacity: resident={_resident_adapter_count(adapter_dir)} "
+                f"incoming={incoming} max={max_resident}",
+                flush=True,
+            )
+            last_report = time.time()
+        time.sleep(1)
+    return True
+
+
+def _run_streaming_pipeline(
+    args,
+    pending_keys: list[str],
+    output_dir: Path,
+    adapter_dir: Path,
+    manifest_path: Path,
+    state_path: Path,
+    submission_path: Path,
+    state: dict,
+    done_keys: set[str],
+) -> None:
+    batches = list(_chunked(pending_keys, args.chunk_size))
+    if args.max_chunks is not None:
+        batches = batches[: args.max_chunks]
+    streaming_keys = [key for batch in batches for key in batch]
+    if not streaming_keys:
+        _write_submission(args.test_path, output_dir, submission_path, args.selection_algorithm)
+        return
+
+    producer_done_path = adapter_dir / "stream_producer_done"
+    try:
+        producer_done_path.unlink()
+    except FileNotFoundError:
+        pass
+
+    inference_process = _start_starter(
+        args,
+        streaming_keys,
+        phase="stream-infer",
+        cuda_device_offset=args.train_nprocs,
+        producer_done_path=producer_done_path,
+    )
+    trained_keys = []
+    training_error = None
+    try:
+        for batch_index, batch_keys in enumerate(batches, 1):
+            if args.end_time is not None and time.time() > args.end_time:
+                print("[stream] reached end_time before starting next training batch", flush=True)
+                break
+            if not _wait_for_adapter_capacity(
+                adapter_dir,
+                args.max_ready_adapters,
+                len(batch_keys),
+                inference_process,
+                args.end_time,
+            ):
+                print("[stream] reached end_time while waiting for adapter capacity", flush=True)
+                break
+            print(f"[stream] training batch {batch_index}: {batch_keys}", flush=True)
+            training_process = _start_starter(args, batch_keys, phase="train", cuda_device_offset=0)
+            return_code = training_process.wait()
+            if return_code:
+                raise subprocess.CalledProcessError(return_code, training_process.args)
+            trained_keys.extend(batch_keys)
+    except BaseException as exc:
+        training_error = exc
+    finally:
+        producer_done_path.write_text("done\n")
+
+    inference_return_code = inference_process.wait()
+    if inference_return_code:
+        raise subprocess.CalledProcessError(inference_return_code, inference_process.args)
+    if training_error is not None:
+        raise training_error
+
+    _write_submission(args.test_path, output_dir, submission_path, args.selection_algorithm)
+    completed_keys, missing_outputs = _partition_completed_keys(args.test_path, output_dir, trained_keys)
+    incomplete_keys = [key for key in trained_keys if key not in completed_keys]
+    state.setdefault("history", []).append(
+        {
+            "mode": "overlap_train_infer",
+            "keys": trained_keys,
+            "completed_keys": completed_keys,
+            "incomplete_keys": incomplete_keys,
+            "missing_outputs": missing_outputs,
+            "completed_at": time.time(),
+        }
+    )
+    done_keys.update(completed_keys)
+    state["done_keys"] = sorted(done_keys)
+    _save_state(state_path, state)
+
+    _cleanup_adapters(adapter_dir, trained_keys)
+    _prune_manifest(manifest_path, trained_keys)
+    print(
+        f"[stream] finished: trained={len(trained_keys)} completed={len(completed_keys)} "
+        f"incomplete={len(incomplete_keys)}",
+        flush=True,
+    )
+    if incomplete_keys:
+        print(f"[stream] incomplete_keys={incomplete_keys} missing_outputs={missing_outputs}", flush=True)
+
+
 def build_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument("--end-time", type=float, default=None)
@@ -274,6 +432,17 @@ def build_parser():
     parser.add_argument("--max-chunks", type=int, default=None)
     parser.add_argument("--keep-adapters", action="store_true")
     parser.add_argument(
+        "--overlap-train-infer",
+        action="store_true",
+        help="Run adapter training and persistent SGLang inference concurrently on disjoint GPUs.",
+    )
+    parser.add_argument(
+        "--max-ready-adapters",
+        type=int,
+        default=16,
+        help="Maximum resident adapter directories in overlap mode.",
+    )
+    parser.add_argument(
         "--inference-only",
         action="store_true",
         help="Skip adapter training and infer from the supplied adapter manifest.",
@@ -288,6 +457,18 @@ def main():
     if args.sglang_tp_size > 1:
         args.train_nprocs = 1
         args.infer_workers = 1
+
+    if args.overlap_train_infer:
+        if args.inference_only:
+            parser.error("--overlap-train-infer cannot be combined with --inference-only")
+        if args.keep_adapters:
+            parser.error("--overlap-train-infer requires adapter consumption; remove --keep-adapters")
+        if args.sglang_tp_size != 1:
+            parser.error("--overlap-train-infer currently requires --sglang-tp-size 1")
+        if args.train_nprocs + args.infer_workers > 4:
+            parser.error("overlap workers exceed the four Kaggle GPUs")
+        if args.chunk_size > args.max_ready_adapters:
+            parser.error("--chunk-size cannot exceed --max-ready-adapters in overlap mode")
 
     test_path = Path(args.test_path).resolve()
     model_path = Path(args.model_path).resolve()
@@ -323,6 +504,22 @@ def main():
         f"inference_only={args.inference_only}",
         flush=True,
     )
+
+    if args.overlap_train_infer:
+        _run_streaming_pipeline(
+            args,
+            pending_keys,
+            output_dir,
+            adapter_dir,
+            manifest_path,
+            state_path,
+            submission_path,
+            state,
+            done_keys,
+        )
+        _write_submission(args.test_path, output_dir, submission_path, args.selection_algorithm)
+        print(f"[chunked] complete; final submission at {submission_path}", flush=True)
+        return
 
     for chunk_index, chunk_keys in enumerate(_chunked(pending_keys, args.chunk_size), start=1):
         if args.max_chunks is not None and chunk_index > args.max_chunks:

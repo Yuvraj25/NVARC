@@ -54,6 +54,7 @@ def runtime_config():
         "sglang_train_adapters_only": _env_flag("ARC_SGLANG_TRAIN_ADAPTERS_ONLY", default=False),
         "sglang_reuse_adapters": _env_flag("ARC_SGLANG_REUSE_ADAPTERS", default=False),
         "sglang_persistent_infer": _env_flag("ARC_SGLANG_PERSISTENT_INFER", default=False),
+        "sglang_consume_adapters": _env_flag("ARC_SGLANG_CONSUME_ADAPTERS", default=False),
         "sglang_speculative_repeat_len": int(os.environ.get("ARC_SGLANG_SPECULATIVE_REPEAT_LEN", "5")),
         "sglang_dynamic_repeat": _env_flag("ARC_SGLANG_DYNAMIC_REPEAT", default=False),
     }
@@ -514,7 +515,7 @@ def worker_sglang(rank, queue, end_time, config):
         f"speculative_dfs={config['use_speculative_dfs']} sglang_speculative_repeat_len={config['sglang_speculative_repeat_len']} "
         f"dynamic_repeat={config['sglang_dynamic_repeat']} "
         f"train_adapters_only={config['sglang_train_adapters_only']} reuse_adapters={config['sglang_reuse_adapters']} "
-        f"persistent_infer={config['sglang_persistent_infer']}"
+        f"persistent_infer={config['sglang_persistent_infer']} consume_adapters={config['sglang_consume_adapters']}"
     )
 
     arc_test_set = ArcDataset.from_file(config["test_path"])
@@ -551,7 +552,7 @@ def worker_sglang(rank, queue, end_time, config):
         print(f"[Rank {rank}] persistent SGLang engine ready: engine_init_s={persistent_backend.engine_init_s:.3f}")
 
     try:
-        while not queue.empty():
+        while True:
             if time.time() > end_time:
                 print(f"[Rank {rank}] stop!")
                 break
@@ -738,6 +739,19 @@ def worker_sglang(rank, queue, end_time, config):
                     unload_started_at = time.perf_counter()
                     backend.unload_adapter()
                     timing_stats["adapter_unload_s"] += time.perf_counter() - unload_started_at
+                    if config["sglang_consume_adapters"]:
+                        shutil.rmtree(adapter_path, ignore_errors=True)
+                        _upsert_manifest_entry(
+                            _default_sglang_manifest_path(config),
+                            {
+                                "key": key,
+                                "adapter_path": adapter_path,
+                                "size_bytes": 0,
+                                "status": "consumed",
+                                "updated_at": time.time(),
+                            },
+                        )
+                        print(f"[Rank {rank}] consumed adapter for puzzle {key}: {adapter_path}")
                 elif backend is not None:
                     backend.close()
                 if (
@@ -870,7 +884,7 @@ def worker(rank, queue, end_time):
     dir_outputs = config["output_dir"]
     os.makedirs(dir_outputs, exist_ok=True)
 
-    while not queue.empty():
+    while True:
         if time.time() > end_time:
             print(f"[Rank {rank}] stop!")
             break

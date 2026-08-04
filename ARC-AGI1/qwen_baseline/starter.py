@@ -8,11 +8,11 @@ import torch
 import torch.multiprocessing as mp
 
 
-def local_worker(rank, queue, end_time):
+def local_worker(rank, queue, end_time, cuda_device_offset, sentinel_prefix):
     use_sglang = os.environ.get("ARC_USE_SGLANG") == "1"
     sglang_tp_size = int(os.environ.get("ARC_SGLANG_TP_SIZE", "1"))
     if not (use_sglang and sglang_tp_size > 1):
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(rank)
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(cuda_device_offset + rank)
     torch.set_default_device("cpu")
 
     # Unsloth dynamically generates RL trainer modules during import.
@@ -23,12 +23,12 @@ def local_worker(rank, queue, end_time):
     os.environ["UNSLOTH_COMPILE_LOCATION"] = compile_root
 
     if rank > 0:
-        while not os.path.exists(f"../worker{rank - 1}"):
+        while not os.path.exists(f"../{sentinel_prefix}{rank - 1}"):
             time.sleep(5)
 
     from arc_solver import worker
 
-    with open(f"../worker{rank}", "w") as f:
+    with open(f"../{sentinel_prefix}{rank}", "w") as f:
         f.write("Ok")
 
     print(f"[Rank {rank}] start!")
@@ -79,6 +79,31 @@ def _load_manifest_jobs(args):
     return jobs
 
 
+def _load_streaming_manifest_jobs(args, queued_keys):
+    if not os.path.isfile(args.sglang_stream_manifest):
+        return []
+    with open(args.sglang_stream_manifest, "r") as f:
+        data = json.load(f)
+    selected = None
+    if args.keys_json:
+        selected = set(json.loads(args.keys_json))
+    elif args.keys_file:
+        with open(args.keys_file, "r") as f:
+            selected = {line.strip() for line in f if line.strip()}
+    jobs = []
+    for entry in data.get("entries", []):
+        key = entry.get("key")
+        if entry.get("status") != "ready" or not key or key in queued_keys:
+            continue
+        if selected is not None and key not in selected:
+            continue
+        adapter_path = entry.get("adapter_path")
+        if adapter_path and os.path.isdir(adapter_path):
+            jobs.append({"key": key, "adapter_path": adapter_path})
+    jobs.sort(key=lambda item: item["key"])
+    return jobs
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--end-time", type=float, default=None)
@@ -89,6 +114,7 @@ if __name__ == "__main__":
     parser.add_argument("--keys-json", type=str, default=None)
     parser.add_argument("--limit-keys", type=int, default=None)
     parser.add_argument("--nprocs", type=int, default=4)
+    parser.add_argument("--cuda-device-offset", type=int, default=0)
     parser.add_argument("--use-speculative-dfs", action="store_true")
     parser.add_argument("--use-sglang", action="store_true")
     parser.add_argument("--sglang-tp-size", type=int, default=1)
@@ -98,6 +124,9 @@ if __name__ == "__main__":
     parser.add_argument("--sglang-train-adapters-only", action="store_true")
     parser.add_argument("--sglang-reuse-adapters", action="store_true")
     parser.add_argument("--sglang-infer-from-manifest", type=str, default=None)
+    parser.add_argument("--sglang-stream-manifest", type=str, default=None)
+    parser.add_argument("--sglang-producer-done", type=str, default=None)
+    parser.add_argument("--sglang-consume-adapters", action="store_true")
     parser.add_argument("--sglang-infer-workers", type=int, default=None)
     parser.add_argument("--sglang-speculative-repeat-len", type=int, default=5)
     parser.add_argument("--sglang-dynamic-repeat", action="store_true")
@@ -110,6 +139,12 @@ if __name__ == "__main__":
         raise ValueError("--sglang-infer-from-manifest requires --use-sglang")
     if args.sglang_infer_from_manifest and args.sglang_train_adapters_only:
         raise ValueError("--sglang-infer-from-manifest cannot be combined with --sglang-train-adapters-only")
+    if args.sglang_stream_manifest and not args.use_sglang:
+        raise ValueError("--sglang-stream-manifest requires --use-sglang")
+    if args.sglang_stream_manifest and (args.sglang_infer_from_manifest or args.sglang_train_adapters_only):
+        raise ValueError("--sglang-stream-manifest is a distinct persistent-inference mode")
+    if args.sglang_stream_manifest and not args.sglang_producer_done:
+        raise ValueError("--sglang-stream-manifest requires --sglang-producer-done")
     effective_nprocs = args.sglang_infer_workers if args.sglang_infer_workers is not None else args.nprocs
     if args.use_sglang and args.sglang_tp_size > 1 and effective_nprocs != 1:
         raise ValueError("--use-sglang with --sglang-tp-size > 1 must run with exactly one worker")
@@ -127,7 +162,8 @@ if __name__ == "__main__":
     )
     os.environ["ARC_SGLANG_TRAIN_ADAPTERS_ONLY"] = "1" if args.sglang_train_adapters_only else "0"
     os.environ["ARC_SGLANG_REUSE_ADAPTERS"] = "1" if args.sglang_reuse_adapters else "0"
-    os.environ["ARC_SGLANG_PERSISTENT_INFER"] = "1" if args.sglang_infer_from_manifest else "0"
+    os.environ["ARC_SGLANG_PERSISTENT_INFER"] = "1" if (args.sglang_infer_from_manifest or args.sglang_stream_manifest) else "0"
+    os.environ["ARC_SGLANG_CONSUME_ADAPTERS"] = "1" if args.sglang_consume_adapters else "0"
     os.environ["ARC_SGLANG_SPECULATIVE_REPEAT_LEN"] = str(args.sglang_speculative_repeat_len)
     os.environ["ARC_SGLANG_DYNAMIC_REPEAT"] = "1" if args.sglang_dynamic_repeat else "0"
     os.environ["ARC_DFS_PROB_THRESHOLD"] = str(args.dfs_prob_threshold)
@@ -146,6 +182,7 @@ if __name__ == "__main__":
         f"sglang_train_adapters_only={os.environ['ARC_SGLANG_TRAIN_ADAPTERS_ONLY']}",
         f"sglang_reuse_adapters={os.environ['ARC_SGLANG_REUSE_ADAPTERS']}",
         f"sglang_persistent_infer={os.environ['ARC_SGLANG_PERSISTENT_INFER']}",
+        f"sglang_consume_adapters={os.environ['ARC_SGLANG_CONSUME_ADAPTERS']}",
         f"sglang_speculative_repeat_len={os.environ['ARC_SGLANG_SPECULATIVE_REPEAT_LEN']}",
         f"sglang_dynamic_repeat={os.environ['ARC_SGLANG_DYNAMIC_REPEAT']}",
         f"dfs_prob_threshold={os.environ['ARC_DFS_PROB_THRESHOLD']}",
@@ -156,8 +193,11 @@ if __name__ == "__main__":
     )
 
     rerun_mode = True
-    queue = mp.Manager().Queue()
-    if args.sglang_infer_from_manifest:
+    manager = mp.Manager()
+    queue = manager.Queue()
+    if args.sglang_stream_manifest:
+        jobs = []
+    elif args.sglang_infer_from_manifest:
         jobs = _load_manifest_jobs(args)
         for job in jobs:
             queue.put(job)
@@ -168,7 +208,34 @@ if __name__ == "__main__":
         for key in selected_keys:
             assert key in data, f"Unknown puzzle key: {key}"
             queue.put(key)
-    for _ in range(effective_nprocs):
-        queue.put(None)
-
-    mp.spawn(local_worker, args=(queue, end_time), nprocs=effective_nprocs)
+    sentinel_prefix = f"worker_{'infer' if (args.sglang_infer_from_manifest or args.sglang_stream_manifest) else 'train'}_"
+    if args.sglang_stream_manifest:
+        context = mp.spawn(
+            local_worker,
+            args=(queue, end_time, args.cuda_device_offset, sentinel_prefix),
+            nprocs=effective_nprocs,
+            join=False,
+        )
+        queued_keys = set()
+        while time.time() <= end_time:
+            new_jobs = _load_streaming_manifest_jobs(args, queued_keys)
+            for job in new_jobs:
+                queue.put(job)
+                queued_keys.add(job["key"])
+                print(f"[stream] queued ready adapter for {job['key']}", flush=True)
+            if os.path.exists(args.sglang_producer_done) and not new_jobs:
+                break
+            time.sleep(1)
+        for _ in range(effective_nprocs):
+            queue.put(None)
+        while not context.join():
+            pass
+        print(f"[stream] inference workers finished; queued_keys={len(queued_keys)}", flush=True)
+    else:
+        for _ in range(effective_nprocs):
+            queue.put(None)
+        mp.spawn(
+            local_worker,
+            args=(queue, end_time, args.cuda_device_offset, sentinel_prefix),
+            nprocs=effective_nprocs,
+        )
