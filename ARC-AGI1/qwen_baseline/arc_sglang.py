@@ -160,11 +160,18 @@ class ArcSglangBackend:
 
     @staticmethod
     def _import_sglang():
+        import os
         import sys
 
-        arc_stack = "/kaggle/working/arc_stack"
+        arc_stack = os.environ.get("ARC_SGLANG_STACK_PATH", "/kaggle/working/arc_stack")
+        if not Path(arc_stack).is_dir():
+            raise FileNotFoundError(f"SGLang stack directory does not exist: {arc_stack}")
         if arc_stack not in sys.path:
             sys.path.append(arc_stack)
+        pythonpath = [entry for entry in os.environ.get("PYTHONPATH", "").split(os.pathsep) if entry]
+        if arc_stack not in pythonpath:
+            pythonpath.append(arc_stack)
+            os.environ["PYTHONPATH"] = os.pathsep.join(pythonpath)
         sglang = __import__("sglang")
         _patch_sglang_rslora(sglang)
         return sglang

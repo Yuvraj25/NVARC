@@ -144,7 +144,19 @@ def _run_starter(args, chunk_keys: list[str], phase: str) -> None:
         raise ValueError(f"Unknown phase: {phase}")
     _clear_worker_sentinels()
     print(f"[chunked] running {phase}: {' '.join(cmd)}", flush=True)
-    subprocess.run(cmd, cwd=ROOT_DIR, check=True, env=os.environ.copy())
+    env = os.environ.copy()
+    stack_path = env.get("ARC_SGLANG_STACK_PATH")
+    if stack_path:
+        pythonpath = [entry for entry in env.get("PYTHONPATH", "").split(os.pathsep) if entry]
+        excluded = {stack_path, "/kaggle/working/arc_stack"}
+        pythonpath = [entry for entry in pythonpath if entry not in excluded]
+        if phase == "infer":
+            pythonpath.append(stack_path)
+        if pythonpath:
+            env["PYTHONPATH"] = os.pathsep.join(pythonpath)
+        else:
+            env.pop("PYTHONPATH", None)
+    subprocess.run(cmd, cwd=ROOT_DIR, check=True, env=env)
 
 
 def _prune_manifest(manifest_path: Path, chunk_keys: list[str]) -> None:
