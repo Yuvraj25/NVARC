@@ -10,7 +10,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from arc_decoder import score_full_probmul_3, score_kgmon, ArcDecoder
+from arc_decoder import score_full_probmul_3, score_kgmon, score_kgmon_median, ArcDecoder
 from arc_loader import ArcDataset
 
 
@@ -18,6 +18,7 @@ ROOT_DIR = Path(__file__).resolve().parent
 
 SELECTION_ALGORITHMS = {
     "score_kgmon": score_kgmon,
+    "score_kgmon_median": score_kgmon_median,
     "score_full_probmul_3": score_full_probmul_3,
 }
 

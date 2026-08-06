@@ -41,9 +41,22 @@ def score_kgmon(guesses):
     return score_sum(guesses, getter_kgmon)
 
 
+def getter_kgmon_median(guesses):
+    inf_score = len(guesses)
+    aug_scores = np.concatenate(
+        [np.asarray(g["score_aug"], dtype=float).reshape(-1) for g in guesses]
+    )
+    return inf_score - np.median(aug_scores)
+
+
+def score_kgmon_median(guesses):
+    return score_sum(guesses, getter_kgmon_median)
+
+
 selection_algorithms = [
     score_full_probmul_3,
     score_kgmon,
+    score_kgmon_median,
 ]
 
 
