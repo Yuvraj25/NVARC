@@ -83,8 +83,8 @@ control after the one-puzzle implementation smoke succeeds.
 notebook:
 yuvraj/arc26-opsd-fixed-pool-validation
 
-code patch dataset:
-yuvraj/arc2026-opsd-code-patch
+code dataset (must include the rollout/gating fixes):
+yuvraj/arc2026
 
 fixed candidate dataset:
 yuvraj/arc26-v17-opsd-fixed-candidates-32
