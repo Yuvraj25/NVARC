@@ -203,6 +203,26 @@ def activate_adapter(model, adapter_name: str, trainable: bool) -> list[torch.nn
     return selected
 
 
+def _adapter_parameter_state(model, adapter_name: str) -> dict[str, torch.Tensor]:
+    """Return adapter parameters with the arbitrary adapter name normalized."""
+    canonical = {}
+    marker = f".{adapter_name}."
+    suffix = f".{adapter_name}"
+    for key, value in model.named_parameters():
+        if marker in key:
+            normalized = key.replace(marker, ".__adapter__.")
+        elif key.endswith(suffix):
+            normalized = key[: -len(suffix)] + ".__adapter__"
+        else:
+            continue
+        if normalized in canonical:
+            raise RuntimeError(f"Adapter parameter keys collide after normalization: {normalized}")
+        canonical[normalized] = value
+    if not canonical:
+        raise RuntimeError(f"No parameters found for adapter {adapter_name!r}")
+    return canonical
+
+
 def clone_frozen_teacher_adapter(
     model,
     get_peft_model_state_dict,
@@ -215,13 +235,25 @@ def clone_frozen_teacher_adapter(
     teacher_config = copy.deepcopy(model.peft_config[student_adapter_name])
     model.add_adapter(teacher_adapter_name, teacher_config)
     student_state = get_peft_model_state_dict(model, adapter_name=student_adapter_name)
-    result = set_peft_model_state_dict(model, student_state, adapter_name=teacher_adapter_name)
+    # Some pinned PEFT versions rewrite keys in the mapping passed here. Keep
+    # the student snapshot intact so the post-load verification remains valid.
+    result = set_peft_model_state_dict(model, dict(student_state), adapter_name=teacher_adapter_name)
     unexpected = list(getattr(result, "unexpected_keys", []) or [])
     if unexpected:
         raise RuntimeError(f"Unexpected keys while cloning teacher adapter: {unexpected[:5]}")
-    teacher_state = get_peft_model_state_dict(model, adapter_name=teacher_adapter_name)
+    # Verify the actual model parameters instead of serialized PEFT keys. The
+    # pinned Kaggle/Unsloth stack spells state-dict keys differently for the
+    # default adapter and a named adapter, even when they refer to the same
+    # module parameters.
+    student_state = _adapter_parameter_state(model, student_adapter_name)
+    teacher_state = _adapter_parameter_state(model, teacher_adapter_name)
     if student_state.keys() != teacher_state.keys():
-        raise RuntimeError("Student and cloned teacher adapter state keys do not match")
+        missing = sorted(student_state.keys() - teacher_state.keys())
+        extra = sorted(teacher_state.keys() - student_state.keys())
+        raise RuntimeError(
+            f"Student and cloned teacher adapter state keys do not match; "
+            f"missing={missing[:5]} extra={extra[:5]}"
+        )
     mismatched = [
         key
         for key in student_state

@@ -9,6 +9,7 @@ from arc_opsd import (
     _teacher_trajectory_diagnostics,
     build_opsd_examples,
     classify_rollout,
+    clone_frozen_teacher_adapter,
     deployment_rollout_limit,
     deterministic_reserved_pair_index,
     exact_reverse_kl,
@@ -107,6 +108,44 @@ class ArcOpsdTest(unittest.TestCase):
         shifted_loss.backward()
         self.assertIsNotNone(shifted_student.grad)
         self.assertIsNone(shifted_teacher.grad)
+
+    def test_teacher_clone_accepts_named_adapter_key_spelling(self):
+        class FakeModel:
+            def __init__(self):
+                self.peft_config = {"default": {"r": 1}}
+                self.student = torch.tensor([1.0, 2.0])
+                self.teacher = None
+                self.active_adapter = "default"
+
+            def add_adapter(self, name, config):
+                self.peft_config[name] = config
+                self.teacher = torch.zeros_like(self.student)
+
+            def set_adapter(self, name):
+                self.active_adapter = name
+
+            def named_parameters(self):
+                return iter(
+                    [
+                        ("base.lora_A.default.weight", self.student),
+                        ("base.lora_A.opsd_teacher.weight", self.teacher),
+                    ]
+                )
+
+        model = FakeModel()
+
+        def get_state(_model, adapter_name):
+            if adapter_name == "default":
+                return {"base.lora_A.weight": _model.student}
+            return {f"base.lora_A.{adapter_name}.weight": _model.teacher}
+
+        def set_state(_model, state, adapter_name):
+            _model.teacher.copy_(state["base.lora_A.weight"])
+            return type("LoadResult", (), {"unexpected_keys": []})()
+
+        clone_frozen_teacher_adapter(model, get_state, set_state)
+        self.assertTrue(torch.equal(model.student, model.teacher))
+        self.assertEqual(model.active_adapter, "opsd_teacher")
 
     def test_rollout_limit_uses_deployment_cap_and_both_context_lengths(self):
         self.assertEqual(
