@@ -15,7 +15,17 @@ the mean-NLL `score_kgmon` selector.
   end of reduced SFT.
 - The student samples legal ARC tokens. The teacher scores the same sampled
   prefix with an additional solved view of `C` in its prompt.
+- Rollouts use the normal deployment output limit, further bounded by the
+  remaining student and teacher context windows. Gold answer length is never
+  used as a generation limit.
+- Every accepted teacher must reproduce `h(C)` exactly under restricted greedy
+  decoding and have lower gold NLL than the student.
 - The primary loss is exact reverse KL over the complete 16-token output head.
+- Corrupted-trajectory logs include teacher probability for the sampled token
+  and position-aligned gold token, restricted next-token accuracy after the
+  first divergence, divergence token types, and positions beyond gold length.
+- A rollout without terminal EOS is recorded as `missing_eos` and is never
+  passed to the grid converter.
 - Phase 1 only rescores the preserved v17 candidate pool. It never runs DFS.
 
 Puzzles with fewer than three training pairs fall back to unchanged full SFT.
@@ -80,7 +90,7 @@ fixed candidate dataset:
 yuvraj/arc26-v17-opsd-fixed-candidates-32
 ```
 
-Notebook version 1 is deliberately inert and GPU-disabled. To run the first
+The uploaded notebook is deliberately inert and GPU-disabled. To run the first
 smoke:
 
 1. Edit the notebook.

@@ -6,11 +6,16 @@ import torch
 
 from arc_loader import ArcDataset, QwenFormatter
 from arc_opsd import (
+    _teacher_trajectory_diagnostics,
     build_opsd_examples,
+    classify_rollout,
+    deployment_rollout_limit,
     deterministic_reserved_pair_index,
     exact_reverse_kl,
     split_puzzle_for_opsd,
+    teacher_advantage_gate,
 )
+from arc_search import EOS_ID
 
 
 def _pair(value):
@@ -102,6 +107,93 @@ class ArcOpsdTest(unittest.TestCase):
         shifted_loss.backward()
         self.assertIsNotNone(shifted_student.grad)
         self.assertIsNone(shifted_teacher.grad)
+
+    def test_rollout_limit_uses_deployment_cap_and_both_context_lengths(self):
+        self.assertEqual(
+            deployment_rollout_limit(
+                formatter_max_new_tokens=902,
+                max_seq_length=8192,
+                student_prompt_tokens=7000,
+                teacher_prompt_tokens=7600,
+            ),
+            592,
+        )
+        self.assertEqual(
+            deployment_rollout_limit(
+                formatter_max_new_tokens=902,
+                max_seq_length=8192,
+                student_prompt_tokens=100,
+                teacher_prompt_tokens=200,
+            ),
+            902,
+        )
+
+    def test_teacher_gate_requires_exactness_and_nll_advantage_for_every_view(self):
+        student = {"nll": 3.0, "restricted_greedy_exact": False}
+        accepted, reason = teacher_advantage_gate(
+            student,
+            {"nll": 2.0, "restricted_greedy_exact": False},
+        )
+        self.assertFalse(accepted)
+        self.assertEqual(reason, "teacher_not_restricted_greedy_exact")
+
+        accepted, reason = teacher_advantage_gate(
+            student,
+            {"nll": 3.5, "restricted_greedy_exact": True},
+        )
+        self.assertFalse(accepted)
+        self.assertEqual(reason, "teacher_no_nll_advantage")
+
+        accepted, reason = teacher_advantage_gate(
+            student,
+            {"nll": 2.0, "restricted_greedy_exact": True},
+        )
+        self.assertTrue(accepted)
+        self.assertEqual(reason, "accepted")
+
+    def test_missing_eos_is_never_passed_to_grid_converter(self):
+        class TrackingFormatter:
+            def __init__(self):
+                self.calls = 0
+
+            def convert_tokens_to_array(self, tokens):
+                self.calls += 1
+                return np.asarray([[1]])
+
+        formatter = TrackingFormatter()
+        grid, reason = classify_rollout(formatter, [1, 10, 2])
+        self.assertIsNone(grid)
+        self.assertEqual(reason, "missing_eos")
+        self.assertEqual(formatter.calls, 0)
+
+        grid, reason = classify_rollout(formatter, [1, EOS_ID])
+        self.assertTrue(np.array_equal(grid, [[1]]))
+        self.assertIsNone(reason)
+        self.assertEqual(formatter.calls, 1)
+
+    def test_corrupted_trajectory_teacher_diagnostics(self):
+        rollout = [1, 2, 10, EOS_ID, 4]
+        gold = [1, 3, 10, EOS_ID]
+        logits = torch.full((len(rollout), 16), -4.0)
+        logits[0, 1] = 4.0
+        logits[1, 3] = 4.0
+        logits[2, 2] = 4.0
+        logits[3, EOS_ID] = 4.0
+        logits[4, 4] = 4.0
+        diagnostics = _teacher_trajectory_diagnostics(
+            teacher_logits=logits,
+            rollout_ids=rollout,
+            gold_ids=gold,
+            first_divergence=1,
+        )
+        self.assertEqual(diagnostics["divergence_student_token_id"], 2)
+        self.assertEqual(diagnostics["divergence_gold_token_id"], 3)
+        self.assertEqual(diagnostics["divergence_student_token_type"], "digit")
+        self.assertEqual(diagnostics["divergence_gold_token_type"], "digit")
+        self.assertTrue(diagnostics["teacher_gold_correct_at_divergence"])
+        self.assertAlmostEqual(diagnostics["teacher_next_token_accuracy_after_divergence"], 0.5)
+        self.assertEqual(diagnostics["trajectory_positions_beyond_gold"], 1)
+        self.assertIsNone(diagnostics["teacher_aligned_gold_token_probabilities"][-1])
 
 
 if __name__ == "__main__":

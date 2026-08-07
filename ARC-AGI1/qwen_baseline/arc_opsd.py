@@ -179,7 +179,10 @@ def _gold_metrics(logits: torch.Tensor, gold_ids: list[int]) -> dict[str, Any]:
     return {
         "nll": float(token_nll.sum().detach().cpu()),
         "mean_nll": float(token_nll.mean().detach().cpu()),
-        "teacher_forced_greedy_exact": bool(torch.equal(legal_argmax, targets)),
+        # If every restricted argmax matches the next gold token under gold
+        # prefixes, restricted greedy generation follows that same sequence by
+        # induction, including the final EOS token.
+        "restricted_greedy_exact": bool(torch.equal(legal_argmax, targets)),
     }
 
 
@@ -279,6 +282,140 @@ def _first_divergence(rollout_ids: list[int], gold_ids: list[int]) -> Optional[i
     return None
 
 
+def deployment_rollout_limit(
+    formatter_max_new_tokens: int,
+    max_seq_length: int,
+    student_prompt_tokens: int,
+    teacher_prompt_tokens: int,
+) -> int:
+    return min(
+        formatter_max_new_tokens,
+        max_seq_length - student_prompt_tokens,
+        max_seq_length - teacher_prompt_tokens,
+    )
+
+
+def teacher_advantage_gate(student_gold: dict[str, Any], teacher_gold: dict[str, Any]) -> tuple[bool, str]:
+    if not teacher_gold["restricted_greedy_exact"]:
+        return False, "teacher_not_restricted_greedy_exact"
+    if not teacher_gold["nll"] < student_gold["nll"]:
+        return False, "teacher_no_nll_advantage"
+    return True, "accepted"
+
+
+def _token_type(token_id: Optional[int]) -> str:
+    if token_id is None:
+        return "missing"
+    if 0 <= token_id <= 9:
+        return "digit"
+    if token_id == 10:
+        return "newline"
+    if token_id == EOS_ID:
+        return "eos"
+    return "illegal"
+
+
+def _mean_or_none(values: list[float]) -> Optional[float]:
+    return float(np.mean(values)) if values else None
+
+
+def _teacher_trajectory_diagnostics(
+    teacher_logits: torch.Tensor,
+    rollout_ids: list[int],
+    gold_ids: list[int],
+    first_divergence: Optional[int],
+) -> dict[str, Any]:
+    probabilities = torch.softmax(teacher_logits.detach().float(), dim=-1)
+    device = probabilities.device
+    positions = torch.arange(len(rollout_ids), device=device)
+    sampled_targets = torch.tensor(rollout_ids, device=device, dtype=torch.long)
+    sampled_probability = probabilities[positions, sampled_targets].cpu().tolist()
+
+    legal_ids = torch.tensor(ARC_TOKENS, device=device, dtype=torch.long)
+    legal_argmax = legal_ids[teacher_logits[:, legal_ids].argmax(dim=-1)].cpu().tolist()
+    aligned_gold_probability: list[Optional[float]] = []
+    aligned_gold_correct: list[Optional[bool]] = []
+    for index in range(len(rollout_ids)):
+        if index < len(gold_ids):
+            gold_token = gold_ids[index]
+            aligned_gold_probability.append(float(probabilities[index, gold_token].cpu()))
+            aligned_gold_correct.append(legal_argmax[index] == gold_token)
+        else:
+            aligned_gold_probability.append(None)
+            aligned_gold_correct.append(None)
+
+    divergence_rollout_token = (
+        rollout_ids[first_divergence]
+        if first_divergence is not None and first_divergence < len(rollout_ids)
+        else None
+    )
+    divergence_gold_token = (
+        gold_ids[first_divergence]
+        if first_divergence is not None and first_divergence < len(gold_ids)
+        else None
+    )
+    at_gold_probability = (
+        aligned_gold_probability[first_divergence]
+        if first_divergence is not None and first_divergence < len(aligned_gold_probability)
+        else None
+    )
+    at_sampled_probability = (
+        sampled_probability[first_divergence]
+        if first_divergence is not None and first_divergence < len(sampled_probability)
+        else None
+    )
+    at_gold_correct = (
+        aligned_gold_correct[first_divergence]
+        if first_divergence is not None and first_divergence < len(aligned_gold_correct)
+        else None
+    )
+
+    post_indices = (
+        range(first_divergence + 1, len(rollout_ids))
+        if first_divergence is not None
+        else range(0)
+    )
+    post_gold_probabilities = [
+        aligned_gold_probability[index]
+        for index in post_indices
+        if aligned_gold_probability[index] is not None
+    ]
+    post_sampled_probabilities = [sampled_probability[index] for index in post_indices]
+    post_gold_accuracy = [
+        float(aligned_gold_correct[index])
+        for index in post_indices
+        if aligned_gold_correct[index] is not None
+    ]
+    return {
+        "teacher_sampled_token_probabilities": sampled_probability,
+        "teacher_aligned_gold_token_probabilities": aligned_gold_probability,
+        "teacher_legal_argmax_token_ids": legal_argmax,
+        "teacher_aligned_gold_correct": aligned_gold_correct,
+        "divergence_student_token_id": divergence_rollout_token,
+        "divergence_gold_token_id": divergence_gold_token,
+        "divergence_student_token_type": _token_type(divergence_rollout_token),
+        "divergence_gold_token_type": _token_type(divergence_gold_token),
+        "teacher_gold_probability_at_divergence": at_gold_probability,
+        "teacher_sampled_probability_at_divergence": at_sampled_probability,
+        "teacher_gold_correct_at_divergence": at_gold_correct,
+        "teacher_mean_gold_probability_after_divergence": _mean_or_none(post_gold_probabilities),
+        "teacher_mean_sampled_probability_after_divergence": _mean_or_none(post_sampled_probabilities),
+        "teacher_next_token_accuracy_after_divergence": _mean_or_none(post_gold_accuracy),
+        "trajectory_positions_beyond_gold": max(0, len(rollout_ids) - len(gold_ids)),
+    }
+
+
+def classify_rollout(formatter: QwenFormatter, rollout_ids: list[int]):
+    if not rollout_ids:
+        return None, "empty_rollout"
+    if rollout_ids[-1] != EOS_ID:
+        return None, "missing_eos"
+    decoded_grid = formatter.convert_tokens_to_array(rollout_ids)
+    if decoded_grid is None:
+        return None, "malformed_grid"
+    return decoded_grid, None
+
+
 def _region_kl(per_position: torch.Tensor, first_divergence: Optional[int]) -> dict[str, Optional[float]]:
     values = per_position.detach().float().cpu()
     if first_divergence is None:
@@ -329,6 +466,7 @@ def run_opsd_correction(
     logs = []
     accepted = 0
     started_at = time.perf_counter()
+    formatter_max_new_tokens = formatter.max_new_tokens()
 
     for attempt, example in enumerate(examples):
         if accepted >= max_updates:
@@ -351,6 +489,28 @@ def run_opsd_correction(
                 }
             )
             continue
+        rollout_limit = deployment_rollout_limit(
+            formatter_max_new_tokens=formatter_max_new_tokens,
+            max_seq_length=max_seq_length,
+            student_prompt_tokens=len(prompt_student_ids),
+            teacher_prompt_tokens=len(prompt_teacher_ids),
+        )
+        if rollout_limit < 1:
+            logs.append(
+                {
+                    "attempt": attempt,
+                    "accepted": False,
+                    "reason": "no_rollout_context",
+                    "h_key": example.h_key,
+                    "g_key": example.g_key,
+                    "is_cross_view": example.is_cross_view,
+                    "student_prompt_tokens": len(prompt_student_ids),
+                    "teacher_prompt_tokens": len(prompt_teacher_ids),
+                    "gold_tokens": len(gold_ids),
+                    "rollout_limit": rollout_limit,
+                }
+            )
+            continue
 
         activate_adapter(model, student_adapter_name, trainable=False)
         with torch.no_grad():
@@ -361,9 +521,7 @@ def run_opsd_correction(
             teacher_gold_logits = _completion_logits(model, prompt_teacher_ids, gold_ids)
             teacher_gold = _gold_metrics(teacher_gold_logits, gold_ids)
 
-        gate_passed = teacher_gold["nll"] < student_gold["nll"]
-        if example.is_cross_view:
-            gate_passed = gate_passed and teacher_gold["teacher_forced_greedy_exact"]
+        gate_passed, gate_reason = teacher_advantage_gate(student_gold, teacher_gold)
         base_log = {
             "attempt": attempt,
             "h_key": example.h_key,
@@ -372,16 +530,17 @@ def run_opsd_correction(
             "student_prompt_tokens": len(prompt_student_ids),
             "teacher_prompt_tokens": len(prompt_teacher_ids),
             "gold_tokens": len(gold_ids),
+            "rollout_limit": rollout_limit,
             "student_gold_nll": student_gold["nll"],
             "teacher_gold_nll": teacher_gold["nll"],
             "student_gold_mean_nll": student_gold["mean_nll"],
             "teacher_gold_mean_nll": teacher_gold["mean_nll"],
-            "student_greedy_exact": student_gold["teacher_forced_greedy_exact"],
-            "teacher_greedy_exact": teacher_gold["teacher_forced_greedy_exact"],
+            "student_restricted_greedy_exact": student_gold["restricted_greedy_exact"],
+            "teacher_restricted_greedy_exact": teacher_gold["restricted_greedy_exact"],
             "teacher_minus_student_nll": teacher_gold["nll"] - student_gold["nll"],
         }
         if not gate_passed:
-            logs.append({**base_log, "accepted": False, "reason": "teacher_advantage_gate"})
+            logs.append({**base_log, "accepted": False, "reason": gate_reason})
             continue
 
         activate_adapter(model, student_adapter_name, trainable=False)
@@ -390,7 +549,7 @@ def run_opsd_correction(
         rollout_ids = _student_rollout(
             model,
             prompt_ids=prompt_student_ids,
-            max_new_tokens=len(gold_ids),
+            max_new_tokens=rollout_limit,
             seed=seed + attempt,
             temperature=temperature,
             top_p=top_p,
@@ -429,7 +588,7 @@ def run_opsd_correction(
         student_log_prob = torch.log_softmax(student_logits.detach().float(), dim=-1)
         teacher_log_prob = torch.log_softmax(teacher_logits.float(), dim=-1)
         max_log_ratio = float((student_log_prob - teacher_log_prob).max().cpu())
-        decoded_grid = formatter.convert_tokens_to_array(rollout_ids)
+        decoded_grid, invalid_reason = classify_rollout(formatter, rollout_ids)
         accepted += 1
         logs.append(
             {
@@ -438,8 +597,9 @@ def run_opsd_correction(
                 "optimizer_step": accepted,
                 "rollout_token_ids": rollout_ids,
                 "rollout_valid_grid": decoded_grid is not None,
+                "rollout_invalid_reason": invalid_reason,
                 "rollout_has_eos": rollout_ids[-1] == EOS_ID,
-                "rollout_truncated": rollout_ids[-1] != EOS_ID and len(rollout_ids) == len(gold_ids),
+                "rollout_truncated": rollout_ids[-1] != EOS_ID and len(rollout_ids) == rollout_limit,
                 "first_divergence": first_divergence,
                 "opsd_kl": float(opsd_loss.detach().cpu()),
                 "gold_ce": gold_ce_value,
@@ -452,6 +612,12 @@ def run_opsd_correction(
                 "rollout_time_s": rollout_time,
                 "teacher_scoring_time_s": teacher_time,
                 "student_backward_time_s": backward_time,
+                **_teacher_trajectory_diagnostics(
+                    teacher_logits=teacher_logits,
+                    rollout_ids=rollout_ids,
+                    gold_ids=gold_ids,
+                    first_divergence=first_divergence,
+                ),
                 **_region_kl(per_position_kl, first_divergence),
             }
         )
