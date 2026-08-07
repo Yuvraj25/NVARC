@@ -173,9 +173,27 @@ def _completion_logits(model, prompt_ids: list[int], completion_ids: list[int]) 
 def _gold_metrics(logits: torch.Tensor, gold_ids: list[int]) -> dict[str, Any]:
     targets = torch.tensor(gold_ids, device=logits.device, dtype=torch.long)
     log_prob = torch.log_softmax(logits.float(), dim=-1)
+    probabilities = log_prob.exp()
     token_nll = -log_prob[torch.arange(len(gold_ids), device=logits.device), targets]
     legal_ids = torch.tensor(ARC_TOKENS, device=logits.device, dtype=torch.long)
     legal_argmax = legal_ids[logits[:, legal_ids].argmax(dim=-1)]
+    positions = torch.arange(len(gold_ids), device=logits.device)
+    gold_probabilities = probabilities[positions, targets]
+    argmax_probabilities = probabilities[positions, legal_argmax]
+    wrong_positions = (legal_argmax != targets).nonzero(as_tuple=False).flatten().cpu().tolist()
+    wrong_token_details = [
+        {
+            "position": position,
+            "gold_token_id": int(targets[position].detach().cpu()),
+            "argmax_token_id": int(legal_argmax[position].detach().cpu()),
+            "gold_probability": float(gold_probabilities[position].detach().cpu()),
+            "argmax_probability": float(argmax_probabilities[position].detach().cpu()),
+            "argmax_margin": float(
+                (argmax_probabilities[position] - gold_probabilities[position]).detach().cpu()
+            ),
+        }
+        for position in wrong_positions
+    ]
     return {
         "nll": float(token_nll.sum().detach().cpu()),
         "mean_nll": float(token_nll.mean().detach().cpu()),
@@ -183,6 +201,8 @@ def _gold_metrics(logits: torch.Tensor, gold_ids: list[int]) -> dict[str, Any]:
         # prefixes, restricted greedy generation follows that same sequence by
         # induction, including the final EOS token.
         "restricted_greedy_exact": bool(torch.equal(legal_argmax, targets)),
+        "wrong_token_count": len(wrong_positions),
+        "wrong_token_details": wrong_token_details,
     }
 
 
@@ -569,6 +589,10 @@ def run_opsd_correction(
             "teacher_gold_mean_nll": teacher_gold["mean_nll"],
             "student_restricted_greedy_exact": student_gold["restricted_greedy_exact"],
             "teacher_restricted_greedy_exact": teacher_gold["restricted_greedy_exact"],
+            "student_gold_wrong_token_count": student_gold["wrong_token_count"],
+            "teacher_gold_wrong_token_count": teacher_gold["wrong_token_count"],
+            "student_gold_wrong_token_details": student_gold["wrong_token_details"],
+            "teacher_gold_wrong_token_details": teacher_gold["wrong_token_details"],
             "teacher_minus_student_nll": teacher_gold["nll"] - student_gold["nll"],
         }
         if not gate_passed:

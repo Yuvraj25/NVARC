@@ -6,6 +6,7 @@ import torch
 
 from arc_loader import ArcDataset, QwenFormatter
 from arc_opsd import (
+    _gold_metrics,
     _teacher_trajectory_diagnostics,
     build_opsd_examples,
     classify_rollout,
@@ -189,6 +190,22 @@ class ArcOpsdTest(unittest.TestCase):
         )
         self.assertTrue(accepted)
         self.assertEqual(reason, "accepted")
+
+    def test_gold_metrics_records_wrong_argmax_positions_and_confidence(self):
+        logits = torch.full((3, 16), -10.0)
+        logits[0, 1] = 8.0
+        logits[1, 4] = 7.0
+        logits[1, 2] = 6.0
+        logits[2, EOS_ID] = 8.0
+        metrics = _gold_metrics(logits, [1, 2, EOS_ID])
+        self.assertFalse(metrics["restricted_greedy_exact"])
+        self.assertEqual(metrics["wrong_token_count"], 1)
+        detail = metrics["wrong_token_details"][0]
+        self.assertEqual(detail["position"], 1)
+        self.assertEqual(detail["gold_token_id"], 2)
+        self.assertEqual(detail["argmax_token_id"], 4)
+        self.assertGreater(detail["argmax_probability"], detail["gold_probability"])
+        self.assertGreater(detail["argmax_margin"], 0.0)
 
     def test_missing_eos_is_never_passed_to_grid_converter(self):
         class TrackingFormatter:
