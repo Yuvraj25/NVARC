@@ -132,6 +132,21 @@ if __name__ == "__main__":
     parser.add_argument("--sglang-dynamic-repeat", action="store_true")
     parser.add_argument("--dfs-prob-threshold", type=float, default=0.2)
     parser.add_argument("--profile-timings", action="store_true")
+    parser.add_argument(
+        "--ttft-method",
+        choices=["full_sft", "reduced_sft", "reduced_plus_sft_c", "reduced_plus_opsd"],
+        default="full_sft",
+    )
+    parser.add_argument("--fixed-candidate-dir", type=str, default=None)
+    parser.add_argument("--opsd-log-dir", type=str, default="../opsd_logs")
+    parser.add_argument("--opsd-min-train-pairs", type=int, default=3)
+    parser.add_argument("--opsd-color-permutations", type=int, default=2)
+    parser.add_argument("--opsd-cross-view-probability", type=float, default=0.2)
+    parser.add_argument("--opsd-max-updates", type=int, default=16)
+    parser.add_argument("--opsd-learning-rate", type=float, default=5e-5)
+    parser.add_argument("--opsd-temperature", type=float, default=1.0)
+    parser.add_argument("--opsd-top-p", type=float, default=1.0)
+    parser.add_argument("--opsd-lambda-ce", type=float, default=0.0)
     args = parser.parse_args()
     if args.sglang_train_adapters_only and args.sglang_reuse_adapters:
         raise ValueError("--sglang-train-adapters-only and --sglang-reuse-adapters are mutually exclusive")
@@ -148,6 +163,16 @@ if __name__ == "__main__":
     effective_nprocs = args.sglang_infer_workers if args.sglang_infer_workers is not None else args.nprocs
     if args.use_sglang and args.sglang_tp_size > 1 and effective_nprocs != 1:
         raise ValueError("--use-sglang with --sglang-tp-size > 1 must run with exactly one worker")
+    if args.ttft_method != "full_sft" and args.use_sglang:
+        raise ValueError("Reduced-pair TTFT methods are only supported by the Unsloth/HF worker")
+    if args.opsd_min_train_pairs < 3:
+        raise ValueError("--opsd-min-train-pairs must be at least 3")
+    if args.opsd_color_permutations < 1:
+        raise ValueError("--opsd-color-permutations must be positive")
+    if args.opsd_max_updates < 1:
+        raise ValueError("--opsd-max-updates must be positive")
+    if not 0.0 <= args.opsd_cross_view_probability <= 1.0:
+        raise ValueError("--opsd-cross-view-probability must be in [0, 1]")
     end_time = args.end_time if args.end_time is not None else time.time() + 12 * 3600
     os.environ["ARC_USE_SPECULATIVE_DFS"] = "1" if args.use_speculative_dfs else "0"
     os.environ["ARC_USE_SGLANG"] = "1" if args.use_sglang else "0"
@@ -171,6 +196,20 @@ if __name__ == "__main__":
     os.environ["ARC_TEST_PATH"] = args.test_path
     os.environ["ARC_MODEL_PATH"] = args.model_path
     os.environ["ARC_OUTPUT_DIR"] = args.output_dir
+    os.environ["ARC_TTFT_METHOD"] = args.ttft_method
+    if args.fixed_candidate_dir is not None:
+        os.environ["ARC_FIXED_CANDIDATE_DIR"] = args.fixed_candidate_dir
+    else:
+        os.environ.pop("ARC_FIXED_CANDIDATE_DIR", None)
+    os.environ["ARC_OPSD_LOG_DIR"] = args.opsd_log_dir
+    os.environ["ARC_OPSD_MIN_TRAIN_PAIRS"] = str(args.opsd_min_train_pairs)
+    os.environ["ARC_OPSD_COLOR_PERMUTATIONS"] = str(args.opsd_color_permutations)
+    os.environ["ARC_OPSD_CROSS_VIEW_PROBABILITY"] = str(args.opsd_cross_view_probability)
+    os.environ["ARC_OPSD_MAX_UPDATES"] = str(args.opsd_max_updates)
+    os.environ["ARC_OPSD_LEARNING_RATE"] = str(args.opsd_learning_rate)
+    os.environ["ARC_OPSD_TEMPERATURE"] = str(args.opsd_temperature)
+    os.environ["ARC_OPSD_TOP_P"] = str(args.opsd_top_p)
+    os.environ["ARC_OPSD_LAMBDA_CE"] = str(args.opsd_lambda_ce)
     print(
         "runtime flags:",
         f"speculative_dfs={os.environ['ARC_USE_SPECULATIVE_DFS']}",
@@ -190,6 +229,17 @@ if __name__ == "__main__":
         f"test_path={os.environ['ARC_TEST_PATH']}",
         f"model_path={os.environ['ARC_MODEL_PATH']}",
         f"output_dir={os.environ['ARC_OUTPUT_DIR']}",
+        f"ttft_method={os.environ['ARC_TTFT_METHOD']}",
+        f"fixed_candidate_dir={os.environ.get('ARC_FIXED_CANDIDATE_DIR')}",
+        f"opsd_log_dir={os.environ['ARC_OPSD_LOG_DIR']}",
+        f"opsd_min_train_pairs={os.environ['ARC_OPSD_MIN_TRAIN_PAIRS']}",
+        f"opsd_color_permutations={os.environ['ARC_OPSD_COLOR_PERMUTATIONS']}",
+        f"opsd_cross_view_probability={os.environ['ARC_OPSD_CROSS_VIEW_PROBABILITY']}",
+        f"opsd_max_updates={os.environ['ARC_OPSD_MAX_UPDATES']}",
+        f"opsd_learning_rate={os.environ['ARC_OPSD_LEARNING_RATE']}",
+        f"opsd_temperature={os.environ['ARC_OPSD_TEMPERATURE']}",
+        f"opsd_top_p={os.environ['ARC_OPSD_TOP_P']}",
+        f"opsd_lambda_ce={os.environ['ARC_OPSD_LAMBDA_CE']}",
     )
 
     rerun_mode = True

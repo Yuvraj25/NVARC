@@ -20,6 +20,15 @@ import torch
 from datasets import Dataset
 
 from arc_loader import ArcDataset, QwenFormatter
+from arc_opsd import (
+    TEACHER_ADAPTER_NAME,
+    activate_adapter,
+    build_opsd_examples,
+    clone_frozen_teacher_adapter,
+    remove_teacher_adapter,
+    run_opsd_correction,
+    split_puzzle_for_opsd,
+)
 from arc_rescoring import FullPassRescorer
 from arc_sglang import ArcSglangBackend, SglangConfig, SglangRescorer, inference_sglang_dfs, inference_sglang_speculative_dfs
 from arc_search import ASSISTANT_TOKEN_ID, EOS_ID, USER_TOKEN_ID, default_max_score, inference_turbo_dfs
@@ -39,6 +48,15 @@ def runtime_config():
     if not 0.0 < dfs_prob_threshold < 1.0:
         raise ValueError(f"ARC_DFS_PROB_THRESHOLD must be in (0, 1), got {dfs_prob_threshold}")
     sglang_mem_fraction = os.environ.get("ARC_SGLANG_MEM_FRACTION_STATIC")
+    ttft_method = os.environ.get("ARC_TTFT_METHOD", "full_sft")
+    valid_ttft_methods = {"full_sft", "reduced_sft", "reduced_plus_sft_c", "reduced_plus_opsd"}
+    if ttft_method not in valid_ttft_methods:
+        raise ValueError(f"ARC_TTFT_METHOD must be one of {sorted(valid_ttft_methods)}, got {ttft_method!r}")
+    cross_view_probability = float(os.environ.get("ARC_OPSD_CROSS_VIEW_PROBABILITY", "0.2"))
+    if not 0.0 <= cross_view_probability <= 1.0:
+        raise ValueError(
+            f"ARC_OPSD_CROSS_VIEW_PROBABILITY must be in [0, 1], got {cross_view_probability}"
+        )
     return {
         "use_speculative_dfs": _env_flag("ARC_USE_SPECULATIVE_DFS", default=False),
         "use_sglang": _env_flag("ARC_USE_SGLANG", default=False),
@@ -57,6 +75,17 @@ def runtime_config():
         "sglang_consume_adapters": _env_flag("ARC_SGLANG_CONSUME_ADAPTERS", default=False),
         "sglang_speculative_repeat_len": int(os.environ.get("ARC_SGLANG_SPECULATIVE_REPEAT_LEN", "5")),
         "sglang_dynamic_repeat": _env_flag("ARC_SGLANG_DYNAMIC_REPEAT", default=False),
+        "ttft_method": ttft_method,
+        "opsd_min_train_pairs": int(os.environ.get("ARC_OPSD_MIN_TRAIN_PAIRS", "3")),
+        "opsd_color_permutations": int(os.environ.get("ARC_OPSD_COLOR_PERMUTATIONS", "2")),
+        "opsd_cross_view_probability": cross_view_probability,
+        "opsd_max_updates": int(os.environ.get("ARC_OPSD_MAX_UPDATES", "16")),
+        "opsd_learning_rate": float(os.environ.get("ARC_OPSD_LEARNING_RATE", "5e-5")),
+        "opsd_temperature": float(os.environ.get("ARC_OPSD_TEMPERATURE", "1.0")),
+        "opsd_top_p": float(os.environ.get("ARC_OPSD_TOP_P", "1.0")),
+        "opsd_lambda_ce": float(os.environ.get("ARC_OPSD_LAMBDA_CE", "0.0")),
+        "opsd_log_dir": os.environ.get("ARC_OPSD_LOG_DIR", "../opsd_logs"),
+        "fixed_candidate_dir": os.environ.get("ARC_FIXED_CANDIDATE_DIR"),
     }
 
 
@@ -228,6 +257,75 @@ def _prepare_eval_ds(puzzle_ds, formatter, max_seq_length: int, max_new_tokens: 
     eval_ds = puzzle_ds_multi.augment(n=2, seed=2)
     eval_ds = eval_ds.cut_to_len(formatter=formatter, name="input", max_len=max_seq_length - max_new_tokens)
     return puzzle_ds_multi, eval_ds
+
+
+def _rescore_fixed_candidate_pool(
+    model,
+    tokenizer,
+    formatter,
+    puzzle_ds_multi,
+    puzzle_key: str,
+    candidate_dir: str,
+    output_dir: str,
+    max_seq_length: int,
+    max_new_tokens: int,
+    timing_stats,
+    count_stats,
+):
+    if not os.path.isdir(candidate_dir):
+        raise FileNotFoundError(f"Fixed candidate directory does not exist: {candidate_dir}")
+    source_names = sorted(name for name in os.listdir(candidate_dir) if name.startswith(f"{puzzle_key}_"))
+    if not source_names:
+        raise FileNotFoundError(f"No fixed-pool candidates found for puzzle {puzzle_key} in {candidate_dir}")
+
+    rescorers = {}
+    known_scores = {}
+    for source_name in source_names:
+        source_path = os.path.join(candidate_dir, source_name)
+        if not os.path.isfile(source_path):
+            continue
+        with bz2.BZ2File(source_path, "rb") as source_file:
+            decoded_result = pickle.load(source_file)
+        base_key = source_name.split(".", 1)[0]
+        if base_key not in puzzle_ds_multi.queries:
+            raise KeyError(f"Candidate file {source_name} refers to unknown test output {base_key}")
+        if base_key not in rescorers:
+            started_at = time.perf_counter()
+            rescorers[base_key] = FullPassRescorer(
+                model=model,
+                tokenizer=tokenizer,
+                formatter=formatter,
+                puzzle_ds_multi=puzzle_ds_multi,
+                base_key=base_key,
+                max_seq_length=max_seq_length,
+                max_new_tokens=max_new_tokens,
+                seed=stable_seed_from_key(base_key),
+            )
+            timing_stats["rescorer_init_s"] += time.perf_counter() - started_at
+            count_stats["rescorers_created"] += 1
+
+        for candidate in decoded_result:
+            solution = np.asarray(candidate["solution"])
+            grid_id = (base_key, tuple(map(tuple, solution.tolist())))
+            if grid_id not in known_scores:
+                started_at = time.perf_counter()
+                known_scores[grid_id] = rescorers[base_key].score_solution(solution)
+                timing_stats["rescoring_s"] += time.perf_counter() - started_at
+                count_stats["rescoring_cache_misses"] += 1
+            else:
+                count_stats["rescoring_cache_hits"] += 1
+            candidate["score_aug"] = known_scores[grid_id]
+            count_stats["beam_candidates_valid"] += 1
+
+        target_path = os.path.join(output_dir, source_name)
+        with bz2.BZ2File(target_path, "wb") as target_file:
+            pickle.dump(decoded_result, target_file)
+        count_stats["subkeys_written"] += 1
+
+    count_stats["fixed_pool_source_files"] += len(source_names)
+    count_stats["fixed_pool_unique_candidates"] += len(known_scores)
+    for rescorer in rescorers.values():
+        print(rescorer.format_stats())
 
 
 def _run_sglang_batches(
@@ -877,8 +975,11 @@ def worker(rank, queue, end_time):
     max_score = default_max_score(config["dfs_prob_threshold"])
     print(
         f"[Rank {rank}] config: speculative_dfs={config['use_speculative_dfs']} "
-        f"dfs_prob_threshold={config['dfs_prob_threshold']}"
+        f"dfs_prob_threshold={config['dfs_prob_threshold']} "
+        f"ttft_method={config['ttft_method']} fixed_candidate_dir={config['fixed_candidate_dir']}"
     )
+    if config["ttft_method"] != "full_sft" and config["use_sglang"]:
+        raise ValueError("Reduced-pair and OPSD TTFT modes require the gradient-capable Unsloth/HF worker")
 
     arc_test_set = ArcDataset.from_file(config["test_path"])
     dir_outputs = config["output_dir"]
@@ -906,8 +1007,28 @@ def worker(rank, queue, end_time):
         )
 
         model = FastLanguageModel.for_training(model)
+        activate_adapter(model, "default", trainable=True)
         puzzle_ds = arc_test_set.change_keys([key])
-        train_ds = puzzle_ds.augment(n=16, shfl_keys=True, seed=1)
+        num_train_pairs = len(puzzle_ds.queries[key]["train"])
+        effective_ttft_method = config["ttft_method"]
+        opsd_split = None
+        if effective_ttft_method != "full_sft" and num_train_pairs < config["opsd_min_train_pairs"]:
+            print(
+                f"[Rank {rank}] {key}: falling back to full_sft because it has "
+                f"{num_train_pairs} training pairs (< {config['opsd_min_train_pairs']})"
+            )
+            effective_ttft_method = "full_sft"
+        if effective_ttft_method != "full_sft":
+            opsd_split = split_puzzle_for_opsd(puzzle_ds, key)
+            initial_sft_ds = opsd_split.reduced_dataset
+            print(
+                f"[Rank {rank}] {key}: reserved C pair index={opsd_split.reserved_pair_index}; "
+                f"initial SFT pairs={opsd_split.sft_pair_indices}"
+            )
+        else:
+            initial_sft_ds = puzzle_ds
+
+        train_ds = initial_sft_ds.augment(n=16, shfl_keys=True, seed=1)
         train_ds = train_ds.cut_to_len(formatter=formatter, name="text", max_len=max_seq_length)
 
         training_started_at = time.perf_counter()
@@ -926,6 +1047,99 @@ def worker(rank, queue, end_time):
             model = trainer.accelerator.unwrap_model(model, keep_fp32_wrapper=False)
             del trainer
         timing_stats["training_s"] += time.perf_counter() - training_started_at
+
+        opsd_stats = None
+        if effective_ttft_method == "reduced_plus_sft_c":
+            correction_started_at = time.perf_counter()
+            correction_examples = build_opsd_examples(
+                opsd_split,
+                formatter=formatter,
+                color_permutations=config["opsd_color_permutations"],
+                cross_view_probability=0.0,
+                seed=stable_seed_from_key(key),
+            )
+            correction_rows = [
+                {"text": example.student_prompt + example.gold_reply}
+                for example in correction_examples
+                if len(tokenizer.encode(example.student_prompt + example.gold_reply)) <= max_seq_length
+            ]
+            if not correction_rows:
+                raise RuntimeError(f"No augmented-SFT C examples fit max_seq_length for {key}")
+            activate_adapter(model, "default", trainable=True)
+            model = FastLanguageModel.for_training(model)
+            with io.StringIO() as buf, redirect_stdout(buf), redirect_stderr(buf):
+                correction_trainer = UnslothFixedTrainer(
+                    model=model,
+                    tokenizer=tokenizer,
+                    data_collator=collator,
+                    train_dataset=Dataset.from_list(correction_rows),
+                    dataset_text_field="text",
+                    max_seq_length=max_seq_length,
+                    args=UnslothTrainingArguments(**train_args),
+                )
+                correction_stats = correction_trainer.train()
+                model = correction_trainer.accelerator.unwrap_model(model, keep_fp32_wrapper=False)
+                del correction_trainer
+            timing_stats["sft_c_correction_s"] += time.perf_counter() - correction_started_at
+            print(
+                f"[Rank {rank}] {key}: augmented-SFT control trained on "
+                f"{len(correction_rows)} transformed C examples; stats={correction_stats}"
+            )
+        if effective_ttft_method == "reduced_plus_opsd":
+            correction_started_at = time.perf_counter()
+            examples = build_opsd_examples(
+                opsd_split,
+                formatter=formatter,
+                color_permutations=config["opsd_color_permutations"],
+                cross_view_probability=config["opsd_cross_view_probability"],
+                seed=stable_seed_from_key(key),
+            )
+            clone_frozen_teacher_adapter(
+                model,
+                get_peft_model_state_dict=get_peft_model_state_dict,
+                set_peft_model_state_dict=set_peft_model_state_dict,
+            )
+            try:
+                opsd_stats = run_opsd_correction(
+                    model=model,
+                    tokenizer=tokenizer,
+                    formatter=formatter,
+                    examples=examples,
+                    max_seq_length=max_seq_length,
+                    max_updates=config["opsd_max_updates"],
+                    learning_rate=config["opsd_learning_rate"],
+                    temperature=config["opsd_temperature"],
+                    top_p=config["opsd_top_p"],
+                    lambda_ce=config["opsd_lambda_ce"],
+                    seed=stable_seed_from_key(key),
+                )
+            finally:
+                remove_teacher_adapter(model, TEACHER_ADAPTER_NAME)
+                model.set_adapter("default")
+                for parameter in model.parameters():
+                    parameter.requires_grad = False
+            timing_stats["opsd_correction_s"] += time.perf_counter() - correction_started_at
+            os.makedirs(config["opsd_log_dir"], exist_ok=True)
+            opsd_log = {
+                "puzzle_key": key,
+                "requested_ttft_method": config["ttft_method"],
+                "effective_ttft_method": effective_ttft_method,
+                "num_train_pairs": num_train_pairs,
+                "reserved_pair_index": opsd_split.reserved_pair_index,
+                "sft_pair_indices": opsd_split.sft_pair_indices,
+                "color_permutations": config["opsd_color_permutations"],
+                "cross_view_probability": config["opsd_cross_view_probability"],
+                "learning_rate": config["opsd_learning_rate"],
+                "lambda_ce": config["opsd_lambda_ce"],
+                "stats": opsd_stats,
+            }
+            with open(os.path.join(config["opsd_log_dir"], f"{_safe_path_key(key)}.json"), "w") as log_file:
+                json.dump(opsd_log, log_file, indent=2, sort_keys=True)
+                log_file.write("\n")
+            print(
+                f"[Rank {rank}] {key}: OPSD accepted "
+                f"{opsd_stats['accepted_updates']}/{opsd_stats['attempted_examples']} attempted examples"
+            )
 
         if config["sglang_train_adapters_only"]:
             adapter_path = _sglang_adapter_path(config, key)
@@ -995,6 +1209,25 @@ def worker(rank, queue, end_time):
             for offset in [10, 14]:
                 batch.extend(subkeys[offset : offset + 2])
             batches.append(batch)
+
+        if config["fixed_candidate_dir"]:
+            print(f"[Rank {rank}] rescoring fixed candidate pool for {key}")
+            with torch.inference_mode():
+                _rescore_fixed_candidate_pool(
+                    model=model,
+                    tokenizer=tokenizer,
+                    formatter=formatter,
+                    puzzle_ds_multi=puzzle_ds_multi,
+                    puzzle_key=key,
+                    candidate_dir=config["fixed_candidate_dir"],
+                    output_dir=dir_outputs,
+                    max_seq_length=max_seq_length,
+                    max_new_tokens=max_new_tokens,
+                    timing_stats=timing_stats,
+                    count_stats=count_stats,
+                )
+            # Phase 1 deliberately freezes the candidate pool; do not run DFS.
+            batches = []
 
         with torch.inference_mode():
             known_scores = {}
@@ -1088,6 +1321,8 @@ def worker(rank, queue, end_time):
             timing_stats["total_wall_s"] = time.perf_counter() - puzzle_started_at
             ordered_timings = [
                 "training_s",
+                "opsd_correction_s",
+                "sft_c_correction_s",
                 "eval_prep_s",
                 "tokenize_inputs_s",
                 "dfs_s",
@@ -1110,6 +1345,8 @@ def worker(rank, queue, end_time):
                     "rescoring_cache_hits",
                     "rescoring_cache_misses",
                     "rescorers_created",
+                    "fixed_pool_source_files",
+                    "fixed_pool_unique_candidates",
                 ]
             )
             print(f"[Rank {rank}] timing summary for {key}: {timings_text}")
