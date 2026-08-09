@@ -17,6 +17,7 @@ class CandidateRecoveryTest(unittest.TestCase):
         self.assertEqual(result["wrong_cells"], 1)
         self.assertTrue(result["immediate_next_cell_correct"])
         self.assertEqual(result["correct_cell_suffix"], 2)
+        self.assertIsNone(result["next_wrong_cell_manhattan_distance"])
 
     def test_sustained_same_shape_error(self):
         result = analyze_grid(np.array([[1, 9], [9, 9]]), np.array([[1, 2], [3, 4]]))
@@ -24,6 +25,17 @@ class CandidateRecoveryTest(unittest.TestCase):
         self.assertEqual(result["wrong_cells"], 3)
         self.assertFalse(result["immediate_next_cell_correct"])
         self.assertEqual(result["cell_error_spans"], 1)
+        self.assertEqual(result["next_wrong_cell_manhattan_distance"], 2)
+
+    def test_immediate_recovery_then_nearby_error(self):
+        candidate = np.array([[9, 2, 9], [4, 5, 6]])
+        gold = np.array([[1, 2, 3], [4, 5, 6]])
+        result = analyze_grid(candidate, gold)
+        self.assertTrue(result["immediate_next_cell_correct"])
+        self.assertEqual(result["next_wrong_cell_row_distance"], 0)
+        self.assertEqual(result["next_wrong_cell_col_distance"], 2)
+        self.assertEqual(result["next_wrong_cell_manhattan_distance"], 2)
+        self.assertTrue(result["next_wrong_cell_same_row"])
 
     def test_early_newline_from_shorter_width(self):
         candidate = np.array([[1, 2], [3, 4]])

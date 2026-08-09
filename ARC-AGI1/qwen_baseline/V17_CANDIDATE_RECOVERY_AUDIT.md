@@ -20,7 +20,15 @@ the candidates are unrestricted-greedy rollouts.
 - 2,268 unique grids within output
 - 165 of 172 evaluation outputs, spanning 118 of 120 tasks
 
-The seven outputs absent from the retained corpus are:
+Two tasks are entirely absent because every output has zero retained candidates:
+
+```text
+271d71e2
+4e34c42c
+```
+
+Four other tasks are partially covered. The seven outputs absent from the
+retained corpus are:
 
 ```text
 271d71e2_0
@@ -84,6 +92,20 @@ The common failure pattern is neither a single isolated error nor total
 autoregressive collapse. The candidate usually returns to matching gold, but
 then makes additional localized errors later.
 
+Of the 958 unique candidates that recover on the immediately following cell,
+only 30 have no later error. The remaining 928 return immediately and then
+diverge again. For those 928:
+
+- 61.3% have the next error in the same row or column as the first;
+- 60.6% have it within Chebyshev distance two;
+- the median Manhattan distance to the next error is two cells;
+- the 75th-percentile Manhattan distance is five cells.
+
+The later error is therefore often, but not always, in the spatial vicinity of
+the first. Across every multi-error candidate, including candidates whose first
+error run is contiguous, 81.5% have the next wrong cell in the same row or
+column and the median Manhattan distance is one.
+
 ## Wrong-shape candidates
 
 There are 241 unique wrong-shape grids. Their first divergence is:
@@ -100,16 +122,16 @@ Only 5.8% of unique wrong-shape candidates have at least 90% post-divergence
 sequence-match similarity after allowing alignment. Most wrong shapes are not
 merely an otherwise-correct output with one misplaced structural token.
 
-## Implication for OPSD
+## Hypothesis to test for OPSD
 
-The retained valid-grid evidence argues against treating every first error as a
-catastrophic trajectory departure. Most later cells remain correct, while
-errors recur in multiple islands. An OPSD loss averaged uniformly over the
-entire 420-token rollout will therefore spend most of its mass on already
-matching positions and can dilute the sharp signal at individual divergence
-positions. Before increasing a global learning rate, measure the same-example
-pre/post probability change at the divergence and consider divergence- or
-high-KL-weighted correction.
+These candidates come from SFT-trained models; this audit contains no OPSD
+training and cannot establish how OPSD loss is distributed. It does argue
+against assuming that every first error causes a catastrophic trajectory
+departure: most later cells remain correct while errors recur in multiple
+islands. That motivates measuring OPSD KL by position. Only if KL is also
+concentrated at those error islands would uniform averaging be shown to dilute
+their signal. Before increasing a global learning rate, measure the same-example
+pre/post probability change at each divergence and the per-position KL profile.
 
 ## Reproduction
 

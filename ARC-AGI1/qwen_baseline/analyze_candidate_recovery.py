@@ -125,6 +125,12 @@ def analyze_grid(candidate, gold):
         "immediate_next_cell_correct": None,
         "post_first_wrong_cell_match_fraction": None,
         "correct_cell_suffix": None,
+        "next_wrong_cell_row_distance": None,
+        "next_wrong_cell_col_distance": None,
+        "next_wrong_cell_manhattan_distance": None,
+        "next_wrong_cell_chebyshev_distance": None,
+        "next_wrong_cell_same_row": None,
+        "next_wrong_cell_same_col": None,
     }
     if exact:
         result["category"] = "exact"
@@ -191,6 +197,21 @@ def analyze_grid(candidate, gold):
                 "correct_cell_suffix": suffix,
             }
         )
+        if len(wrong_indices) > 1:
+            first_coordinates = np.asarray([first_wrong // gold.shape[1], first_wrong % gold.shape[1]])
+            next_wrong = int(wrong_indices[1])
+            next_coordinates = np.asarray([next_wrong // gold.shape[1], next_wrong % gold.shape[1]])
+            row_distance, col_distance = map(int, np.abs(next_coordinates - first_coordinates))
+            result.update(
+                {
+                    "next_wrong_cell_row_distance": row_distance,
+                    "next_wrong_cell_col_distance": col_distance,
+                    "next_wrong_cell_manhattan_distance": row_distance + col_distance,
+                    "next_wrong_cell_chebyshev_distance": max(row_distance, col_distance),
+                    "next_wrong_cell_same_row": row_distance == 0,
+                    "next_wrong_cell_same_col": col_distance == 0,
+                }
+            )
     else:
         result["category"] = "wrong_shape_" + classify_structural_divergence(
             candidate_at_divergence, gold_at_divergence
@@ -266,6 +287,11 @@ def summarize(rows, all_solution_keys, covered_output_keys, source_files):
         same_with_post = [
             row for row in same if row["post_first_wrong_cell_match_fraction"] is not None
         ]
+        immediate_then_later = [
+            row
+            for row in same_with_post
+            if row["immediate_next_cell_correct"] and row["wrong_cells"] > 1
+        ]
         return {
             "candidates": sum(row[weight_field] for row in values),
             "exact_fraction": weighted_fraction(values, lambda row: row["exact"], weight_field),
@@ -323,6 +349,28 @@ def summarize(rows, all_solution_keys, covered_output_keys, source_files):
                 ),
                 "wrong_cell_count_quantiles": weighted_quantiles(same, "wrong_cells", weight_field),
                 "error_span_count_quantiles": weighted_quantiles(same, "cell_error_spans", weight_field),
+                "immediate_recovery_then_later_error": {
+                    "candidates": sum(row[weight_field] for row in immediate_then_later),
+                    "next_error_same_row_fraction": weighted_fraction(
+                        immediate_then_later, lambda row: row["next_wrong_cell_same_row"], weight_field
+                    ),
+                    "next_error_same_col_fraction": weighted_fraction(
+                        immediate_then_later, lambda row: row["next_wrong_cell_same_col"], weight_field
+                    ),
+                    "next_error_same_row_or_col_fraction": weighted_fraction(
+                        immediate_then_later,
+                        lambda row: row["next_wrong_cell_same_row"] or row["next_wrong_cell_same_col"],
+                        weight_field,
+                    ),
+                    "next_error_within_chebyshev_2_fraction": weighted_fraction(
+                        immediate_then_later,
+                        lambda row: row["next_wrong_cell_chebyshev_distance"] <= 2,
+                        weight_field,
+                    ),
+                    "next_error_manhattan_distance_quantiles": weighted_quantiles(
+                        immediate_then_later, "next_wrong_cell_manhattan_distance", weight_field
+                    ),
+                },
             },
             "wrong_shape_first_divergence_counts": dict(
                 sorted(
