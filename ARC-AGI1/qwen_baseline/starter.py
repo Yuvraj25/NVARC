@@ -138,6 +138,7 @@ if __name__ == "__main__":
         default="full_sft",
     )
     parser.add_argument("--fixed-candidate-dir", type=str, default=None)
+    parser.add_argument("--selected-augmentations-path", type=str, default=None)
     parser.add_argument("--opsd-log-dir", type=str, default="../opsd_logs")
     parser.add_argument("--opsd-min-train-pairs", type=int, default=3)
     parser.add_argument("--opsd-color-permutations", type=int, default=2)
@@ -154,6 +155,8 @@ if __name__ == "__main__":
         raise ValueError("--sglang-infer-from-manifest requires --use-sglang")
     if args.sglang_infer_from_manifest and args.sglang_train_adapters_only:
         raise ValueError("--sglang-infer-from-manifest cannot be combined with --sglang-train-adapters-only")
+    if args.selected_augmentations_path and not args.sglang_infer_from_manifest:
+        raise ValueError("--selected-augmentations-path requires --sglang-infer-from-manifest")
     if args.sglang_stream_manifest and not args.use_sglang:
         raise ValueError("--sglang-stream-manifest requires --use-sglang")
     if args.sglang_stream_manifest and (args.sglang_infer_from_manifest or args.sglang_train_adapters_only):
@@ -201,6 +204,10 @@ if __name__ == "__main__":
         os.environ["ARC_FIXED_CANDIDATE_DIR"] = args.fixed_candidate_dir
     else:
         os.environ.pop("ARC_FIXED_CANDIDATE_DIR", None)
+    if args.selected_augmentations_path is not None:
+        os.environ["ARC_SELECTED_AUGMENTATIONS_PATH"] = args.selected_augmentations_path
+    else:
+        os.environ.pop("ARC_SELECTED_AUGMENTATIONS_PATH", None)
     os.environ["ARC_OPSD_LOG_DIR"] = args.opsd_log_dir
     os.environ["ARC_OPSD_MIN_TRAIN_PAIRS"] = str(args.opsd_min_train_pairs)
     os.environ["ARC_OPSD_COLOR_PERMUTATIONS"] = str(args.opsd_color_permutations)
@@ -231,6 +238,7 @@ if __name__ == "__main__":
         f"output_dir={os.environ['ARC_OUTPUT_DIR']}",
         f"ttft_method={os.environ['ARC_TTFT_METHOD']}",
         f"fixed_candidate_dir={os.environ.get('ARC_FIXED_CANDIDATE_DIR')}",
+        f"selected_augmentations_path={os.environ.get('ARC_SELECTED_AUGMENTATIONS_PATH')}",
         f"opsd_log_dir={os.environ['ARC_OPSD_LOG_DIR']}",
         f"opsd_min_train_pairs={os.environ['ARC_OPSD_MIN_TRAIN_PAIRS']}",
         f"opsd_color_permutations={os.environ['ARC_OPSD_COLOR_PERMUTATIONS']}",

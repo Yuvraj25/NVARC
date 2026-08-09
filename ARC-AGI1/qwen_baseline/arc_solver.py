@@ -30,6 +30,7 @@ from arc_opsd import (
     split_puzzle_for_opsd,
 )
 from arc_rescoring import FullPassRescorer
+from arc_selected_augmentations import load_selected_augmentations, prepare_selected_eval_ds
 from arc_sglang import ArcSglangBackend, SglangConfig, SglangRescorer, inference_sglang_dfs, inference_sglang_speculative_dfs
 from arc_search import ASSISTANT_TOKEN_ID, EOS_ID, USER_TOKEN_ID, default_max_score, inference_turbo_dfs
 
@@ -86,6 +87,7 @@ def runtime_config():
         "opsd_lambda_ce": float(os.environ.get("ARC_OPSD_LAMBDA_CE", "0.0")),
         "opsd_log_dir": os.environ.get("ARC_OPSD_LOG_DIR", "../opsd_logs"),
         "fixed_candidate_dir": os.environ.get("ARC_FIXED_CANDIDATE_DIR"),
+        "selected_augmentations_path": os.environ.get("ARC_SELECTED_AUGMENTATIONS_PATH"),
     }
 
 
@@ -226,6 +228,13 @@ def _build_eval_batches(eval_ds):
     for subkey in sorted(eval_ds.keys):
         test_id = subkey.split(".")[0].split("_")[1]
         test_id_to_subkeys[test_id].append(subkey)
+
+    if any(len(subkeys) != 16 for subkeys in test_id_to_subkeys.values()):
+        return [
+            subkeys[offset : offset + 4]
+            for subkeys in test_id_to_subkeys.values()
+            for offset in range(0, len(subkeys), 4)
+        ]
 
     batches = []
     for _test_id, subkeys in test_id_to_subkeys.items():
@@ -691,6 +700,21 @@ def worker_sglang(rank, queue, end_time, config):
                     backend.reset_stats()
                     prep_started_at = time.perf_counter()
                     puzzle_ds_multi, eval_ds = _prepare_eval_ds(puzzle_ds, formatter, max_seq_length, max_new_tokens)
+                    if config["selected_augmentations_path"]:
+                        descriptors = load_selected_augmentations(
+                            config["selected_augmentations_path"], key
+                        )
+                        eval_ds = prepare_selected_eval_ds(
+                            puzzle_ds_multi,
+                            descriptors,
+                            formatter,
+                            max_seq_length,
+                            max_new_tokens,
+                        )
+                        print(
+                            f"[Rank {rank}] selected augmentation replay for {key}: "
+                            f"descriptors={len(descriptors)} outputs={len(puzzle_ds_multi.keys)}"
+                        )
                     timing_stats["eval_prep_s"] += time.perf_counter() - prep_started_at
                     print(f"[Rank {rank}] persistent-infer adapter loaded for puzzle {key}: {adapter_path}")
                 elif config["sglang_reuse_adapters"]:
