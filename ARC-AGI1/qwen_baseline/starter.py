@@ -116,6 +116,8 @@ if __name__ == "__main__":
     parser.add_argument("--nprocs", type=int, default=4)
     parser.add_argument("--cuda-device-offset", type=int, default=0)
     parser.add_argument("--use-speculative-dfs", action="store_true")
+    parser.add_argument("--use-unsloth-multitoken-dfs", action="store_true")
+    parser.add_argument("--unsloth-multitoken-repeat-len", type=int, default=9)
     parser.add_argument("--use-sglang", action="store_true")
     parser.add_argument("--sglang-tp-size", type=int, default=1)
     parser.add_argument("--sglang-mem-fraction-static", type=float, default=None)
@@ -168,6 +170,10 @@ if __name__ == "__main__":
         raise ValueError("--use-sglang with --sglang-tp-size > 1 must run with exactly one worker")
     if args.ttft_method != "full_sft" and args.use_sglang:
         raise ValueError("Reduced-pair TTFT methods are only supported by the Unsloth/HF worker")
+    if args.use_unsloth_multitoken_dfs and args.use_sglang:
+        raise ValueError("--use-unsloth-multitoken-dfs is only supported by the Unsloth/HF worker")
+    if args.unsloth_multitoken_repeat_len < 2:
+        raise ValueError("--unsloth-multitoken-repeat-len must be at least 2")
     if args.opsd_min_train_pairs < 3:
         raise ValueError("--opsd-min-train-pairs must be at least 3")
     if args.opsd_color_permutations < 1:
@@ -178,6 +184,8 @@ if __name__ == "__main__":
         raise ValueError("--opsd-cross-view-probability must be in [0, 1]")
     end_time = args.end_time if args.end_time is not None else time.time() + 12 * 3600
     os.environ["ARC_USE_SPECULATIVE_DFS"] = "1" if args.use_speculative_dfs else "0"
+    os.environ["ARC_USE_UNSLOTH_MULTITOKEN_DFS"] = "1" if args.use_unsloth_multitoken_dfs else "0"
+    os.environ["ARC_UNSLOTH_MULTITOKEN_REPEAT_LEN"] = str(args.unsloth_multitoken_repeat_len)
     os.environ["ARC_USE_SGLANG"] = "1" if args.use_sglang else "0"
     os.environ["ARC_SGLANG_TP_SIZE"] = str(args.sglang_tp_size)
     if args.sglang_mem_fraction_static is not None:
@@ -220,6 +228,8 @@ if __name__ == "__main__":
     print(
         "runtime flags:",
         f"speculative_dfs={os.environ['ARC_USE_SPECULATIVE_DFS']}",
+        f"unsloth_multitoken_dfs={os.environ['ARC_USE_UNSLOTH_MULTITOKEN_DFS']}",
+        f"unsloth_multitoken_repeat_len={os.environ['ARC_UNSLOTH_MULTITOKEN_REPEAT_LEN']}",
         f"use_sglang={os.environ['ARC_USE_SGLANG']}",
         f"sglang_tp_size={os.environ['ARC_SGLANG_TP_SIZE']}",
         f"sglang_mem_fraction_static={os.environ.get('ARC_SGLANG_MEM_FRACTION_STATIC')}",
@@ -249,6 +259,19 @@ if __name__ == "__main__":
         f"opsd_top_p={os.environ['ARC_OPSD_TOP_P']}",
         f"opsd_lambda_ce={os.environ['ARC_OPSD_LAMBDA_CE']}",
     )
+
+    if args.use_unsloth_multitoken_dfs:
+        import importlib.util
+        from pathlib import Path
+
+        from patch_unsloth_qwen3_multitoken import patch_unsloth
+
+        spec = importlib.util.find_spec("unsloth")
+        if spec is None or not spec.submodule_search_locations:
+            raise RuntimeError("Cannot locate the Unsloth package for multi-token patching")
+        package_dir = Path(next(iter(spec.submodule_search_locations)))
+        changed = patch_unsloth(package_dir)
+        print("Unsloth multi-token patch ready:", package_dir, "changed=", [str(path) for path in changed])
 
     rerun_mode = True
     manager = mp.Manager()

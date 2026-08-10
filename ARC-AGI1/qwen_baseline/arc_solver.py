@@ -33,6 +33,7 @@ from arc_rescoring import FullPassRescorer
 from arc_selected_augmentations import load_selected_augmentations, prepare_selected_eval_ds
 from arc_sglang import ArcSglangBackend, SglangConfig, SglangRescorer, inference_sglang_dfs, inference_sglang_speculative_dfs
 from arc_search import ASSISTANT_TOKEN_ID, EOS_ID, USER_TOKEN_ID, default_max_score, inference_turbo_dfs
+from arc_search_multitoken import inference_turbo_dfs_multitoken
 
 logging.disable(logging.WARNING)
 
@@ -60,6 +61,8 @@ def runtime_config():
         )
     return {
         "use_speculative_dfs": _env_flag("ARC_USE_SPECULATIVE_DFS", default=False),
+        "use_unsloth_multitoken_dfs": _env_flag("ARC_USE_UNSLOTH_MULTITOKEN_DFS", default=False),
+        "unsloth_multitoken_repeat_len": int(os.environ.get("ARC_UNSLOTH_MULTITOKEN_REPEAT_LEN", "9")),
         "use_sglang": _env_flag("ARC_USE_SGLANG", default=False),
         "profile_timings": _env_flag("ARC_PROFILE_TIMINGS", default=False),
         "dfs_prob_threshold": dfs_prob_threshold,
@@ -1274,7 +1277,24 @@ def worker(rank, queue, end_time):
                 timing_stats["tokenize_inputs_s"] += time.perf_counter() - tokenize_started_at
 
                 dfs_started_at = time.perf_counter()
-                dfs_result = inference_turbo_dfs(model, tokens, max_new_tokens, max_score, end_time)
+                if config["use_unsloth_multitoken_dfs"]:
+                    multitoken_stats = {}
+                    dfs_result = inference_turbo_dfs_multitoken(
+                        model,
+                        tokens,
+                        max_new_tokens,
+                        max_score,
+                        end_time,
+                        repeat_len=config["unsloth_multitoken_repeat_len"],
+                        stats=multitoken_stats,
+                    )
+                    for name, value in multitoken_stats.items():
+                        if name == "model_time_s":
+                            timing_stats["dfs_multitoken_model_s"] += value
+                        else:
+                            count_stats[f"dfs_multitoken_{name}"] += value
+                else:
+                    dfs_result = inference_turbo_dfs(model, tokens, max_new_tokens, max_score, end_time)
                 timing_stats["dfs_s"] += time.perf_counter() - dfs_started_at
                 count_stats["dfs_calls"] += 1
 
@@ -1350,6 +1370,7 @@ def worker(rank, queue, end_time):
                 "eval_prep_s",
                 "tokenize_inputs_s",
                 "dfs_s",
+                "dfs_multitoken_model_s",
                 "rescorer_init_s",
                 "rescoring_s",
                 "write_results_s",
@@ -1361,6 +1382,10 @@ def worker(rank, queue, end_time):
                 for name in [
                     "batches",
                     "dfs_calls",
+                    "dfs_multitoken_block_calls",
+                    "dfs_multitoken_draft_tokens",
+                    "dfs_multitoken_accepted_extra_tokens",
+                    "dfs_multitoken_zero_extra_blocks",
                     "subkeys_scored",
                     "subkeys_written",
                     "beam_candidates_seen",
