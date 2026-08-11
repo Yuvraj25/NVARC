@@ -7,11 +7,16 @@ import numpy as np
 
 from repair_mining import (
     build_leave_one_out_probe,
+    build_repair_training_record,
+    build_solve_replay_record,
     deterministic_sample_paths,
     discover_subset_root,
     error_mask_diagnostics,
     gold_shape_error_mask,
+    length_bucket_batches,
+    restricted_greedy_rollout_batch,
     stabilize_inference_state,
+    teacher_forced_metrics_batch,
     transform_grid,
     validate_pairs,
 )
@@ -102,6 +107,97 @@ class RepairMiningTest(unittest.TestCase):
         self.assertTrue(validate_pairs([pair(1), pair(2), pair(3)]))
         bad = [pair(1), pair(2), {"input": [[11]], "output": [[0]]}]
         self.assertFalse(validate_pairs(bad))
+
+    def test_constructs_failure_noop_and_solve_replay_without_gold_leak(self):
+        probe = build_leave_one_out_probe(
+            [pair(value) for value in range(5)],
+            subset="nvarc_training",
+            puzzle_id="record_test",
+            anchor_id="anchor",
+            source_path="record_test.json",
+            seed=3,
+        )
+        wrong = np.asarray(probe.gold_output).copy()
+        wrong[0, 0] = (wrong[0, 0] + 1) % 10
+        failure = build_repair_training_record(probe, wrong.tolist())
+        self.assertEqual(failure["record_type"], "repair_failure")
+        self.assertIn("<REPAIR>\n", failure["input"])
+        self.assertEqual(failure["reply"], "\n".join("".join(map(str, row)) for row in probe.gold_output) + "<|im_end|>")
+        self.assertEqual(failure["error_mask"][0][0], 1)
+
+        noop = build_repair_training_record(probe, probe.gold_output)
+        self.assertEqual(noop["record_type"], "repair_noop")
+        self.assertEqual(noop["total_wrong_missing_or_extra_cells"], 0)
+        self.assertTrue(all(cell == 0 for row in noop["error_mask"] for cell in row))
+
+        replay = build_solve_replay_record(probe)
+        self.assertEqual(replay["record_type"], "solve_replay")
+        self.assertNotIn("<REPAIR>", replay["input"])
+
+    def test_length_bucketing_is_stable_and_complete(self):
+        values = ["aaaa", "b", "ccc", "dd", "ee"]
+        batches = length_bucket_batches(values, batch_size=2, key=len)
+        self.assertEqual(batches, [[1, 3], [4, 2], [0]])
+        self.assertEqual(sorted(index for batch in batches for index in batch), list(range(len(values))))
+        with self.assertRaises(ValueError):
+            length_bucket_batches(values, batch_size=0, key=len)
+
+    def test_batched_tensor_paths_handle_variable_lengths_and_eos(self):
+        import torch
+
+        class Tokenizer:
+            values = {
+                "prompt_a": [1, 2],
+                "reply_a": [3, 15],
+                "prompt_b": [4],
+                "reply_b": [5, 6, 15],
+            }
+
+            def encode(self, text):
+                return self.values[text]
+
+        class Output:
+            def __init__(self, logits):
+                self.logits = logits
+
+        class Model(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.marker = torch.nn.Parameter(torch.zeros(1))
+                self.gradient_checkpointing = False
+
+            def forward(self, input_ids, **_kwargs):
+                logits = torch.full((*input_ids.shape, 16), -20.0, device=input_ids.device)
+                for row in range(input_ids.shape[0]):
+                    for position in range(input_ids.shape[1] - 1):
+                        logits[row, position, input_ids[row, position + 1]] = 20.0
+                return Output(logits)
+
+            def generate(self, input_ids, **_kwargs):
+                suffix = torch.tensor([[1, 15, 13], [2, 3, 15]], device=input_ids.device)
+                return torch.cat([input_ids, suffix], dim=1)
+
+            def gradient_checkpointing_disable(self):
+                self.gradient_checkpointing = False
+
+        model = Model()
+        tokenizer = Tokenizer()
+        metrics = teacher_forced_metrics_batch(
+            model,
+            tokenizer,
+            ["prompt_a", "prompt_b"],
+            ["reply_a", "reply_b"],
+        )
+        self.assertEqual([item["restricted_greedy_exact"] for item in metrics], [True, True])
+        self.assertEqual([item["gold_tokens"] for item in metrics], [2, 3])
+
+        rollouts = restricted_greedy_rollout_batch(
+            model,
+            tokenizer,
+            ["prompt_a", "prompt_b"],
+            max_new_tokens=3,
+        )
+        self.assertEqual(rollouts, [[1, 15], [2, 3, 15]])
 
     def test_stabilizes_patched_inference_state(self):
         class Layer:

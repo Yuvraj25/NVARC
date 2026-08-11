@@ -11,7 +11,7 @@ import hashlib
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 import numpy as np
 
@@ -245,6 +245,88 @@ def format_reply(grid: Any) -> str:
     return grid_to_string(grid) + "<|im_end|>"
 
 
+def zero_mask(grid: Any) -> list[list[int]]:
+    if not validate_grid(grid):
+        raise ValueError("Invalid ARC grid")
+    return np.zeros(np.asarray(grid).shape, dtype=np.int8).tolist()
+
+
+def format_repair_prompt(
+    probe: LeaveOneOutProbe,
+    prediction: Any,
+    *,
+    repair_token: str = "<REPAIR>",
+) -> str:
+    """Append a privileged repair turn to an ordinary solve trajectory.
+
+    The candidate is the model's prior assistant response.  The following user
+    turn contains one new mode token and a binary error mask.  The mask is
+    gold-shaped, so its dimensions also communicate the desired output shape.
+    """
+    mask = gold_shape_error_mask(prediction, probe.gold_output)
+    return (
+        format_prompt(probe)
+        + format_reply(prediction)
+        + "<|im_start|>user\n"
+        + repair_token
+        + "\n"
+        + grid_to_string(mask)
+        + "<|im_end|><|im_start|>assistant\n"
+    )
+
+
+def build_repair_training_record(
+    probe: LeaveOneOutProbe,
+    prediction: Any,
+    *,
+    repair_token: str = "<REPAIR>",
+) -> dict[str, Any]:
+    diagnostics = error_mask_diagnostics(prediction, probe.gold_output)
+    return {
+        "record_type": "repair_noop" if diagnostics["total_wrong_missing_or_extra_cells"] == 0 else "repair_failure",
+        "puzzle_id": probe.puzzle_id,
+        "anchor_id": probe.anchor_id,
+        "source_path": probe.source_path,
+        "demonstration_indices": list(probe.demonstration_indices),
+        "query_index": probe.query_index,
+        "transform_id": probe.transform_id,
+        "color_mapping": list(probe.color_mapping),
+        "input": format_repair_prompt(probe, prediction, repair_token=repair_token),
+        "reply": format_reply(probe.gold_output),
+        "prediction": np.asarray(prediction).tolist(),
+        **diagnostics,
+    }
+
+
+def build_solve_replay_record(probe: LeaveOneOutProbe) -> dict[str, Any]:
+    """Construct ordinary solve replay without storing a duplicate corpus."""
+    return {
+        "record_type": "solve_replay",
+        "puzzle_id": probe.puzzle_id,
+        "anchor_id": probe.anchor_id,
+        "source_path": probe.source_path,
+        "demonstration_indices": list(probe.demonstration_indices),
+        "query_index": probe.query_index,
+        "transform_id": probe.transform_id,
+        "color_mapping": list(probe.color_mapping),
+        "input": format_prompt(probe),
+        "reply": format_reply(probe.gold_output),
+    }
+
+
+def length_bucket_batches(
+    values: Sequence[Any],
+    *,
+    batch_size: int,
+    key: Callable[[Any], int],
+) -> list[list[int]]:
+    """Return stable index batches sorted by length to reduce padding."""
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive")
+    ordered = sorted(range(len(values)), key=lambda index: (key(values[index]), index))
+    return [ordered[start : start + batch_size] for start in range(0, len(ordered), batch_size)]
+
+
 def gold_shape_error_mask(prediction: Any, gold: Any) -> list[list[int]]:
     """Return a gold-shaped mask; absent cells are wrong and extras are cropped."""
     if not validate_grid(prediction) or not validate_grid(gold):
@@ -315,47 +397,81 @@ def stabilize_inference_state(model: Any) -> None:
             module.gradient_checkpointing = False
 
 
-def teacher_forced_metrics(model: Any, tokenizer: Any, prompt: str, gold_reply: str) -> dict[str, Any]:
-    import torch
-
-    stabilize_inference_state(model)
-    prompt_ids = tokenizer.encode(prompt)
-    gold_ids = tokenizer.encode(gold_reply)
-    if not prompt_ids or not gold_ids:
-        raise ValueError("Prompt and gold reply must tokenize to non-empty sequences")
-    device = next(model.parameters()).device
-    input_ids = torch.tensor([prompt_ids + gold_ids], device=device, dtype=torch.long)
-    with torch.no_grad():
-        logits = model(input_ids=input_ids, return_dict=True, use_cache=False).logits[0]
-    completion_logits = logits[len(prompt_ids) - 1 : len(prompt_ids) - 1 + len(gold_ids)].float()
-    targets = torch.tensor(gold_ids, device=device, dtype=torch.long)
-    legal_ids = torch.tensor(ARC_TOKENS, device=device, dtype=torch.long)
-    legal_argmax = legal_ids[completion_logits[:, legal_ids].argmax(dim=-1)]
-    log_prob = torch.log_softmax(completion_logits, dim=-1)
-    positions = torch.arange(len(gold_ids), device=device)
-    token_nll = -log_prob[positions, targets]
-    wrong = (legal_argmax != targets).nonzero(as_tuple=False).flatten()
-    first_wrong = int(wrong[0].cpu()) if len(wrong) else None
-    result = {
-        "prompt_tokens": len(prompt_ids),
-        "gold_tokens": len(gold_ids),
-        "gold_nll": float(token_nll.sum().cpu()),
-        "gold_mean_nll": float(token_nll.mean().cpu()),
-        "restricted_greedy_exact": len(wrong) == 0,
-        "wrong_argmax_tokens": int(len(wrong)),
-        "first_wrong_token": first_wrong,
-    }
-    del input_ids, logits, completion_logits, targets, legal_ids, legal_argmax, log_prob, token_nll, wrong
-    return result
-
-
-def restricted_greedy_rollout(
+def teacher_forced_metrics_batch(
     model: Any,
     tokenizer: Any,
-    prompt: str,
+    prompts: Sequence[str],
+    gold_replies: Sequence[str],
+) -> list[dict[str, Any]]:
+    import torch
+
+    if len(prompts) != len(gold_replies) or not prompts:
+        raise ValueError("prompts and gold_replies must have the same positive length")
+    stabilize_inference_state(model)
+    prompt_token_ids = [tokenizer.encode(prompt) for prompt in prompts]
+    gold_token_ids = [tokenizer.encode(reply) for reply in gold_replies]
+    if any(not ids for ids in prompt_token_ids) or any(not ids for ids in gold_token_ids):
+        raise ValueError("Prompts and gold replies must tokenize to non-empty sequences")
+
+    sequences = [prompt_ids + gold_ids for prompt_ids, gold_ids in zip(prompt_token_ids, gold_token_ids)]
+    maximum_length = max(map(len, sequences))
+    device = next(model.parameters()).device
+    input_ids = torch.full(
+        (len(sequences), maximum_length),
+        PAD_ID,
+        device=device,
+        dtype=torch.long,
+    )
+    attention_mask = torch.zeros_like(input_ids)
+    for index, sequence in enumerate(sequences):
+        input_ids[index, : len(sequence)] = torch.tensor(sequence, device=device, dtype=torch.long)
+        attention_mask[index, : len(sequence)] = 1
+    with torch.no_grad():
+        logits = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            return_dict=True,
+            use_cache=False,
+        ).logits
+    legal_ids = torch.tensor(ARC_TOKENS, device=device, dtype=torch.long)
+    results = []
+    for index, (prompt_ids, gold_ids) in enumerate(zip(prompt_token_ids, gold_token_ids)):
+        completion_logits = logits[
+            index,
+            len(prompt_ids) - 1 : len(prompt_ids) - 1 + len(gold_ids),
+        ].float()
+        targets = torch.tensor(gold_ids, device=device, dtype=torch.long)
+        legal_argmax = legal_ids[completion_logits[:, legal_ids].argmax(dim=-1)]
+        log_prob = torch.log_softmax(completion_logits, dim=-1)
+        positions = torch.arange(len(gold_ids), device=device)
+        token_nll = -log_prob[positions, targets]
+        wrong = (legal_argmax != targets).nonzero(as_tuple=False).flatten()
+        results.append(
+            {
+                "prompt_tokens": len(prompt_ids),
+                "gold_tokens": len(gold_ids),
+                "gold_nll": float(token_nll.sum().cpu()),
+                "gold_mean_nll": float(token_nll.mean().cpu()),
+                "restricted_greedy_exact": len(wrong) == 0,
+                "wrong_argmax_tokens": int(len(wrong)),
+                "first_wrong_token": int(wrong[0].cpu()) if len(wrong) else None,
+            }
+        )
+    del input_ids, attention_mask, logits, legal_ids
+    return results
+
+
+def teacher_forced_metrics(model: Any, tokenizer: Any, prompt: str, gold_reply: str) -> dict[str, Any]:
+    return teacher_forced_metrics_batch(model, tokenizer, [prompt], [gold_reply])[0]
+
+
+def restricted_greedy_rollout_batch(
+    model: Any,
+    tokenizer: Any,
+    prompts: Sequence[str],
     *,
     max_new_tokens: int,
-) -> list[int]:
+) -> list[list[int]]:
     import torch
     from transformers import LogitsProcessorList
 
@@ -365,14 +481,33 @@ def restricted_greedy_rollout(
             masked[:, ARC_TOKENS] = scores[:, ARC_TOKENS]
             return masked
 
+    if not prompts:
+        raise ValueError("prompts must be non-empty")
+    if max_new_tokens < 1:
+        raise ValueError("max_new_tokens must be positive")
+
     stabilize_inference_state(model)
-    prompt_ids = tokenizer.encode(prompt)
+    prompt_token_ids = [tokenizer.encode(prompt) for prompt in prompts]
+    if any(not ids for ids in prompt_token_ids):
+        raise ValueError("Prompts must tokenize to non-empty sequences")
+    maximum_prompt_length = max(map(len, prompt_token_ids))
     device = next(model.parameters()).device
-    input_ids = torch.tensor([prompt_ids], device=device, dtype=torch.long)
+    input_ids = torch.full(
+        (len(prompts), maximum_prompt_length),
+        PAD_ID,
+        device=device,
+        dtype=torch.long,
+    )
+    attention_mask = torch.zeros_like(input_ids)
+    for index, prompt_ids in enumerate(prompt_token_ids):
+        offset = maximum_prompt_length - len(prompt_ids)
+        input_ids[index, offset:] = torch.tensor(prompt_ids, device=device, dtype=torch.long)
+        attention_mask[index, offset:] = 1
     try:
         with torch.no_grad():
             generated = model.generate(
                 input_ids=input_ids,
+                attention_mask=attention_mask,
                 do_sample=False,
                 max_new_tokens=max_new_tokens,
                 eos_token_id=EOS_ID,
@@ -382,6 +517,25 @@ def restricted_greedy_rollout(
             )
     finally:
         stabilize_inference_state(model)
-    result = generated[0, len(prompt_ids) :].tolist()
-    del input_ids, generated
-    return result
+    results = []
+    for row in generated[:, maximum_prompt_length:].tolist():
+        if EOS_ID in row:
+            row = row[: row.index(EOS_ID) + 1]
+        results.append(row)
+    del input_ids, attention_mask, generated
+    return results
+
+
+def restricted_greedy_rollout(
+    model: Any,
+    tokenizer: Any,
+    prompt: str,
+    *,
+    max_new_tokens: int,
+) -> list[int]:
+    return restricted_greedy_rollout_batch(
+        model,
+        tokenizer,
+        [prompt],
+        max_new_tokens=max_new_tokens,
+    )[0]
