@@ -12,8 +12,8 @@ HERE = Path(__file__).resolve().parent
 OUTPUT_NAME = os.environ.get("ARC_REPAIR_SFT_NOTEBOOK_NAME", "arc26-repair-sft-smoke.ipynb")
 OUTPUT = HERE.parent / OUTPUT_NAME
 DATASET_SLUG = os.environ.get("ARC_REPAIR_SFT_DATASET_SLUG", "arc26-repair-failures-18432")
-MAX_TRAIN_EXAMPLES = os.environ.get("ARC_REPAIR_SFT_MAX_TRAIN_EXAMPLES", "8")
-EPOCHS = os.environ.get("ARC_REPAIR_SFT_EPOCHS", "0.25")
+MAX_TRAIN_EXAMPLES = os.environ.get("ARC_REPAIR_SFT_MAX_TRAIN_EXAMPLES", "32")
+EPOCHS = os.environ.get("ARC_REPAIR_SFT_EPOCHS", "0.5")
 DIAGNOSTIC_EXAMPLES = int(os.environ.get("ARC_REPAIR_SFT_DIAGNOSTIC_EXAMPLES", "2"))
 ROLLOUT_EXAMPLES = int(os.environ.get("ARC_REPAIR_SFT_ROLLOUT_EXAMPLES", "1"))
 OUTPUT_DIR_NAME = os.environ.get("ARC_REPAIR_SFT_OUTPUT_DIR", "repair_sft_smoke")
@@ -164,6 +164,7 @@ print('dataset =', DATASET_SLUG, 'max train =', MAX_TRAIN_EXAMPLES, 'epochs =', 
         'solve_replay': 0.15,
         'repair_noop': 0.01,
     }
+    assert manifest['adapter_update']['after']['nonzero_elements'] > 0
     print(json.dumps(manifest, indent=2))"""
     ),
 ]

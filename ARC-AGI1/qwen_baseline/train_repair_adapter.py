@@ -70,6 +70,27 @@ def select_diagnostics(
     return rng.sample(records, min(count, len(records)))
 
 
+def summarize_lora_b(model: Any) -> dict[str, float | int]:
+    """Cheap proof that optimization moved the zero-initialized LoRA-B weights."""
+    import torch
+
+    tensors = [
+        parameter.detach()
+        for name, parameter in model.named_parameters()
+        if "lora_B" in name
+    ]
+    if not tensors:
+        raise RuntimeError("No LoRA-B parameters found")
+    with torch.no_grad():
+        return {
+            "tensors": len(tensors),
+            "elements": sum(tensor.numel() for tensor in tensors),
+            "nonzero_elements": sum(int(torch.count_nonzero(tensor).item()) for tensor in tensors),
+            "max_abs": max(float(tensor.float().abs().max().item()) for tensor in tensors),
+            "l2": float(sum(tensor.float().square().sum().item() for tensor in tensors) ** 0.5),
+        }
+
+
 def evaluate_model(
     model: Any,
     tokenizer: Any,
@@ -230,6 +251,7 @@ def main() -> None:
     for _name, parameter in model.named_parameters():
         if parameter.dtype == torch.float32:
             parameter.data = parameter.data.to(torch.bfloat16)
+    adapter_before = summarize_lora_b(model)
     model_load_seconds = time.perf_counter() - load_started
 
     tokenized = []
@@ -280,7 +302,9 @@ def main() -> None:
             lr_scheduler_type="cosine",
             seed=args.seed,
             report_to="none",
-            save_strategy="no",
+            save_strategy="steps",
+            save_steps=100,
+            save_total_limit=2,
             eval_strategy="no",
             logging_steps=10,
             fp16=False,
@@ -293,6 +317,12 @@ def main() -> None:
     training_seconds = time.perf_counter() - training_started
     model = trainer.accelerator.unwrap_model(model, keep_fp32_wrapper=False)
     del trainer
+    adapter_after = summarize_lora_b(model)
+    if adapter_after["nonzero_elements"] <= adapter_before["nonzero_elements"]:
+        raise RuntimeError(
+            "Training completed without changing any zero-initialized LoRA-B weights: "
+            f"before={adapter_before} after={adapter_after}"
+        )
 
     # Persist the trained artifact before optional autoregressive diagnostics.
     # A diagnostic failure must not discard a completed multi-hour run.
@@ -324,6 +354,7 @@ def main() -> None:
         "mixture": mixture_manifest,
         "overlong": dict(sorted(overlong.items())),
         "tokenized_examples": len(tokenized),
+        "adapter_update": {"before": adapter_before, "after": adapter_after},
         "diagnostics": {"before": before, "after": after},
         "timings": {
             "model_load_s": model_load_seconds,

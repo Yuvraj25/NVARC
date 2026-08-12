@@ -10,6 +10,7 @@ from repair_sft import (
     ordinary_solve_prompt,
     tokenize_completion_only,
 )
+from train_repair_adapter import summarize_lora_b
 
 
 def repair_record(index=0):
@@ -94,6 +95,18 @@ class FakeArcModel(torch.nn.Module):
 
 
 class RepairSftTest(unittest.TestCase):
+    def test_lora_update_summary_detects_nonzero_b_weights(self):
+        model = torch.nn.Module()
+        model.lora_B = torch.nn.Linear(2, 3, bias=False)
+        with torch.no_grad():
+            model.lora_B.weight.zero_()
+            model.lora_B.weight[1, 0] = 0.25
+        summary = summarize_lora_b(model)
+        self.assertEqual(summary["tensors"], 1)
+        self.assertEqual(summary["elements"], 6)
+        self.assertEqual(summary["nonzero_elements"], 1)
+        self.assertEqual(summary["max_abs"], 0.25)
+
     def test_repair_token_uses_structural_embedding_mean(self):
         tokenizer = FakeArcTokenizer()
         model = FakeArcModel()
