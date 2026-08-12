@@ -161,18 +161,20 @@ print('probes =', NUM_PROBES, 'workers =', WORLD_SIZE, 'rollout batch =', ROLLOU
         json.loads((output_dir / f'summary.rank{rank}.json').read_text())
         for rank in range(WORLD_SIZE)
     ]
-    records = []
+    raw_records = []
     shard_hashes = {}
     for rank in range(WORLD_SIZE):
         path = output_dir / f'repair_failures.rank{rank}.jsonl'
         if path.exists():
             shard_hashes[path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
-            records.extend(
+            raw_records.extend(
                 json.loads(line)
                 for line in path.read_text().splitlines()
                 if line.strip()
             )
-    records.sort(key=lambda record: record['global_index'])
+    raw_records.sort(key=lambda record: record['global_index'])
+    records = [record for record in raw_records if record['record_type'] == 'repair_failure']
+    rollout_exact_noops = [record for record in raw_records if record['record_type'] == 'repair_noop']
 
     aggregate = {
         key: sum(summary['counts'][key] for summary in summaries)
@@ -186,17 +188,20 @@ print('probes =', NUM_PROBES, 'workers =', WORLD_SIZE, 'rollout batch =', ROLLOU
         == NUM_PROBES
     ), aggregate
     assert (
-        aggregate['usable_repair_failures'] + aggregate['invalid_rollouts']
+        aggregate['usable_repair_failures']
+        + aggregate['rollout_exact_noops']
+        + aggregate['invalid_rollouts']
         == aggregate['teacher_forced_failures']
     ), aggregate
     assert len(records) == aggregate['usable_repair_failures']
-    assert len({record['global_index'] for record in records}) == len(records)
-    assert len({record['source_relpath'] for record in records}) == len(records)
-    assert all(record['record_type'] == 'repair_failure' for record in records)
-    assert all('<REPAIR>\\n' in record['input'] for record in records)
-    assert all(record['anchor_id'] not in validation_anchors for record in records)
-    assert all(record['global_index'] in record['decoder']['batch_member_global_indices'] for record in records)
-    assert all(len(record['decoder']['batch_member_global_indices']) <= ROLLOUT_BATCH_SIZE for record in records)
+    assert len(rollout_exact_noops) == aggregate['rollout_exact_noops']
+    assert len({record['global_index'] for record in raw_records}) == len(raw_records)
+    assert len({record['source_relpath'] for record in raw_records}) == len(raw_records)
+    assert all(record['record_type'] in {'repair_failure', 'repair_noop'} for record in raw_records)
+    assert all('<REPAIR>\\n' in record['input'] for record in raw_records)
+    assert all(record['anchor_id'] not in validation_anchors for record in raw_records)
+    assert all(record['global_index'] in record['decoder']['batch_member_global_indices'] for record in raw_records)
+    assert all(len(record['decoder']['batch_member_global_indices']) <= ROLLOUT_BATCH_SIZE for record in raw_records)
 
     def split_for(anchor_id):
         value = int(hashlib.sha256(f'{SEED}:split:{anchor_id}'.encode()).hexdigest()[:16], 16)
@@ -269,6 +274,7 @@ print('probes =', NUM_PROBES, 'workers =', WORLD_SIZE, 'rollout batch =', ROLLOU
         'aggregate_counts': aggregate,
         'records': {
             'combined': len(records),
+            'excluded_rollout_exact_noops': len(rollout_exact_noops),
             'unique_anchors': len({record['anchor_id'] for record in records}),
             'unique_puzzles': len({record['puzzle_id'] for record in records}),
             'shape_errors': len(shape_errors),

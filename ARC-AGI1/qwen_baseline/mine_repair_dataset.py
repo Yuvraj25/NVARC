@@ -154,6 +154,8 @@ def main() -> None:
             item is not None and item["restricted_greedy_exact"] for item in metrics
         ),
         "teacher_forced_failures": len(failure_indices),
+        "valid_rollouts": 0,
+        "rollout_exact_noops": 0,
         "usable_repair_failures": 0,
         "invalid_rollouts": 0,
     }
@@ -193,6 +195,10 @@ def main() -> None:
                 prediction,
                 repair_token=args.repair_token,
             )
+            counts["valid_rollouts"] += 1
+            if record["record_type"] == "repair_noop":
+                counts["rollout_exact_noops"] += 1
+                continue
             record["source_path"] = str(source_path.relative_to(training_root))
             record.update(
                 {
