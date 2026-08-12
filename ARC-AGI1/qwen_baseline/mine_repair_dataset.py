@@ -24,6 +24,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-path", type=str, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--num-probes", type=int, required=True)
+    parser.add_argument("--start-index", type=int, default=0)
     parser.add_argument("--seed", type=int, default=20260811)
     parser.add_argument("--rank", type=int, default=0)
     parser.add_argument("--world-size", type=int, default=1)
@@ -43,6 +44,8 @@ def main() -> None:
     args = parse_args()
     if args.num_probes < 1:
         raise ValueError("num_probes must be positive")
+    if not 0 <= args.start_index < args.num_probes:
+        raise ValueError("start_index must be in [0, num_probes)")
     if not (0 <= args.rank < args.world_size):
         raise ValueError("rank must be in [0, world_size)")
     if args.rollout_batch_size < 1:
@@ -72,6 +75,7 @@ def main() -> None:
         load_probe_from_path,
         parse_rollout_grid,
         restricted_greedy_rollout_batch,
+        shard_indexed_paths,
         stabilize_inference_state,
         teacher_forced_metrics,
     )
@@ -95,11 +99,12 @@ def main() -> None:
     if len(global_paths) != args.num_probes:
         raise RuntimeError(f"Requested {args.num_probes} paths but found {len(global_paths)}")
 
-    indexed_paths = [
-        (global_index, path)
-        for global_index, path in enumerate(global_paths)
-        if global_index % args.world_size == args.rank
-    ]
+    indexed_paths = shard_indexed_paths(
+        global_paths,
+        start_index=args.start_index,
+        rank=args.rank,
+        world_size=args.world_size,
+    )
     probes = [
         load_probe_from_path(path, subset="nvarc_training", seed=args.seed)
         for _, path in indexed_paths
@@ -140,11 +145,12 @@ def main() -> None:
         for index, item in enumerate(metrics)
         if item is not None and not item["restricted_greedy_exact"]
     ]
-    failure_prompts = [prompts[index] for index in failure_indices]
+    prompt_token_lengths = [len(tokenizer.encode(prompt)) for prompt in prompts]
+    gold_token_lengths = [len(tokenizer.encode(reply)) for reply in replies]
     rollout_batches = length_bucket_batches(
-        failure_prompts,
+        failure_indices,
         batch_size=args.rollout_batch_size,
-        key=lambda prompt: len(tokenizer.encode(prompt)),
+        key=lambda index: gold_token_lengths[index],
     )
 
     counts = {
@@ -160,11 +166,10 @@ def main() -> None:
         "invalid_rollouts": 0,
     }
     rollout_started = time.perf_counter()
-    for batch_number, local_failure_indices in enumerate(rollout_batches, 1):
-        batch_probe_indices = [failure_indices[index] for index in local_failure_indices]
+    for batch_number, batch_probe_indices in enumerate(rollout_batches, 1):
         batch_prompts = [prompts[index] for index in batch_probe_indices]
         batch_global_indices = [indexed_paths[index][0] for index in batch_probe_indices]
-        maximum_prompt = max(len(tokenizer.encode(prompt)) for prompt in batch_prompts)
+        maximum_prompt = max(prompt_token_lengths[index] for index in batch_probe_indices)
         token_batches = restricted_greedy_rollout_batch(
             model,
             tokenizer,
@@ -208,7 +213,10 @@ def main() -> None:
                     "teacher_forced": metrics[probe_index],
                     "decoder": {
                         "name": "restricted_greedy",
-                        "rollout_batch_size": args.rollout_batch_size,
+                        "requested_rollout_batch_size": args.rollout_batch_size,
+                        "actual_rollout_batch_size": len(batch_probe_indices),
+                        "batch_bucket_key": "gold_reply_token_length",
+                        "gold_length_used_as_generation_limit": False,
                         "batch_number": batch_number,
                         "batch_member_global_indices": batch_global_indices,
                         "rank": args.rank,
@@ -231,6 +239,7 @@ def main() -> None:
     summary = {
         "config": {
             "num_probes": args.num_probes,
+            "start_index": args.start_index,
             "seed": args.seed,
             "rank": args.rank,
             "world_size": args.world_size,

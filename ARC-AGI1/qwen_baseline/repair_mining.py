@@ -217,6 +217,25 @@ def deterministic_sample_paths(
     return selected
 
 
+def shard_indexed_paths(
+    paths: Sequence[Path],
+    *,
+    start_index: int,
+    rank: int,
+    world_size: int,
+) -> list[tuple[int, Path]]:
+    """Shard a resumed global sample without renumbering its path indices."""
+    if not 0 <= start_index <= len(paths):
+        raise ValueError("start_index must be in [0, len(paths)]")
+    if world_size < 1 or not 0 <= rank < world_size:
+        raise ValueError("rank must be in [0, world_size)")
+    return [
+        (global_index, path)
+        for global_index, path in enumerate(paths)
+        if global_index >= start_index and global_index % world_size == rank
+    ]
+
+
 def grid_to_string(grid: Any) -> str:
     if not validate_grid(grid):
         raise ValueError("Invalid ARC grid")

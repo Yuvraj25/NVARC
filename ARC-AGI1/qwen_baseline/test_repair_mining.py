@@ -15,6 +15,7 @@ from repair_mining import (
     gold_shape_error_mask,
     length_bucket_batches,
     restricted_greedy_rollout_batch,
+    shard_indexed_paths,
     stabilize_inference_state,
     teacher_forced_metrics_batch,
     transform_grid,
@@ -29,6 +30,16 @@ def pair(value, rows=2, cols=3):
 
 
 class RepairMiningTest(unittest.TestCase):
+    def test_resume_sharding_preserves_global_indices_without_overlap(self):
+        paths = [Path(f"p{index}.json") for index in range(12)]
+        shards = [
+            shard_indexed_paths(paths, start_index=5, rank=rank, world_size=4)
+            for rank in range(4)
+        ]
+        observed = sorted(item for shard in shards for item in shard)
+        self.assertEqual(observed, list(enumerate(paths))[5:])
+        self.assertTrue(all(index >= 5 for index, _path in observed))
+
     def test_leave_one_out_is_reproducible_and_never_leaks_query(self):
         pairs = [pair(value) for value in range(6)]
         first = build_leave_one_out_probe(
