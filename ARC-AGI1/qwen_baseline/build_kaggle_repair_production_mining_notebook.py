@@ -4,11 +4,22 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 
 
 HERE = Path(__file__).resolve().parent
-OUTPUT = HERE.parent / "arc26-repair-production-mining-continuation.ipynb"
+NUM_PROBES = int(os.environ.get("ARC_REPAIR_NUM_PROBES", "10240"))
+START_INDEX = int(os.environ.get("ARC_REPAIR_START_INDEX", "512"))
+OUTPUT_NAME = os.environ.get(
+    "ARC_REPAIR_NOTEBOOK_NAME",
+    "arc26-repair-production-mining-continuation.ipynb",
+)
+OUTPUT = HERE.parent / OUTPUT_NAME
+WORK_NAME = os.environ.get(
+    "ARC_REPAIR_WORK_NAME",
+    "repair_mining_10240_continuation",
+)
 SOURCE_FILES = ("repair_mining.py", "mine_repair_dataset.py")
 SOURCE_HASHES = {
     name: hashlib.sha256((HERE / name).read_bytes()).hexdigest()
@@ -42,16 +53,16 @@ def markdown_cell(source: str) -> dict:
 
 cells = [
     markdown_cell(
-        """# ARC repair dataset: 10,240-probe production continuation
+        f"""# ARC repair dataset: production continuation to {NUM_PROBES:,} probes
 
-This run resumes after the completed first 512 probes and mines global probe indices 512 through 10,239 from clean `nvarc_training` using four L4 workers. It uses strict batch size 8: an OOM fails the worker instead of retrying smaller batches. Different prompts are bucketed by gold-output token length only to reduce padding; gold length is never used as a generation limit. It mounts the refreshed `yuvraj/arc2026` repository code, verifies exact source hashes before launching workers, excludes ARC-AGI-2 validation anchors, and writes only real valid-grid repair failures. Ordinary solve replay and zero-mask no-op examples remain reconstructible from the immutable source corpus.
+This run mines global probe indices {START_INDEX:,} through {NUM_PROBES - 1:,} from clean `nvarc_training` using four L4 workers. It uses strict batch size 8: an OOM fails the worker instead of retrying smaller batches. Different prompts are bucketed by gold-output token length only to reduce padding; gold length is never used as a generation limit. It mounts the refreshed `yuvraj/arc2026` repository code, verifies exact source hashes before launching workers, excludes ARC-AGI-2 validation anchors, and writes only real valid-grid repair failures. Ordinary solve replay and zero-mask no-op examples remain reconstructible from the immutable source corpus.
 
 This notebook mines training data only. It does not train or evaluate a repair model."""
     ),
     code_cell(
         f"""RUN_EXPERIMENT = True
-NUM_PROBES = 10240
-START_INDEX = 512
+NUM_PROBES = {NUM_PROBES}
+START_INDEX = {START_INDEX}
 NUM_ASSIGNED = NUM_PROBES - START_INDEX
 WORLD_SIZE = 4
 ROLLOUT_BATCH_SIZE = 8
@@ -60,8 +71,8 @@ EXPECTED_SOURCE_HASHES = {SOURCE_HASHES!r}
 
 MODEL_PATH = '/kaggle/input/models/sorokin/qwen3_4b_grids15_sft139/transformers/bfloat16/1'
 VALIDATION_PATH = '/kaggle/input/competitions/arc-prize-2026-arc-agi-2/arc-agi_evaluation_challenges.json'
-OUTPUT_DIR = '/kaggle/working/repair_mining_10240_continuation'
-MANIFEST_PATH = '/kaggle/working/repair_mining_10240_continuation/repair_mining_manifest.json'
+OUTPUT_DIR = '/kaggle/working/{WORK_NAME}'
+MANIFEST_PATH = '/kaggle/working/{WORK_NAME}/repair_mining_manifest.json'
 
 print('global probes =', NUM_PROBES, 'start =', START_INDEX, 'assigned =', NUM_ASSIGNED)
 print('workers =', WORLD_SIZE, 'strict rollout batch =', ROLLOUT_BATCH_SIZE)"""
