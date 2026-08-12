@@ -268,6 +268,7 @@ def main() -> None:
         train_dataset=Dataset.from_list(tokenized),
         max_seq_length=args.max_seq_length,
         args=UnslothTrainingArguments(
+            output_dir=str(args.output_dir / "trainer_output"),
             per_device_train_batch_size=1,
             gradient_accumulation_steps=args.gradient_accumulation_steps,
             num_train_epochs=args.epochs,
@@ -293,6 +294,12 @@ def main() -> None:
     model = trainer.accelerator.unwrap_model(model, keep_fp32_wrapper=False)
     del trainer
 
+    # Persist the trained artifact before optional autoregressive diagnostics.
+    # A diagnostic failure must not discard a completed multi-hour run.
+    adapter_dir = args.output_dir / "adapter"
+    model.save_pretrained(adapter_dir)
+    tokenizer.save_pretrained(adapter_dir)
+
     model = FastLanguageModel.for_inference(model)
     after = evaluate_model(
         model,
@@ -301,9 +308,6 @@ def main() -> None:
         rollout_examples=args.rollout_examples,
     )
 
-    adapter_dir = args.output_dir / "adapter"
-    model.save_pretrained(adapter_dir)
-    tokenizer.save_pretrained(adapter_dir)
     manifest = {
         "config": vars(args) | {
             "train_path": str(args.train_path),
