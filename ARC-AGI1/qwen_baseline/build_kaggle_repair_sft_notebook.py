@@ -11,7 +11,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 OUTPUT_NAME = os.environ.get("ARC_REPAIR_SFT_NOTEBOOK_NAME", "arc26-repair-sft-smoke.ipynb")
 OUTPUT = HERE.parent / OUTPUT_NAME
-DATASET_SLUG = os.environ.get("ARC_REPAIR_SFT_DATASET_SLUG", "arc26-repair-failures-10240")
+DATASET_SLUG = os.environ.get("ARC_REPAIR_SFT_DATASET_SLUG", "arc26-repair-failures-18432")
 MAX_TRAIN_EXAMPLES = os.environ.get("ARC_REPAIR_SFT_MAX_TRAIN_EXAMPLES", "8")
 EPOCHS = os.environ.get("ARC_REPAIR_SFT_EPOCHS", "0.25")
 DIAGNOSTIC_EXAMPLES = int(os.environ.get("ARC_REPAIR_SFT_DIAGNOSTIC_EXAMPLES", "2"))
