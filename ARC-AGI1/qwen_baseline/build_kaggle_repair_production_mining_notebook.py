@@ -198,7 +198,8 @@ print('workers =', WORLD_SIZE, 'strict rollout batch =', ROLLOUT_BATCH_SIZE)"""
         == aggregate['teacher_forced_failures']
     ), aggregate
     assert len(records) == aggregate['usable_repair_failures']
-    assert len(rollout_exact_noops) == aggregate['rollout_exact_noops']
+    # Exact rollout no-ops are counted by workers but intentionally not materialized.
+    assert len(rollout_exact_noops) == 0
     assert len({record['global_index'] for record in raw_records}) == len(raw_records)
     assert len({record['source_relpath'] for record in raw_records}) == len(raw_records)
     assert all(record['record_type'] in {'repair_failure', 'repair_noop'} for record in raw_records)
@@ -280,7 +281,7 @@ print('workers =', WORLD_SIZE, 'strict rollout batch =', ROLLOUT_BATCH_SIZE)"""
         'aggregate_counts': aggregate,
         'records': {
             'combined': len(records),
-            'excluded_rollout_exact_noops': len(rollout_exact_noops),
+            'excluded_rollout_exact_noops': aggregate['rollout_exact_noops'],
             'unique_anchors': len({record['anchor_id'] for record in records}),
             'unique_puzzles': len({record['puzzle_id'] for record in records}),
             'shape_errors': len(shape_errors),
