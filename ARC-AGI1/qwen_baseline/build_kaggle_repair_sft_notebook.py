@@ -118,8 +118,18 @@ print('dataset =', DATASET_SLUG, 'max train =', MAX_TRAIN_EXAMPLES, 'epochs =', 
     ),
     code_cell(
         """if RUN_EXPERIMENT:
+    import os
     import subprocess
     import sys
+
+    os.environ['UNSLOTH_DISABLE_STATISTICS'] = '1'
+    os.environ['HF_HUB_OFFLINE'] = '1'
+    os.environ['TRANSFORMERS_OFFLINE'] = '1'
+    os.environ['HF_HUB_ENABLE_HF_TRANSFER'] = '0'
+    os.environ['TRITON_PTXAS_PATH'] = '/usr/local/cuda/bin/ptxas'
+    os.environ['OMP_NUM_THREADS'] = '12'
+    if not Path(os.environ['TRITON_PTXAS_PATH']).is_file():
+        raise FileNotFoundError(os.environ['TRITON_PTXAS_PATH'])
 
     command = [
         sys.executable,

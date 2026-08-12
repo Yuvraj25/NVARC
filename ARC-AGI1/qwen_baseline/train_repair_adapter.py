@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
+import tempfile
 import time
 from collections import Counter
 from pathlib import Path
@@ -150,6 +152,20 @@ def main() -> None:
         raise FileExistsError(args.output_dir)
     args.output_dir.mkdir(parents=True)
 
+    os.environ.setdefault("UNSLOTH_DISABLE_STATISTICS", "1")
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+    os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")
+    os.environ.setdefault("TRITON_PTXAS_PATH", "/usr/local/cuda/bin/ptxas")
+    os.environ.setdefault("OMP_NUM_THREADS", "12")
+    compile_root = Path(tempfile.gettempdir()) / f"unsloth_repair_sft_pid{os.getpid()}"
+    compile_root.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("UNSLOTH_COMPILE_LOCATION", str(compile_root))
+    ptxas_path = Path(os.environ["TRITON_PTXAS_PATH"])
+    if not ptxas_path.is_file():
+        raise FileNotFoundError(f"Missing Triton ptxas binary: {ptxas_path}")
+
+    import unsloth  # noqa: F401 - must precede transformers/PEFT imports in the pinned stack
     import torch
     from datasets import Dataset
     from unsloth import FastLanguageModel, UnslothTrainer, UnslothTrainingArguments

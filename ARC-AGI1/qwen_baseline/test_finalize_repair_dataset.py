@@ -68,6 +68,8 @@ class FinalizeRepairDatasetTest(unittest.TestCase):
             self.assertEqual(manifest["raw_record_types"], {"repair_failure": 2, "repair_noop": 1})
             self.assertEqual(manifest["records"]["repair_failures"], 2)
             self.assertEqual(manifest["records"]["excluded_rollout_exact_noops"], 1)
+            self.assertEqual(manifest["records"]["summary_only_rollout_exact_noops"], 0)
+            self.assertEqual(manifest["records"]["legacy_materialized_rollout_exact_noops"], 1)
             combined = [
                 json.loads(line)
                 for line in (root / "final" / "repair_failures.all.jsonl").read_text().splitlines()

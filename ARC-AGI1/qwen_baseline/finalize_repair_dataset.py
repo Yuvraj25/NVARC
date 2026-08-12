@@ -155,7 +155,14 @@ def finalize(
         "raw_record_types": dict(sorted(type_counts.items())),
         "records": {
             "repair_failures": len(records),
-            "excluded_rollout_exact_noops": type_counts["repair_noop"],
+            # Current miners count exact autoregressive rollouts in their worker
+            # summaries without materializing them.  The earliest shard format
+            # materialized those rows as repair_noop records instead.
+            "excluded_rollout_exact_noops": (
+                aggregate.get("rollout_exact_noops", 0) + type_counts["repair_noop"]
+            ),
+            "summary_only_rollout_exact_noops": aggregate.get("rollout_exact_noops", 0),
+            "legacy_materialized_rollout_exact_noops": type_counts["repair_noop"],
             "unique_anchors": len({record["anchor_id"] for record in records}),
             "unique_puzzles": len({record["puzzle_id"] for record in records}),
             "shape_errors": sum(not record["shape_equal"] for record in records),
