@@ -76,7 +76,18 @@ print('dataset =', DATASET_SLUG, 'max train =', MAX_TRAIN_EXAMPLES, 'epochs =', 
     code_cell(
         """if RUN_EXPERIMENT:
     import hashlib
+    import subprocess
     from pathlib import Path
+
+    gpu_names = subprocess.check_output(
+        ['nvidia-smi', '--query-gpu=name', '--format=csv,noheader'],
+        text=True,
+    ).strip().splitlines()
+    if len(gpu_names) != 4 or any('L4' not in name for name in gpu_names):
+        raise RuntimeError(
+            f'Repair SFT requires the pinned 4xL4 environment; observed GPUs={gpu_names}'
+        )
+    print('verified GPUs =', gpu_names)
 
     code_candidates = [
         Path('/kaggle/input/datasets/yuvraj/arc2026/ARC-AGI1/qwen_baseline'),
