@@ -118,8 +118,6 @@ def _make_unsloth_fixed_trainer_class(UnslothTrainer):
                 loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
             if hasattr(loss, "clone"):
                 loss = loss.clone()
-            if self.accelerator.num_processes > 1:
-                loss = loss * self.accelerator.num_processes
             return (loss, outputs) if return_outputs else loss
 
     return UnslothFixedTrainer
