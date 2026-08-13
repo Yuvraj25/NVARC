@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
 import json
 import os
 import random
@@ -259,7 +260,6 @@ def main() -> None:
     if not ptxas_path.is_file():
         raise FileNotFoundError(f"Missing Triton ptxas binary: {ptxas_path}")
 
-    import torch
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
@@ -267,12 +267,25 @@ def main() -> None:
         raise RuntimeError(
             f"Expected world_size={args.expected_world_size}, observed {world_size}"
         )
+
+    # Modern Unsloth must patch Transformers before Torch/Transformers/PEFT are
+    # imported by this process. torchrun has already populated the rank env vars,
+    # which the modern loader uses for distributed device placement.
+    import unsloth  # noqa: F401
+    import torch
+
+    unsloth_version = importlib.metadata.version("unsloth")
+    unsloth_zoo_version = importlib.metadata.version("unsloth_zoo")
+    if unsloth_version != "2026.7.5" or unsloth_zoo_version != "2026.7.6":
+        raise RuntimeError(
+            "Repair DDP requires the pinned modern utility layer: "
+            f"unsloth={unsloth_version} unsloth_zoo={unsloth_zoo_version}"
+        )
     if world_size > 1:
         torch.cuda.set_device(local_rank)
         if not torch.distributed.is_initialized():
             torch.distributed.init_process_group(backend="nccl")
 
-    import unsloth  # noqa: F401 - must precede transformers/PEFT imports in the pinned stack
     from datasets import Dataset
     from unsloth import FastLanguageModel, UnslothTrainer, UnslothTrainingArguments
 
@@ -336,6 +349,7 @@ def main() -> None:
     load_started = time.perf_counter()
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=args.model_path,
+        device_map={"": f"cuda:{local_rank}"},
         full_finetuning=False,
         load_in_4bit=False,
         local_files_only=True,
@@ -508,6 +522,11 @@ def main() -> None:
         "overlong": dict(sorted(overlong.items())),
         "tokenized_examples": len(tokenized),
         "distributed": distributed,
+        "environment": {
+            "unsloth": unsloth_version,
+            "unsloth_zoo": unsloth_zoo_version,
+            "torch": torch.__version__,
+        },
         "adapter_update": {"before": adapter_before, "after": adapter_after},
         "diagnostics": {"before": before, "after": after},
         "timings": {
