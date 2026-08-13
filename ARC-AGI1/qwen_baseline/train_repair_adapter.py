@@ -348,6 +348,7 @@ def main() -> None:
     from unsloth import FastLanguageModel, UnslothTrainer, UnslothTrainingArguments
 
     from arc_solver import _make_unsloth_fixed_trainer_class
+    from repair_mining import model_execution_device
     from repair_sft import (
         REPAIR_TOKEN,
         add_and_initialize_repair_token,
@@ -470,6 +471,17 @@ def main() -> None:
         # get_peft_model may replace ``model`` with a PEFT wrapper, so restore
         # the exact base config object that prepare_unsloth_offload modified.
         original_model_config._name_or_path = original_model_name
+    execution_device = model_execution_device(model)
+    if execution_device.type != "cuda" or execution_device.index != local_rank:
+        raise RuntimeError(
+            f"Rank {rank} PEFT execution device is {execution_device}, "
+            f"expected cuda:{local_rank}"
+        )
+    print(
+        f"[rank {rank}] first_parameter_device={next(model.parameters()).device} "
+        f"execution_device={execution_device}",
+        flush=True,
+    )
     for _name, parameter in model.named_parameters():
         if parameter.dtype == torch.float32:
             parameter.data = parameter.data.to(torch.bfloat16)

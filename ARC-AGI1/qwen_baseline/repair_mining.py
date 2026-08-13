@@ -416,6 +416,29 @@ def stabilize_inference_state(model: Any) -> None:
             module.gradient_checkpointing = False
 
 
+def model_execution_device(model: Any):
+    """Return the CUDA device that executes this single-rank model.
+
+    Unsloth's offloaded checkpointing intentionally leaves frozen embedding
+    parameters on CPU.  Consequently, ``next(model.parameters()).device`` is
+    not the execution device after PEFT construction.  Each repair DDP rank
+    owns exactly one CUDA device, so prefer that device and reject ambiguous
+    multi-device placement rather than silently creating inputs on CPU.
+    """
+    cuda_devices = {
+        parameter.device
+        for parameter in model.parameters()
+        if parameter.device.type == "cuda"
+    }
+    if len(cuda_devices) == 1:
+        return next(iter(cuda_devices))
+    if len(cuda_devices) > 1:
+        raise RuntimeError(
+            f"Expected one CUDA execution device, observed {sorted(map(str, cuda_devices))}"
+        )
+    return next(model.parameters()).device
+
+
 def teacher_forced_metrics_batch(
     model: Any,
     tokenizer: Any,
@@ -434,7 +457,7 @@ def teacher_forced_metrics_batch(
 
     sequences = [prompt_ids + gold_ids for prompt_ids, gold_ids in zip(prompt_token_ids, gold_token_ids)]
     maximum_length = max(map(len, sequences))
-    device = next(model.parameters()).device
+    device = model_execution_device(model)
     input_ids = torch.full(
         (len(sequences), maximum_length),
         PAD_ID,
@@ -510,7 +533,7 @@ def restricted_greedy_rollout_batch(
     if any(not ids for ids in prompt_token_ids):
         raise ValueError("Prompts must tokenize to non-empty sequences")
     maximum_prompt_length = max(map(len, prompt_token_ids))
-    device = next(model.parameters()).device
+    device = model_execution_device(model)
     input_ids = torch.full(
         (len(prompts), maximum_prompt_length),
         PAD_ID,

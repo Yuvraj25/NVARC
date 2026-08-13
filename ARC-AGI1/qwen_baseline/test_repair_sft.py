@@ -4,7 +4,7 @@ from tempfile import TemporaryDirectory
 
 import torch
 
-from repair_mining import format_reply, grid_to_string
+from repair_mining import format_reply, grid_to_string, model_execution_device
 from repair_sft import (
     build_training_mixture,
     build_zero_mask_noop_example,
@@ -124,6 +124,29 @@ class FakeArcModel(torch.nn.Module):
 
 
 class RepairSftTest(unittest.TestCase):
+    def test_execution_device_ignores_first_offloaded_cpu_parameter(self):
+        class Parameter:
+            def __init__(self, device):
+                self.device = torch.device(device)
+
+        class OffloadedModel:
+            def parameters(self):
+                return iter([Parameter("cpu"), Parameter("cuda:2"), Parameter("cuda:2")])
+
+        self.assertEqual(model_execution_device(OffloadedModel()), torch.device("cuda:2"))
+
+    def test_execution_device_rejects_ambiguous_cuda_placement(self):
+        class Parameter:
+            def __init__(self, device):
+                self.device = torch.device(device)
+
+        class SplitModel:
+            def parameters(self):
+                return iter([Parameter("cuda:0"), Parameter("cuda:1")])
+
+        with self.assertRaises(RuntimeError):
+            model_execution_device(SplitModel())
+
     def test_unsloth_absolute_model_path_cannot_escape_writable_offload(self):
         model = FakeArcModel()
         with TemporaryDirectory() as directory:
