@@ -128,7 +128,14 @@ def add_and_initialize_repair_token(
     old_vocab_size = len(tokenizer)
     if repair_token in tokenizer.get_vocab():
         raise ValueError(f"{repair_token} is already present in the tokenizer")
-    existing_special = list(tokenizer.additional_special_tokens)
+    # Transformers versions differ here: some tokenizer classes expose
+    # ``additional_special_tokens`` as a direct attribute, while newer Qwen2
+    # tokenizers expose the same information only through ``special_tokens_map``.
+    existing_special = getattr(tokenizer, "additional_special_tokens", None)
+    if existing_special is None:
+        special_tokens_map = getattr(tokenizer, "special_tokens_map", {}) or {}
+        existing_special = special_tokens_map.get("additional_special_tokens", [])
+    existing_special = list(existing_special)
     added = tokenizer.add_special_tokens(
         {"additional_special_tokens": existing_special + [repair_token]}
     )

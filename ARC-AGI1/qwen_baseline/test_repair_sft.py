@@ -73,6 +73,27 @@ class FakeArcTokenizer:
         return [self.vocab[token] for token in tokens]
 
 
+class FakeMappedSpecialArcTokenizer(FakeArcTokenizer):
+    """Match newer tokenizers that only expose special_tokens_map."""
+
+    def __init__(self):
+        super().__init__()
+        self.special_tokens_map = {
+            "additional_special_tokens": self.additional_special_tokens
+        }
+        del self.additional_special_tokens
+
+    def add_special_tokens(self, mapping):
+        added = 0
+        tokens = list(mapping["additional_special_tokens"])
+        self.special_tokens_map["additional_special_tokens"] = tokens
+        for token in tokens:
+            if token not in self.vocab:
+                self.vocab[token] = len(self.vocab)
+                added += 1
+        return added
+
+
 class FakeArcModel(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -151,6 +172,16 @@ class RepairSftTest(unittest.TestCase):
         self.assertEqual(len(tokenizer), 17)
         torch.testing.assert_close(model.input.weight[token_id], expected_input)
         torch.testing.assert_close(model.output.weight[token_id], expected_output)
+
+    def test_repair_token_supports_special_tokens_map_only(self):
+        tokenizer = FakeMappedSpecialArcTokenizer()
+        model = FakeArcModel()
+        token_id = add_and_initialize_repair_token(model, tokenizer)
+        self.assertEqual(token_id, 16)
+        self.assertEqual(
+            tokenizer.special_tokens_map["additional_special_tokens"],
+            ["<|im_start|>", "<|im_end|>", "<REPAIR>"],
+        )
 
     def test_recovers_ordinary_prompt_without_wrong_candidate(self):
         record = repair_record()
