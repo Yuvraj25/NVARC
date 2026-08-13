@@ -449,9 +449,12 @@ def main() -> None:
                 "gate_proj",
                 "up_proj",
                 "down_proj",
-                "embed_tokens",
-                "lm_head",
             ],
+            # The tokenizer was resized for <REPAIR>.  Train and persist the
+            # actual embedding/head matrices rather than wrapping lm_head in
+            # LoRA: Unsloth's optimized loss path bypasses lm_head LoRA A/B,
+            # leaving those parameters unused under DDP.
+            modules_to_save=["embed_tokens", "lm_head"],
             lora_alpha=32,
             lora_dropout=0.0,
             bias="none",
@@ -482,6 +485,35 @@ def main() -> None:
         f"execution_device={execution_device}",
         flush=True,
     )
+    peft_config = model.peft_config["default"]
+    configured_targets = set(peft_config.target_modules or [])
+    configured_saved = set(peft_config.modules_to_save or [])
+    expected_targets = {
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+    }
+    if configured_targets != expected_targets or configured_saved != {
+        "embed_tokens",
+        "lm_head",
+    }:
+        raise RuntimeError(
+            "Unexpected repair PEFT layout: "
+            f"targets={sorted(configured_targets)} saved={sorted(configured_saved)}"
+        )
+    invalid_head_lora = [
+        name
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+        and "lm_head" in name
+        and ("lora_A" in name or "lora_B" in name)
+    ]
+    if invalid_head_lora:
+        raise RuntimeError(f"lm_head must not use LoRA: {invalid_head_lora}")
     for _name, parameter in model.named_parameters():
         if parameter.dtype == torch.float32:
             parameter.data = parameter.data.to(torch.bfloat16)
