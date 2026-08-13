@@ -385,7 +385,10 @@ def main() -> None:
         lora_alpha=32,
         lora_dropout=0.0,
         bias="none",
-        use_gradient_checkpointing=False,
+        # Repair prompts can approach the 8k context limit.  Rank-256 LoRA plus
+        # uncheckpointed activations exceeded a 22 GiB L4 on the first forward
+        # pass, so use Unsloth's offloaded checkpointing implementation.
+        use_gradient_checkpointing="unsloth",
         random_state=args.seed,
         use_rslora=True,
         loftq_config=None,
@@ -433,6 +436,8 @@ def main() -> None:
     )
 
     model = FastLanguageModel.for_training(model)
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats(device=f"cuda:{local_rank}")
     FixedTrainer = _make_unsloth_fixed_trainer_class(UnslothTrainer)
     trainer = FixedTrainer(
         model=model,
@@ -460,7 +465,8 @@ def main() -> None:
             logging_steps=10,
             fp16=False,
             bf16=True,
-            gradient_checkpointing=False,
+            gradient_checkpointing=True,
+            gradient_checkpointing_kwargs={"use_reentrant": False},
             ddp_find_unused_parameters=False,
         ),
     )
@@ -474,9 +480,17 @@ def main() -> None:
         f"num_processes={trainer.accelerator.num_processes}",
         flush=True,
     )
+    print(
+        f"[rank {rank}] pre_train_cuda_gib "
+        f"allocated={torch.cuda.memory_allocated(local_rank) / 2**30:.3f} "
+        f"reserved={torch.cuda.memory_reserved(local_rank) / 2**30:.3f}",
+        flush=True,
+    )
     training_started = time.perf_counter()
     stats = trainer.train()
     training_seconds = time.perf_counter() - training_started
+    peak_cuda_gib = torch.cuda.max_memory_allocated(local_rank) / 2**30
+    print(f"[rank {rank}] peak_train_cuda_gib={peak_cuda_gib:.3f}", flush=True)
     model = trainer.accelerator.unwrap_model(model, keep_fp32_wrapper=False)
     del trainer
     adapter_after = summarize_lora_b(model)
