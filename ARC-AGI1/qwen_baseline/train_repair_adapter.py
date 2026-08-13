@@ -22,8 +22,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-seq-length", type=int, default=8192)
     parser.add_argument("--epochs", type=float, default=1.0)
     parser.add_argument("--learning-rate", type=float, default=5e-5)
-    parser.add_argument("--lora-rank", type=int, default=64)
-    parser.add_argument("--gradient-accumulation-steps", type=int, default=4)
+    parser.add_argument("--lora-rank", type=int, default=256)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
+    parser.add_argument("--expected-world-size", type=int, default=1)
     parser.add_argument("--solve-replay-fraction", type=float, default=0.15)
     parser.add_argument("--noop-fraction", type=float, default=0.01)
     parser.add_argument("--seed", type=int, default=20260812)
@@ -89,6 +90,22 @@ def summarize_lora_b(model: Any) -> dict[str, float | int]:
             "max_abs": max(float(tensor.float().abs().max().item()) for tensor in tensors),
             "l2": float(sum(tensor.float().square().sum().item() for tensor in tensors) ** 0.5),
         }
+
+
+def distributed_metadata(
+    *, world_size: int, rank: int, local_rank: int, per_device_batch: int,
+    gradient_accumulation_steps: int,
+) -> dict[str, int]:
+    return {
+        "world_size": world_size,
+        "rank": rank,
+        "local_rank": local_rank,
+        "per_device_train_batch_size": per_device_batch,
+        "gradient_accumulation_steps": gradient_accumulation_steps,
+        "effective_global_batch_size": (
+            world_size * per_device_batch * gradient_accumulation_steps
+        ),
+    }
 
 
 def evaluate_model(
@@ -167,11 +184,67 @@ def evaluate_model(
     return result
 
 
+def merge_evaluation_results(parts: list[dict[str, Any]]) -> dict[str, Any]:
+    """Combine disjoint per-rank diagnostics into one weighted result."""
+    merged: dict[str, Any] = {}
+    for task_name in parts[0]:
+        task_parts = [part[task_name] for part in parts]
+        examples = sum(part["examples"] for part in task_parts)
+        if examples <= 0:
+            raise RuntimeError(f"No distributed diagnostics for {task_name}")
+        merged[task_name] = {
+            "examples": examples,
+            "teacher_forced_restricted_exact": sum(
+                part["teacher_forced_restricted_exact"] for part in task_parts
+            ),
+            "mean_gold_nll": sum(
+                part["mean_gold_nll"] * part["examples"] for part in task_parts
+            ) / examples,
+            "mean_gold_token_nll": sum(
+                part["mean_gold_token_nll"] * part["examples"] for part in task_parts
+            ) / examples,
+            "rollout_examples": sum(part["rollout_examples"] for part in task_parts),
+            "rollout_valid": sum(part["rollout_valid"] for part in task_parts),
+            "rollout_exact": sum(part["rollout_exact"] for part in task_parts),
+        }
+    return merged
+
+
+def evaluate_distributed(
+    model: Any,
+    tokenizer: Any,
+    repair_records: list[dict[str, Any]],
+    *,
+    rollout_examples: int,
+    rank: int,
+    world_size: int,
+) -> dict[str, Any] | None:
+    import torch
+
+    indices = list(range(rank, len(repair_records), world_size))
+    local_records = [repair_records[index] for index in indices]
+    local_rollouts = sum(index < rollout_examples for index in indices)
+    local_result = evaluate_model(
+        model,
+        tokenizer,
+        local_records,
+        rollout_examples=local_rollouts,
+    )
+    if world_size == 1:
+        return local_result
+    gathered: list[dict[str, Any] | None] | None = (
+        [None] * world_size if rank == 0 else None
+    )
+    torch.distributed.gather_object(local_result, gathered, dst=0)
+    if rank != 0:
+        return None
+    if gathered is None or any(part is None for part in gathered):
+        raise RuntimeError("Distributed diagnostics were not gathered from every rank")
+    return merge_evaluation_results(gathered)  # type: ignore[arg-type]
+
+
 def main() -> None:
     args = parse_args()
-    if args.output_dir.exists():
-        raise FileExistsError(args.output_dir)
-    args.output_dir.mkdir(parents=True)
 
     os.environ.setdefault("UNSLOTH_DISABLE_STATISTICS", "1")
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
@@ -186,8 +259,20 @@ def main() -> None:
     if not ptxas_path.is_file():
         raise FileNotFoundError(f"Missing Triton ptxas binary: {ptxas_path}")
 
-    import unsloth  # noqa: F401 - must precede transformers/PEFT imports in the pinned stack
     import torch
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if world_size != args.expected_world_size:
+        raise RuntimeError(
+            f"Expected world_size={args.expected_world_size}, observed {world_size}"
+        )
+    if world_size > 1:
+        torch.cuda.set_device(local_rank)
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(backend="nccl")
+
+    import unsloth  # noqa: F401 - must precede transformers/PEFT imports in the pinned stack
     from datasets import Dataset
     from unsloth import FastLanguageModel, UnslothTrainer, UnslothTrainingArguments
 
@@ -197,6 +282,35 @@ def main() -> None:
         add_and_initialize_repair_token,
         build_training_mixture,
         tokenize_completion_only,
+    )
+
+    is_main = rank == 0
+    output_exists = torch.tensor(
+        [int(args.output_dir.exists())], device=f"cuda:{local_rank}", dtype=torch.int32
+    )
+    if world_size > 1:
+        torch.distributed.broadcast(output_exists, src=0)
+    if output_exists.item():
+        raise FileExistsError(args.output_dir)
+    if is_main:
+        args.output_dir.mkdir(parents=True)
+    if world_size > 1:
+        torch.distributed.barrier()
+
+    distributed = distributed_metadata(
+        world_size=world_size,
+        rank=rank,
+        local_rank=local_rank,
+        per_device_batch=1,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+    )
+    if args.expected_world_size == 4 and distributed["effective_global_batch_size"] != 4:
+        raise RuntimeError(f"Expected effective global batch 4, observed {distributed}")
+    print(
+        f"[rank {rank}] local_rank={local_rank} world_size={world_size} "
+        f"device={torch.cuda.get_device_name(local_rank)} global_batch="
+        f"{distributed['effective_global_batch_size']}",
+        flush=True,
     )
 
     train_records = load_jsonl(args.train_path)
@@ -209,6 +323,15 @@ def main() -> None:
         noop_fraction=args.noop_fraction,
         seed=args.seed,
     )
+    expected_fractions = {
+        "repair_failure": 0.84,
+        "solve_replay": 0.15,
+        "repair_noop": 0.01,
+    }
+    if mixture_manifest["requested_fractions"] != expected_fractions:
+        raise RuntimeError(
+            f"Repair training mixture changed unexpectedly: {mixture_manifest}"
+        )
 
     load_started = time.perf_counter()
     model, tokenizer = FastLanguageModel.from_pretrained(
@@ -219,6 +342,11 @@ def main() -> None:
         use_gradient_checkpointing=False,
         max_seq_length=args.max_seq_length,
     )
+    model_device = next(model.parameters()).device
+    if model_device.type != "cuda" or model_device.index != local_rank:
+        raise RuntimeError(
+            f"Rank {rank} loaded model on {model_device}, expected cuda:{local_rank}"
+        )
     old_vocab_size = len(tokenizer)
     repair_token_id = add_and_initialize_repair_token(model, tokenizer)
     if repair_token_id != old_vocab_size or len(tokenizer) != old_vocab_size + 1:
@@ -271,14 +399,23 @@ def main() -> None:
             overlong[example["record_type"]] += 1
     if not tokenized:
         raise RuntimeError("Every training example exceeded the context limit")
+    distributed["tokenized_dataset_examples"] = len(tokenized)
+    distributed["sampler_padding_examples_per_epoch"] = (-len(tokenized)) % world_size
 
     diagnostics = select_diagnostics(dev_records, args.diagnostic_examples, args.seed)
+    if len(diagnostics) < world_size:
+        raise RuntimeError(
+            f"Need at least one diagnostic per rank: diagnostics={len(diagnostics)} "
+            f"world_size={world_size}"
+        )
     model = FastLanguageModel.for_inference(model)
-    before = evaluate_model(
+    before = evaluate_distributed(
         model,
         tokenizer,
         diagnostics,
         rollout_examples=args.rollout_examples,
+        rank=rank,
+        world_size=world_size,
     )
 
     model = FastLanguageModel.for_training(model)
@@ -310,7 +447,18 @@ def main() -> None:
             fp16=False,
             bf16=True,
             gradient_checkpointing=False,
+            ddp_find_unused_parameters=False,
         ),
+    )
+    if trainer.accelerator.num_processes != world_size:
+        raise RuntimeError(
+            "Trainer did not enter the requested distributed world: "
+            f"accelerator={trainer.accelerator.num_processes} expected={world_size}"
+        )
+    print(
+        f"[rank {rank}] accelerator_process_index={trainer.accelerator.process_index} "
+        f"num_processes={trainer.accelerator.num_processes}",
+        flush=True,
     )
     training_started = time.perf_counter()
     stats = trainer.train()
@@ -327,15 +475,20 @@ def main() -> None:
     # Persist the trained artifact before optional autoregressive diagnostics.
     # A diagnostic failure must not discard a completed multi-hour run.
     adapter_dir = args.output_dir / "adapter"
-    model.save_pretrained(adapter_dir)
-    tokenizer.save_pretrained(adapter_dir)
+    if is_main:
+        model.save_pretrained(adapter_dir)
+        tokenizer.save_pretrained(adapter_dir)
+    if world_size > 1:
+        torch.distributed.barrier()
 
     model = FastLanguageModel.for_inference(model)
-    after = evaluate_model(
+    after = evaluate_distributed(
         model,
         tokenizer,
         diagnostics,
         rollout_examples=args.rollout_examples,
+        rank=rank,
+        world_size=world_size,
     )
 
     manifest = {
@@ -354,6 +507,7 @@ def main() -> None:
         "mixture": mixture_manifest,
         "overlong": dict(sorted(overlong.items())),
         "tokenized_examples": len(tokenized),
+        "distributed": distributed,
         "adapter_update": {"before": adapter_before, "after": adapter_after},
         "diagnostics": {"before": before, "after": after},
         "timings": {
@@ -362,10 +516,14 @@ def main() -> None:
         },
         "train_metrics": dict(stats.metrics),
     }
-    (args.output_dir / "repair_sft_manifest.json").write_text(
-        json.dumps(manifest, indent=2, sort_keys=True, default=str)
-    )
-    print(json.dumps(manifest, indent=2, sort_keys=True, default=str), flush=True)
+    if is_main:
+        (args.output_dir / "repair_sft_manifest.json").write_text(
+            json.dumps(manifest, indent=2, sort_keys=True, default=str)
+        )
+        print(json.dumps(manifest, indent=2, sort_keys=True, default=str), flush=True)
+    if world_size > 1:
+        torch.distributed.barrier()
+        torch.distributed.destroy_process_group()
 
 
 if __name__ == "__main__":

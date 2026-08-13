@@ -14,8 +14,8 @@ OUTPUT = HERE.parent / OUTPUT_NAME
 DATASET_SLUG = os.environ.get("ARC_REPAIR_SFT_DATASET_SLUG", "arc26-repair-failures-18432")
 MAX_TRAIN_EXAMPLES = os.environ.get("ARC_REPAIR_SFT_MAX_TRAIN_EXAMPLES", "32")
 EPOCHS = os.environ.get("ARC_REPAIR_SFT_EPOCHS", "0.5")
-DIAGNOSTIC_EXAMPLES = int(os.environ.get("ARC_REPAIR_SFT_DIAGNOSTIC_EXAMPLES", "2"))
-ROLLOUT_EXAMPLES = int(os.environ.get("ARC_REPAIR_SFT_ROLLOUT_EXAMPLES", "1"))
+DIAGNOSTIC_EXAMPLES = int(os.environ.get("ARC_REPAIR_SFT_DIAGNOSTIC_EXAMPLES", "8"))
+ROLLOUT_EXAMPLES = int(os.environ.get("ARC_REPAIR_SFT_ROLLOUT_EXAMPLES", "4"))
 OUTPUT_DIR_NAME = os.environ.get("ARC_REPAIR_SFT_OUTPUT_DIR", "repair_sft_smoke")
 SOURCE_FILES = (
     "repair_mining.py",
@@ -127,18 +127,24 @@ print('dataset =', DATASET_SLUG, 'max train =', MAX_TRAIN_EXAMPLES, 'epochs =', 
     os.environ['TRANSFORMERS_OFFLINE'] = '1'
     os.environ['HF_HUB_ENABLE_HF_TRANSFER'] = '0'
     os.environ['TRITON_PTXAS_PATH'] = '/usr/local/cuda/bin/ptxas'
-    os.environ['OMP_NUM_THREADS'] = '12'
+    os.environ['OMP_NUM_THREADS'] = '3'
     if not Path(os.environ['TRITON_PTXAS_PATH']).is_file():
         raise FileNotFoundError(os.environ['TRITON_PTXAS_PATH'])
 
     command = [
         sys.executable,
+        '-m', 'torch.distributed.run',
+        '--standalone',
+        '--nproc_per_node', '4',
         str(CODE_DIR / 'train_repair_adapter.py'),
         '--model-path', MODEL_PATH,
         '--train-path', str(DATA_DIR / 'repair_failures.train.jsonl'),
         '--dev-path', str(DATA_DIR / 'repair_failures.dev.jsonl'),
         '--output-dir', OUTPUT_DIR,
         '--epochs', str(EPOCHS),
+        '--lora-rank', '256',
+        '--gradient-accumulation-steps', '1',
+        '--expected-world-size', '4',
         '--solve-replay-fraction', '0.15',
         '--noop-fraction', '0.01',
         '--diagnostic-examples', str(DIAGNOSTIC_EXAMPLES),
@@ -159,6 +165,9 @@ print('dataset =', DATASET_SLUG, 'max train =', MAX_TRAIN_EXAMPLES, 'epochs =', 
     assert manifest['tokenizer']['old_vocab_size'] == 16
     assert manifest['tokenizer']['new_vocab_size'] == 17
     assert manifest['tokenizer']['repair_token_id'] == 16
+    assert manifest['config']['lora_rank'] == 256
+    assert manifest['distributed']['world_size'] == 4
+    assert manifest['distributed']['effective_global_batch_size'] == 4
     assert manifest['mixture']['requested_fractions'] == {
         'repair_failure': 0.84,
         'solve_replay': 0.15,

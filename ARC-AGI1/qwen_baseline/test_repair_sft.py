@@ -10,7 +10,11 @@ from repair_sft import (
     ordinary_solve_prompt,
     tokenize_completion_only,
 )
-from train_repair_adapter import summarize_lora_b
+from train_repair_adapter import (
+    distributed_metadata,
+    merge_evaluation_results,
+    summarize_lora_b,
+)
 
 
 def repair_record(index=0):
@@ -95,6 +99,36 @@ class FakeArcModel(torch.nn.Module):
 
 
 class RepairSftTest(unittest.TestCase):
+    def test_distributed_diagnostics_use_weighted_means(self):
+        def task(examples, mean_nll, exact):
+            return {
+                "examples": examples,
+                "teacher_forced_restricted_exact": exact,
+                "mean_gold_nll": mean_nll,
+                "mean_gold_token_nll": mean_nll / 10,
+                "rollout_examples": examples,
+                "rollout_valid": examples - 1,
+                "rollout_exact": 1,
+            }
+
+        merged = merge_evaluation_results([
+            {"repair": task(1, 10.0, 0), "ordinary_solve": task(1, 20.0, 1)},
+            {"repair": task(3, 30.0, 2), "ordinary_solve": task(3, 40.0, 2)},
+        ])
+        self.assertEqual(merged["repair"]["examples"], 4)
+        self.assertEqual(merged["repair"]["mean_gold_nll"], 25.0)
+        self.assertEqual(merged["repair"]["teacher_forced_restricted_exact"], 2)
+
+    def test_four_gpu_ddp_preserves_global_batch_four(self):
+        metadata = distributed_metadata(
+            world_size=4,
+            rank=2,
+            local_rank=2,
+            per_device_batch=1,
+            gradient_accumulation_steps=1,
+        )
+        self.assertEqual(metadata["effective_global_batch_size"], 4)
+
     def test_lora_update_summary_detects_nonzero_b_weights(self):
         model = torch.nn.Module()
         model.lora_B = torch.nn.Linear(2, 3, bias=False)
