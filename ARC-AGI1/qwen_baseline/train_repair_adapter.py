@@ -263,6 +263,12 @@ def main() -> None:
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    offload_root = (
+        Path("/kaggle/working")
+        / "unsloth_repair_offload"
+        / f"rank{local_rank}_pid{os.getpid()}"
+    )
+    offload_root.mkdir(parents=True, exist_ok=True)
     if world_size != args.expected_world_size:
         raise RuntimeError(
             f"Expected world_size={args.expected_world_size}, observed {world_size}"
@@ -392,6 +398,10 @@ def main() -> None:
         random_state=args.seed,
         use_rslora=True,
         loftq_config=None,
+        # "unsloth" checkpointing offloads embedding buffers to disk.  The
+        # training script itself lives in a read-only Kaggle input mount, so
+        # each DDP rank needs an explicit writable and collision-free target.
+        temporary_location=str(offload_root),
     )
     for _name, parameter in model.named_parameters():
         if parameter.dtype == torch.float32:
