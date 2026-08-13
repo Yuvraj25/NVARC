@@ -7,6 +7,7 @@ import importlib.metadata
 import json
 import os
 import random
+import shutil
 import tempfile
 import time
 from collections import Counter
@@ -107,6 +108,48 @@ def distributed_metadata(
             world_size * per_device_batch * gradient_accumulation_steps
         ),
     }
+
+
+def prepare_unsloth_offload(
+    model: Any,
+    temporary_location: Path,
+    *,
+    writable_root: Path = Path("/kaggle/working"),
+) -> tuple[str, Path]:
+    """Make Unsloth's embedding offload remain inside a writable directory.
+
+    Unsloth 2026.7.5 constructs its destination with
+    ``os.path.join(temporary_location, model.config._name_or_path)``.  Kaggle
+    models have an absolute ``_name_or_path`` under ``/kaggle/input``; Python
+    therefore discards ``temporary_location`` and Unsloth writes to the
+    read-only input mount.  Temporarily replacing the config value with a safe
+    relative component preserves Unsloth's implementation while keeping the
+    actual files under ``/kaggle/working``.
+    """
+    root = writable_root.resolve()
+    temporary_location = temporary_location.resolve()
+    try:
+        temporary_location.relative_to(root)
+    except ValueError as error:
+        raise RuntimeError(
+            f"Unsloth offload directory must be under {root}: {temporary_location}"
+        ) from error
+
+    original_name_or_path = str(model.config._name_or_path)
+    safe_component = "base_model"
+    resolved_destination = (temporary_location / safe_component).resolve()
+    try:
+        resolved_destination.relative_to(root)
+    except ValueError as error:
+        raise RuntimeError(
+            f"Resolved Unsloth offload escaped {root}: {resolved_destination}"
+        ) from error
+    resolved_destination.mkdir(parents=True, exist_ok=True)
+    write_probe = resolved_destination / ".write_probe"
+    write_probe.write_bytes(b"")
+    write_probe.unlink()
+    model.config._name_or_path = safe_component
+    return original_name_or_path, resolved_destination
 
 
 def evaluate_model(
@@ -269,6 +312,15 @@ def main() -> None:
         / f"rank{local_rank}_pid{os.getpid()}"
     )
     offload_root.mkdir(parents=True, exist_ok=True)
+    working_root = Path("/kaggle/working").resolve()
+    resolved_output_dir = args.output_dir.resolve()
+    try:
+        resolved_output_dir.relative_to(working_root)
+    except ValueError as error:
+        raise RuntimeError(
+            f"Repair output directory must be under {working_root}: "
+            f"{resolved_output_dir}"
+        ) from error
     if world_size != args.expected_world_size:
         raise RuntimeError(
             f"Expected world_size={args.expected_world_size}, observed {world_size}"
@@ -374,35 +426,50 @@ def main() -> None:
             f"Unexpected repair token ID: id={repair_token_id}, old_vocab={old_vocab_size}"
         )
 
-    model = FastLanguageModel.get_peft_model(
-        model,
-        r=args.lora_rank,
-        target_modules=[
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "o_proj",
-            "gate_proj",
-            "up_proj",
-            "down_proj",
-            "embed_tokens",
-            "lm_head",
-        ],
-        lora_alpha=32,
-        lora_dropout=0.0,
-        bias="none",
-        # Repair prompts can approach the 8k context limit.  Rank-256 LoRA plus
-        # uncheckpointed activations exceeded a 22 GiB L4 on the first forward
-        # pass, so use Unsloth's offloaded checkpointing implementation.
-        use_gradient_checkpointing="unsloth",
-        random_state=args.seed,
-        use_rslora=True,
-        loftq_config=None,
-        # "unsloth" checkpointing offloads embedding buffers to disk.  The
-        # training script itself lives in a read-only Kaggle input mount, so
-        # each DDP rank needs an explicit writable and collision-free target.
-        temporary_location=str(offload_root),
+    original_model_config = model.config
+    original_model_name, resolved_offload_dir = prepare_unsloth_offload(
+        model, offload_root
     )
+    free_working_gib = shutil.disk_usage("/kaggle/working").free / 2**30
+    print(
+        f"[rank {rank}] unsloth_offload_dir={resolved_offload_dir} "
+        f"working_free_gib={free_working_gib:.3f}",
+        flush=True,
+    )
+    try:
+        model = FastLanguageModel.get_peft_model(
+            model,
+            r=args.lora_rank,
+            target_modules=[
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "gate_proj",
+                "up_proj",
+                "down_proj",
+                "embed_tokens",
+                "lm_head",
+            ],
+            lora_alpha=32,
+            lora_dropout=0.0,
+            bias="none",
+            # Repair prompts can approach the 8k context limit.  Rank-256 LoRA plus
+            # uncheckpointed activations exceeded a 22 GiB L4 on the first forward
+            # pass, so use Unsloth's offloaded checkpointing implementation.
+            use_gradient_checkpointing="unsloth",
+            random_state=args.seed,
+            use_rslora=True,
+            loftq_config=None,
+            # Each DDP rank gets a writable and collision-free target.  The
+            # model config is temporarily made relative above because Unsloth
+            # 2026.7.5 otherwise discards this prefix for absolute model paths.
+            temporary_location=str(offload_root),
+        )
+    finally:
+        # get_peft_model may replace ``model`` with a PEFT wrapper, so restore
+        # the exact base config object that prepare_unsloth_offload modified.
+        original_model_config._name_or_path = original_model_name
     for _name, parameter in model.named_parameters():
         if parameter.dtype == torch.float32:
             parameter.data = parameter.data.to(torch.bfloat16)
@@ -470,7 +537,10 @@ def main() -> None:
             report_to="none",
             save_strategy="steps",
             save_steps=100,
-            save_total_limit=2,
+            # Keep one resumable checkpoint.  Four rank-local embedding
+            # offloads, optimizer state, checkpoints, and the final adapter all
+            # share Kaggle's 20 GiB writable volume.
+            save_total_limit=1,
             eval_strategy="no",
             logging_steps=10,
             fp16=False,
@@ -564,6 +634,18 @@ def main() -> None:
             json.dumps(manifest, indent=2, sort_keys=True, default=str)
         )
         print(json.dumps(manifest, indent=2, sort_keys=True, default=str), flush=True)
+    if world_size > 1:
+        torch.distributed.barrier()
+    # These are runtime-only buffers. Remove their directory entries after all
+    # diagnostics so Kaggle persists the trained artifact rather than several
+    # GiB of duplicate embedding offloads.
+    shutil.rmtree(offload_root, ignore_errors=True)
+    if world_size > 1:
+        torch.distributed.barrier()
+    if is_main:
+        # Retain one checkpoint during training for recovery, then remove it
+        # once the final adapter and manifest have been safely written.
+        shutil.rmtree(args.output_dir / "trainer_output", ignore_errors=True)
     if world_size > 1:
         torch.distributed.barrier()
         torch.distributed.destroy_process_group()

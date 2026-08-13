@@ -1,4 +1,6 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import torch
 
@@ -13,6 +15,7 @@ from repair_sft import (
 from train_repair_adapter import (
     distributed_metadata,
     merge_evaluation_results,
+    prepare_unsloth_offload,
     summarize_lora_b,
 )
 
@@ -99,6 +102,7 @@ class FakeArcModel(torch.nn.Module):
         super().__init__()
         self.input = torch.nn.Embedding(16, 3)
         self.output = torch.nn.Linear(3, 16, bias=False)
+        self.config = type("Config", (), {"_name_or_path": "/read-only/model/1"})()
         with torch.no_grad():
             self.input.weight.copy_(torch.arange(48).reshape(16, 3))
             self.output.weight.copy_(torch.arange(48, 96).reshape(16, 3))
@@ -120,6 +124,22 @@ class FakeArcModel(torch.nn.Module):
 
 
 class RepairSftTest(unittest.TestCase):
+    def test_unsloth_absolute_model_path_cannot_escape_writable_offload(self):
+        model = FakeArcModel()
+        with TemporaryDirectory() as directory:
+            writable_root = Path(directory)
+            temporary_location = writable_root / "rank0"
+            temporary_location.mkdir()
+            original, destination = prepare_unsloth_offload(
+                model,
+                temporary_location,
+                writable_root=writable_root,
+            )
+            self.assertEqual(original, "/read-only/model/1")
+            self.assertEqual(model.config._name_or_path, "base_model")
+            self.assertEqual(destination, (temporary_location / "base_model").resolve())
+            self.assertTrue(destination.is_dir())
+
     def test_distributed_diagnostics_use_weighted_means(self):
         def task(examples, mean_nll, exact):
             return {
