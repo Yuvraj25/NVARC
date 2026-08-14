@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import random
 from collections import Counter
+from pathlib import Path
 from typing import Any, Sequence
 
 from repair_mining import format_reply, grid_to_string, zero_mask
@@ -12,6 +13,73 @@ from repair_mining import format_reply, grid_to_string, zero_mask
 
 REPAIR_TOKEN = "<REPAIR>"
 STRUCTURAL_TOKENS = ("user", "assistant", "<|im_start|>", "<|im_end|>")
+
+
+def merge_repair_adapter_into_base(
+    model: Any,
+    tokenizer: Any,
+    adapter_path: str | Path,
+    *,
+    auto_tokenizer_cls: Any,
+    peft_model_cls: Any,
+) -> tuple[Any, Any]:
+    """Merge the offline repair adapter before creating a fresh TTFT adapter.
+
+    The repair checkpoint owns a seventeenth token plus full saved copies of
+    ``embed_tokens`` and ``lm_head``.  The base model must therefore be resized
+    before PEFT loads the checkpoint; stacking an old 16-token TTFT adapter on
+    top would be shape-incompatible and would not test the repaired
+    initialization fairly.
+    """
+    adapter_path = Path(adapter_path)
+    required = {
+        "adapter_config.json",
+        "adapter_model.safetensors",
+        "tokenizer.json",
+        "tokenizer_config.json",
+    }
+    missing = sorted(name for name in required if not (adapter_path / name).is_file())
+    if missing:
+        raise FileNotFoundError(
+            f"Repair adapter is incomplete at {adapter_path}: missing={missing}"
+        )
+
+    repaired_tokenizer = auto_tokenizer_cls.from_pretrained(
+        str(adapter_path),
+        local_files_only=True,
+    )
+    base_vocab_size = len(tokenizer)
+    repaired_vocab_size = len(repaired_tokenizer)
+    repair_token_id = repaired_tokenizer.convert_tokens_to_ids(REPAIR_TOKEN)
+    if base_vocab_size != 16:
+        raise RuntimeError(f"Expected 16-token ARC base vocabulary, got {base_vocab_size}")
+    if repaired_vocab_size != 17 or repair_token_id != 16:
+        raise RuntimeError(
+            "Unexpected repair tokenizer layout: "
+            f"vocab={repaired_vocab_size} repair_token_id={repair_token_id}"
+        )
+
+    try:
+        model.resize_token_embeddings(repaired_vocab_size, mean_resizing=False)
+    except TypeError:
+        # Older Transformers releases do not expose ``mean_resizing``.
+        model.resize_token_embeddings(repaired_vocab_size)
+
+    repaired_model = peft_model_cls.from_pretrained(
+        model,
+        str(adapter_path),
+        is_trainable=False,
+        local_files_only=True,
+    )
+    repaired_model = repaired_model.merge_and_unload(safe_merge=True)
+    input_rows = repaired_model.get_input_embeddings().weight.shape[0]
+    output_rows = repaired_model.get_output_embeddings().weight.shape[0]
+    if input_rows != repaired_vocab_size or output_rows != repaired_vocab_size:
+        raise RuntimeError(
+            "Merged repair model has inconsistent vocabulary matrices: "
+            f"input={input_rows} output={output_rows} tokenizer={repaired_vocab_size}"
+        )
+    return repaired_model, repaired_tokenizer
 
 
 def ordinary_solve_prompt(record: dict[str, Any]) -> str:
