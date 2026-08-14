@@ -9,7 +9,6 @@ from repair_sft import (
     build_training_mixture,
     build_zero_mask_noop_example,
     add_and_initialize_repair_token,
-    merge_repair_adapter_into_base,
     ordinary_solve_prompt,
     tokenize_completion_only,
 )
@@ -125,58 +124,6 @@ class FakeArcModel(torch.nn.Module):
 
 
 class RepairSftTest(unittest.TestCase):
-    def test_repair_adapter_is_resized_loaded_and_merged_before_ttft(self):
-        test_case = self
-        base_model = FakeArcModel()
-        base_tokenizer = FakeArcTokenizer()
-        repaired_tokenizer = FakeArcTokenizer()
-        repaired_tokenizer.add_special_tokens(
-            {"additional_special_tokens": ["<|im_start|>", "<|im_end|>", "<REPAIR>"]}
-        )
-
-        class AutoTokenizer:
-            @classmethod
-            def from_pretrained(cls, path, local_files_only):
-                test_case.assertTrue(local_files_only)
-                return repaired_tokenizer
-
-        class LoadedAdapter:
-            def __init__(self, model):
-                self.model = model
-
-            def merge_and_unload(self, safe_merge):
-                test_case.assertTrue(safe_merge)
-                return self.model
-
-        class PeftModel:
-            @classmethod
-            def from_pretrained(cls, model, path, is_trainable, local_files_only):
-                test_case.assertFalse(is_trainable)
-                test_case.assertTrue(local_files_only)
-                return LoadedAdapter(model)
-
-        with TemporaryDirectory() as directory:
-            adapter_path = Path(directory)
-            for name in (
-                "adapter_config.json",
-                "adapter_model.safetensors",
-                "tokenizer.json",
-                "tokenizer_config.json",
-            ):
-                (adapter_path / name).write_bytes(b"test")
-            model, tokenizer = merge_repair_adapter_into_base(
-                base_model,
-                base_tokenizer,
-                adapter_path,
-                auto_tokenizer_cls=AutoTokenizer,
-                peft_model_cls=PeftModel,
-            )
-
-        self.assertIs(tokenizer, repaired_tokenizer)
-        self.assertEqual(len(tokenizer), 17)
-        self.assertEqual(model.get_input_embeddings().weight.shape[0], 17)
-        self.assertEqual(model.get_output_embeddings().weight.shape[0], 17)
-
     def test_execution_device_ignores_first_offloaded_cpu_parameter(self):
         class Parameter:
             def __init__(self, device):

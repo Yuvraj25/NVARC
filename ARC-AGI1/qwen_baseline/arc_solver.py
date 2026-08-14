@@ -34,7 +34,6 @@ from arc_selected_augmentations import load_selected_augmentations, prepare_sele
 from arc_sglang import ArcSglangBackend, SglangConfig, SglangRescorer, inference_sglang_dfs, inference_sglang_speculative_dfs
 from arc_search import ASSISTANT_TOKEN_ID, EOS_ID, USER_TOKEN_ID, default_max_score, inference_turbo_dfs
 from arc_search_multitoken import inference_turbo_dfs_multitoken
-from repair_sft import merge_repair_adapter_into_base
 
 logging.disable(logging.WARNING)
 
@@ -68,7 +67,6 @@ def runtime_config():
         "profile_timings": _env_flag("ARC_PROFILE_TIMINGS", default=False),
         "dfs_prob_threshold": dfs_prob_threshold,
         "model_path": os.environ.get("ARC_MODEL_PATH", "../input/qwen3_4b_grids15_sft139/"),
-        "initial_adapter_path": os.environ.get("ARC_INITIAL_ADAPTER_PATH"),
         "test_path": os.environ.get("ARC_TEST_PATH", "../input/arc-prize-2024/arc-agi_evaluation_challenges.json"),
         "output_dir": os.environ.get("ARC_OUTPUT_DIR", "../inference_outputs"),
         "sglang_tensor_parallel_size": int(os.environ.get("ARC_SGLANG_TP_SIZE", "1")),
@@ -149,7 +147,7 @@ def _make_qwen_data_collator_class(DataCollatorForLanguageModeling):
 
 def _get_unsloth_training_stack():
     from unsloth import FastLanguageModel, UnslothTrainer, UnslothTrainingArguments
-    from peft import PeftModel, get_peft_model_state_dict, set_peft_model_state_dict
+    from peft import get_peft_model_state_dict, set_peft_model_state_dict
     from transformers import AutoTokenizer, DataCollatorForLanguageModeling
 
     return {
@@ -159,7 +157,6 @@ def _get_unsloth_training_stack():
         "QwenDataCollatorForCompletionOnlyLM": _make_qwen_data_collator_class(DataCollatorForLanguageModeling),
         "get_peft_model_state_dict": get_peft_model_state_dict,
         "set_peft_model_state_dict": set_peft_model_state_dict,
-        "PeftModel": PeftModel,
         "AutoTokenizer": AutoTokenizer,
     }
 
@@ -225,24 +222,6 @@ def _path_size_bytes(path: str) -> int:
         for file_name in files:
             total += os.path.getsize(os.path.join(root, file_name))
     return total
-
-
-def _prepare_repaired_ttft_offload(model: Any, rank: int) -> tuple[str, str]:
-    """Route modern Unsloth's embedding offload to writable Kaggle storage."""
-    root = os.path.join(
-        "/kaggle/working",
-        "unsloth_repair_ttft_offload",
-        f"rank{rank}_pid{os.getpid()}",
-    )
-    destination = os.path.join(root, "base_model")
-    os.makedirs(destination, exist_ok=True)
-    probe = os.path.join(destination, ".write_probe")
-    with open(probe, "wb") as handle:
-        handle.write(b"")
-    os.unlink(probe)
-    original_name = str(model.config._name_or_path)
-    model.config._name_or_path = "base_model"
-    return original_name, root
 
 
 def _build_eval_batches(eval_ds):
@@ -993,7 +972,6 @@ def worker(rank, queue, end_time):
     QwenDataCollatorForCompletionOnlyLM = training_stack["QwenDataCollatorForCompletionOnlyLM"]
     get_peft_model_state_dict = training_stack["get_peft_model_state_dict"]
     set_peft_model_state_dict = training_stack["set_peft_model_state_dict"]
-    PeftModel = training_stack["PeftModel"]
 
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=config["model_path"],
@@ -1004,33 +982,7 @@ def worker(rank, queue, end_time):
         max_seq_length=max_seq_length,
     )
 
-    if config["initial_adapter_path"]:
-        if config["use_sglang"]:
-            raise ValueError("Initial-adapter merging is currently supported only by the vanilla HF worker")
-        model, tokenizer = merge_repair_adapter_into_base(
-            model,
-            tokenizer,
-            config["initial_adapter_path"],
-            auto_tokenizer_cls=training_stack["AutoTokenizer"],
-            peft_model_cls=PeftModel,
-        )
-        print(
-            f"[Rank {rank}] merged initial adapter from {config['initial_adapter_path']} "
-            f"with vocab_size={len(tokenizer)}",
-            flush=True,
-        )
-
-    ttft_peft_params = dict(peft_params)
-    original_model_name = None
-    if config["initial_adapter_path"]:
-        original_model_name, offload_root = _prepare_repaired_ttft_offload(model, rank)
-        ttft_peft_params["temporary_location"] = offload_root
-        print(f"[Rank {rank}] TTFT embedding offload root={offload_root}", flush=True)
-    try:
-        model = FastLanguageModel.get_peft_model(model, **ttft_peft_params)
-    finally:
-        if original_model_name is not None:
-            model.config._name_or_path = original_model_name
+    model = FastLanguageModel.get_peft_model(model, **peft_params)
     for _name, param in model.named_parameters():
         if param.dtype == torch.float32:
             param.data = param.data.to(torch.bfloat16)
@@ -1050,7 +1002,6 @@ def worker(rank, queue, end_time):
         f"[Rank {rank}] config: speculative_dfs={config['use_speculative_dfs']} "
         f"dfs_prob_threshold={config['dfs_prob_threshold']} "
         f"ttft_method={config['ttft_method']} fixed_candidate_dir={config['fixed_candidate_dir']}"
-        f" initial_adapter_path={config['initial_adapter_path']}"
     )
     if config["ttft_method"] != "full_sft" and config["use_sglang"]:
         raise ValueError("Reduced-pair and OPSD TTFT modes require the gradient-capable Unsloth/HF worker")

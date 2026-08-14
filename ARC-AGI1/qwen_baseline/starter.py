@@ -109,7 +109,6 @@ if __name__ == "__main__":
     parser.add_argument("--end-time", type=float, default=None)
     parser.add_argument("--test-path", type=str, default="../input/arc-prize-2024/arc-agi_evaluation_challenges.json")
     parser.add_argument("--model-path", type=str, default="../input/qwen3_4b_grids15_sft139/")
-    parser.add_argument("--initial-adapter-path", type=str, default=None)
     parser.add_argument("--output-dir", type=str, default="../inference_outputs")
     parser.add_argument("--keys-file", type=str, default=None)
     parser.add_argument("--keys-json", type=str, default=None)
@@ -171,8 +170,6 @@ if __name__ == "__main__":
         raise ValueError("--use-sglang with --sglang-tp-size > 1 must run with exactly one worker")
     if args.ttft_method != "full_sft" and args.use_sglang:
         raise ValueError("Reduced-pair TTFT methods are only supported by the Unsloth/HF worker")
-    if args.initial_adapter_path and args.use_sglang:
-        raise ValueError("--initial-adapter-path is currently supported only by the vanilla HF worker")
     if args.use_unsloth_multitoken_dfs and args.use_sglang:
         raise ValueError("--use-unsloth-multitoken-dfs is only supported by the Unsloth/HF worker")
     if args.unsloth_multitoken_repeat_len < 2:
@@ -209,10 +206,6 @@ if __name__ == "__main__":
     os.environ["ARC_PROFILE_TIMINGS"] = "1" if args.profile_timings else "0"
     os.environ["ARC_TEST_PATH"] = args.test_path
     os.environ["ARC_MODEL_PATH"] = args.model_path
-    if args.initial_adapter_path is not None:
-        os.environ["ARC_INITIAL_ADAPTER_PATH"] = args.initial_adapter_path
-    else:
-        os.environ.pop("ARC_INITIAL_ADAPTER_PATH", None)
     os.environ["ARC_OUTPUT_DIR"] = args.output_dir
     os.environ["ARC_TTFT_METHOD"] = args.ttft_method
     if args.fixed_candidate_dir is not None:
@@ -252,7 +245,6 @@ if __name__ == "__main__":
         f"profile_timings={os.environ['ARC_PROFILE_TIMINGS']}",
         f"test_path={os.environ['ARC_TEST_PATH']}",
         f"model_path={os.environ['ARC_MODEL_PATH']}",
-        f"initial_adapter_path={os.environ.get('ARC_INITIAL_ADAPTER_PATH')}",
         f"output_dir={os.environ['ARC_OUTPUT_DIR']}",
         f"ttft_method={os.environ['ARC_TTFT_METHOD']}",
         f"fixed_candidate_dir={os.environ.get('ARC_FIXED_CANDIDATE_DIR')}",
