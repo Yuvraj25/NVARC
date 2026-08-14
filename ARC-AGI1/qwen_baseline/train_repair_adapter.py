@@ -18,6 +18,12 @@ from typing import Any
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", required=True)
+    parser.add_argument(
+        "--adapter-path",
+        type=Path,
+        default=None,
+        help="Existing repair adapter to continue training instead of creating a fresh LoRA.",
+    )
     parser.add_argument("--train-path", type=Path, required=True)
     parser.add_argument("--dev-path", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -345,6 +351,7 @@ def main() -> None:
             torch.distributed.init_process_group(backend="nccl")
 
     from datasets import Dataset
+    from peft import PeftModel
     from unsloth import FastLanguageModel, UnslothTrainer, UnslothTrainingArguments
 
     from arc_solver import _make_unsloth_fixed_trainer_class
@@ -437,43 +444,62 @@ def main() -> None:
         f"working_free_gib={free_working_gib:.3f}",
         flush=True,
     )
-    try:
-        model = FastLanguageModel.get_peft_model(
+    if args.adapter_path is None:
+        try:
+            model = FastLanguageModel.get_peft_model(
+                model,
+                r=args.lora_rank,
+                target_modules=[
+                    "q_proj",
+                    "k_proj",
+                    "v_proj",
+                    "o_proj",
+                    "gate_proj",
+                    "up_proj",
+                    "down_proj",
+                ],
+                # The tokenizer was resized for <REPAIR>.  Train and persist the
+                # actual embedding/head matrices rather than wrapping lm_head in
+                # LoRA: Unsloth's optimized loss path bypasses lm_head LoRA A/B,
+                # leaving those parameters unused under DDP.
+                modules_to_save=["embed_tokens", "lm_head"],
+                lora_alpha=32,
+                lora_dropout=0.0,
+                bias="none",
+                # Repair prompts can approach the 8k context limit.  Rank-256 LoRA plus
+                # uncheckpointed activations exceeded a 22 GiB L4 on the first forward
+                # pass, so use Unsloth's offloaded checkpointing implementation.
+                use_gradient_checkpointing="unsloth",
+                random_state=args.seed,
+                use_rslora=True,
+                loftq_config=None,
+                # Each DDP rank gets a writable and collision-free target.  The
+                # model config is temporarily made relative above because Unsloth
+                # 2026.7.5 otherwise discards this prefix for absolute model paths.
+                temporary_location=str(offload_root),
+            )
+        finally:
+            # get_peft_model may replace ``model`` with a PEFT wrapper, so restore
+            # the exact base config object that prepare_unsloth_offload modified.
+            original_model_config._name_or_path = original_model_name
+    else:
+        adapter_path = args.adapter_path.resolve()
+        if not (adapter_path / "adapter_config.json").is_file():
+            raise FileNotFoundError(adapter_path / "adapter_config.json")
+        if not (adapter_path / "adapter_model.safetensors").is_file():
+            raise FileNotFoundError(adapter_path / "adapter_model.safetensors")
+        model = PeftModel.from_pretrained(
             model,
-            r=args.lora_rank,
-            target_modules=[
-                "q_proj",
-                "k_proj",
-                "v_proj",
-                "o_proj",
-                "gate_proj",
-                "up_proj",
-                "down_proj",
-            ],
-            # The tokenizer was resized for <REPAIR>.  Train and persist the
-            # actual embedding/head matrices rather than wrapping lm_head in
-            # LoRA: Unsloth's optimized loss path bypasses lm_head LoRA A/B,
-            # leaving those parameters unused under DDP.
-            modules_to_save=["embed_tokens", "lm_head"],
-            lora_alpha=32,
-            lora_dropout=0.0,
-            bias="none",
-            # Repair prompts can approach the 8k context limit.  Rank-256 LoRA plus
-            # uncheckpointed activations exceeded a 22 GiB L4 on the first forward
-            # pass, so use Unsloth's offloaded checkpointing implementation.
-            use_gradient_checkpointing="unsloth",
-            random_state=args.seed,
-            use_rslora=True,
-            loftq_config=None,
-            # Each DDP rank gets a writable and collision-free target.  The
-            # model config is temporarily made relative above because Unsloth
-            # 2026.7.5 otherwise discards this prefix for absolute model paths.
-            temporary_location=str(offload_root),
+            str(adapter_path),
+            is_trainable=True,
+            local_files_only=True,
         )
-    finally:
-        # get_peft_model may replace ``model`` with a PEFT wrapper, so restore
-        # the exact base config object that prepare_unsloth_offload modified.
+        model = FastLanguageModel.patch_peft_model(
+            model,
+            use_gradient_checkpointing="unsloth",
+        )
         original_model_config._name_or_path = original_model_name
+        print(f"[rank {rank}] continuing trainable adapter from {adapter_path}", flush=True)
     execution_device = model_execution_device(model)
     if execution_device.type != "cuda" or execution_device.index != local_rank:
         raise RuntimeError(
@@ -618,9 +644,18 @@ def main() -> None:
     model = trainer.accelerator.unwrap_model(model, keep_fp32_wrapper=False)
     del trainer
     adapter_after = summarize_lora_b(model)
-    if adapter_after["nonzero_elements"] <= adapter_before["nonzero_elements"]:
+    if args.adapter_path is None:
+        adapter_changed = (
+            adapter_after["nonzero_elements"] > adapter_before["nonzero_elements"]
+        )
+    else:
+        # A continued adapter already has nonzero LoRA-B weights.  Its norm must
+        # move; comparing nonzero counts would incorrectly reject every valid
+        # continuation run.
+        adapter_changed = abs(adapter_after["l2"] - adapter_before["l2"]) > 1e-8
+    if not adapter_changed:
         raise RuntimeError(
-            "Training completed without changing any zero-initialized LoRA-B weights: "
+            "Training completed without a measurable LoRA-B update: "
             f"before={adapter_before} after={adapter_after}"
         )
 
@@ -645,6 +680,7 @@ def main() -> None:
 
     manifest = {
         "config": vars(args) | {
+            "adapter_path": None if args.adapter_path is None else str(args.adapter_path),
             "train_path": str(args.train_path),
             "dev_path": str(args.dev_path),
             "output_dir": str(args.output_dir),
