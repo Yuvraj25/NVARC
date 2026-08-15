@@ -349,6 +349,12 @@ def main() -> None:
                 "q_proj", "k_proj", "v_proj", "o_proj",
                 "gate_proj", "up_proj", "down_proj",
             ],
+            # The repair-v2 base already contains its trained structural
+            # embedding/head values.  Keep those matrices trainable in the
+            # fresh global stage as well; the vocabulary is only 17 tokens, so
+            # this adds negligible storage while allowing the global corpus to
+            # recalibrate ARC-token logits directly.
+            modules_to_save=["embed_tokens", "lm_head"],
             lora_alpha=32,
             lora_dropout=0.0,
             bias="none",
@@ -464,6 +470,7 @@ def main() -> None:
                 "repair_token_id": repair_token_id,
                 "repair_adapter_merged_before_scoring": True,
                 "fresh_global_lora_rank": args.lora_rank,
+                "fresh_global_modules_to_save": ["embed_tokens", "lm_head"],
             },
             "environment": {
                 "torch": torch.__version__,
