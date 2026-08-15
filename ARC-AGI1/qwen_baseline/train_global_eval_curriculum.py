@@ -1,0 +1,487 @@
+"""Train a global LoRA on reverse-NLL-ordered ARC evaluation training pairs.
+
+The input challenge file supplies only the public per-task demonstrations.  No
+evaluation solution file is accepted or opened.  A frozen repair-v2 adapter is
+first merged into the base model; pre-training target NLL then determines a
+hard-to-easy curriculum for a fresh global LoRA.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import importlib.metadata
+import json
+import math
+import os
+import shutil
+import tempfile
+import time
+from pathlib import Path
+from typing import Any
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model-path", required=True)
+    parser.add_argument("--repair-adapter-path", type=Path, required=True)
+    parser.add_argument("--challenges-path", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--expected-task-count", type=int, default=120)
+    parser.add_argument("--views-per-task", type=int, default=20)
+    parser.add_argument("--max-tasks", type=int, default=None)
+    parser.add_argument("--max-seq-length", type=int, default=8192)
+    parser.add_argument("--score-batch-size", type=int, default=2)
+    parser.add_argument("--epochs", type=float, default=1.0)
+    parser.add_argument("--learning-rate", type=float, default=2.5e-5)
+    parser.add_argument("--lora-rank", type=int, default=256)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
+    parser.add_argument("--expected-world-size", type=int, default=4)
+    parser.add_argument("--seed", type=int, default=20260815)
+    return parser.parse_args()
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def nll_summary(values: list[float]) -> dict[str, float]:
+    import numpy as np
+
+    array = np.asarray(values, dtype=np.float64)
+    return {
+        "min": float(array.min()),
+        "p10": float(np.quantile(array, 0.10)),
+        "median": float(np.median(array)),
+        "p90": float(np.quantile(array, 0.90)),
+        "max": float(array.max()),
+        "mean": float(array.mean()),
+    }
+
+
+def score_tokenized_examples(
+    model: Any,
+    tokenizer: Any,
+    tokenized: list[dict[str, list[int]]],
+    *,
+    rank: int,
+    world_size: int,
+    batch_size: int,
+) -> list[float] | None:
+    """Return target-token mean NLLs on rank zero, preserving record indices."""
+    import torch
+    import torch.nn.functional as functional
+
+    from repair_mining import model_execution_device
+
+    if batch_size <= 0:
+        raise ValueError("score batch size must be positive")
+    device = model_execution_device(model)
+    local_indices = list(range(rank, len(tokenized), world_size))
+    # Length buckets reduce padding without changing the final index mapping.
+    local_indices.sort(key=lambda index: len(tokenized[index]["input_ids"]))
+    local_scores: dict[int, float] = {}
+    model.eval()
+    with torch.inference_mode():
+        for start in range(0, len(local_indices), batch_size):
+            indices = local_indices[start : start + batch_size]
+            maximum = max(len(tokenized[index]["input_ids"]) for index in indices)
+            input_ids = torch.full(
+                (len(indices), maximum), tokenizer.pad_token_id,
+                dtype=torch.long, device=device,
+            )
+            attention_mask = torch.zeros_like(input_ids)
+            labels = torch.full_like(input_ids, -100)
+            for row, index in enumerate(indices):
+                example = tokenized[index]
+                length = len(example["input_ids"])
+                input_ids[row, :length] = torch.tensor(example["input_ids"], device=device)
+                attention_mask[row, :length] = 1
+                labels[row, :length] = torch.tensor(example["labels"], device=device)
+            logits = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                use_cache=False,
+            ).logits
+            shift_logits = logits[:, :-1].float()
+            shift_labels = labels[:, 1:]
+            losses = functional.cross_entropy(
+                shift_logits.reshape(-1, shift_logits.shape[-1]),
+                shift_labels.reshape(-1),
+                reduction="none",
+                ignore_index=-100,
+            ).view(len(indices), -1)
+            valid = shift_labels.ne(-100)
+            totals = (losses * valid).sum(dim=1)
+            counts = valid.sum(dim=1)
+            if bool((counts == 0).any()):
+                raise RuntimeError("A scored record has no target labels")
+            for index, total, count in zip(indices, totals, counts):
+                local_scores[index] = float((total / count).item())
+            del logits, shift_logits, losses, input_ids, attention_mask, labels
+
+    if world_size == 1:
+        return [local_scores[index] for index in range(len(tokenized))]
+    gathered: list[dict[int, float] | None] | None = [None] * world_size if rank == 0 else None
+    torch.distributed.gather_object(local_scores, gathered, dst=0)
+    if rank != 0:
+        return None
+    combined: dict[int, float] = {}
+    assert gathered is not None
+    for part in gathered:
+        if part is None:
+            raise RuntimeError("Missing a rank's curriculum scores")
+        overlap = set(combined).intersection(part)
+        if overlap:
+            raise RuntimeError(f"Duplicate distributed score indices: {sorted(overlap)[:5]}")
+        combined.update(part)
+    if set(combined) != set(range(len(tokenized))):
+        raise RuntimeError("Distributed scoring did not cover the complete curriculum")
+    return [combined[index] for index in range(len(tokenized))]
+
+
+def main() -> None:
+    args = parse_args()
+    os.environ.setdefault("UNSLOTH_DISABLE_STATISTICS", "1")
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+    os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")
+    os.environ.setdefault("TRITON_PTXAS_PATH", "/usr/local/cuda/bin/ptxas")
+    os.environ.setdefault("OMP_NUM_THREADS", "3")
+    compile_root = Path(tempfile.gettempdir()) / f"unsloth_global_eval_pid{os.getpid()}"
+    compile_root.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("UNSLOTH_COMPILE_LOCATION", str(compile_root))
+
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    is_main = rank == 0
+    if world_size != args.expected_world_size:
+        raise RuntimeError(
+            f"Expected world_size={args.expected_world_size}, observed {world_size}"
+        )
+    working_root = Path("/kaggle/working").resolve()
+    output_dir = args.output_dir.resolve()
+    try:
+        output_dir.relative_to(working_root)
+    except ValueError as error:
+        raise RuntimeError(f"Output must be under {working_root}: {output_dir}") from error
+
+    import unsloth  # noqa: F401  # must patch before Transformers/PEFT imports
+    import torch
+
+    if importlib.metadata.version("unsloth") != "2026.7.5":
+        raise RuntimeError("Expected Unsloth 2026.7.5 utility")
+    if importlib.metadata.version("unsloth_zoo") != "2026.7.6":
+        raise RuntimeError("Expected Unsloth Zoo 2026.7.6 utility")
+    if world_size > 1:
+        torch.cuda.set_device(local_rank)
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(backend="nccl")
+
+    from datasets import Dataset
+    from peft import PeftModel
+    from torch.utils.data import SequentialSampler
+    from unsloth import FastLanguageModel, UnslothTrainer, UnslothTrainingArguments
+
+    from arc_solver import _make_unsloth_fixed_trainer_class
+    from global_eval_curriculum import (
+        build_exact_curriculum_records,
+        format_completion_record,
+        load_evaluation_training_tasks,
+        summarize_records,
+    )
+    from repair_sft import (
+        REPAIR_TOKEN,
+        add_and_initialize_repair_token,
+        tokenize_completion_only,
+    )
+    from train_repair_adapter import (
+        completion_collator,
+        prepare_unsloth_offload,
+        summarize_lora_b,
+    )
+
+    if args.output_dir.exists():
+        raise FileExistsError(args.output_dir)
+    if is_main:
+        args.output_dir.mkdir(parents=True)
+    if world_size > 1:
+        torch.distributed.barrier()
+
+    tasks = load_evaluation_training_tasks(args.challenges_path)
+    observed_full_task_count = len(tasks)
+    if args.max_tasks is None and observed_full_task_count != args.expected_task_count:
+        raise RuntimeError(
+            f"Expected {args.expected_task_count} evaluation tasks, found {observed_full_task_count}"
+        )
+    if args.max_tasks is not None:
+        tasks = dict(list(tasks.items())[: args.max_tasks])
+    raw_records = build_exact_curriculum_records(
+        tasks, views_per_task=args.views_per_task, seed=args.seed
+    )
+
+    load_started = time.perf_counter()
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=args.model_path,
+        device_map={"": f"cuda:{local_rank}"},
+        full_finetuning=False,
+        load_in_4bit=False,
+        local_files_only=True,
+        use_gradient_checkpointing=False,
+        max_seq_length=args.max_seq_length,
+    )
+    old_vocab_size = len(tokenizer)
+    repair_token_id = add_and_initialize_repair_token(model, tokenizer)
+    if repair_token_id != old_vocab_size:
+        raise RuntimeError(f"Unexpected {REPAIR_TOKEN} ID {repair_token_id}")
+
+    repair_adapter = args.repair_adapter_path.resolve()
+    for required in ("adapter_config.json", "adapter_model.safetensors"):
+        if not (repair_adapter / required).is_file():
+            raise FileNotFoundError(repair_adapter / required)
+    model = PeftModel.from_pretrained(
+        model, str(repair_adapter), is_trainable=False, local_files_only=True
+    )
+    model = model.merge_and_unload(safe_merge=True)
+    remaining_repair_lora = [
+        name for name, _parameter in model.named_parameters() if "lora_" in name
+    ]
+    if remaining_repair_lora:
+        raise RuntimeError(
+            f"Repair LoRA tensors remained after merge: {remaining_repair_lora[:5]}"
+        )
+    model_load_seconds = time.perf_counter() - load_started
+    print(
+        f"[rank {rank}] merged repair adapter; vocab={len(tokenizer)} "
+        f"device={next(model.parameters()).device}",
+        flush=True,
+    )
+
+    formatted = [
+        format_completion_record(record, tokenizer, max_seq_length=args.max_seq_length)
+        for record in raw_records
+    ]
+    tokenized = [
+        tokenize_completion_only(record, tokenizer, max_seq_length=args.max_seq_length)
+        for record in formatted
+    ]
+    if len(tokenized) != len(tasks) * args.views_per_task:
+        raise RuntimeError("Formatting changed the exact curriculum record count")
+
+    scoring_started = time.perf_counter()
+    model = FastLanguageModel.for_inference(model)
+    scores = score_tokenized_examples(
+        model,
+        tokenizer,
+        tokenized,
+        rank=rank,
+        world_size=world_size,
+        batch_size=args.score_batch_size,
+    )
+    scoring_seconds = time.perf_counter() - scoring_started
+    if world_size > 1:
+        torch.distributed.barrier()
+
+    order_payload: list[int] | None = None
+    if is_main:
+        assert scores is not None
+        order_payload = sorted(range(len(scores)), key=lambda index: (-scores[index], index))
+    objects = [order_payload]
+    if world_size > 1:
+        torch.distributed.broadcast_object_list(objects, src=0)
+    order = objects[0]
+    if order is None or len(order) != len(tokenized):
+        raise RuntimeError("Failed to broadcast the complete curriculum order")
+    ordered_tokenized = [tokenized[index] for index in order]
+
+    curriculum_rows: list[dict[str, Any]] | None = None
+    if is_main:
+        assert scores is not None
+        curriculum_rows = [
+            {
+                "curriculum_rank": rank_index,
+                "mean_target_nll": scores[source_index],
+                "task_id": formatted[source_index]["task_id"],
+                "view_index": formatted[source_index]["view_index"],
+                "target_index": formatted[source_index]["target_index"],
+                "demonstration_indices": formatted[source_index]["demonstration_indices"],
+                "kept_demonstration_indices": formatted[source_index]["kept_demonstration_indices"],
+                "dropped_demonstration_indices": formatted[source_index]["dropped_demonstration_indices"],
+                "transform_id": formatted[source_index]["transform_id"],
+                "color_mapping": formatted[source_index]["color_mapping"],
+                "sequence_tokens": formatted[source_index]["sequence_tokens"],
+            }
+            for rank_index, source_index in enumerate(order)
+        ]
+        with (args.output_dir / "curriculum.jsonl").open("w") as handle:
+            for row in curriculum_rows:
+                handle.write(json.dumps(row, sort_keys=True) + "\n")
+
+    model = FastLanguageModel.for_training(model)
+    offload_root = (
+        Path("/kaggle/working")
+        / "unsloth_global_eval_offload"
+        / f"rank{local_rank}_pid{os.getpid()}"
+    )
+    offload_root.mkdir(parents=True, exist_ok=True)
+    original_config = model.config
+    original_name, resolved_offload = prepare_unsloth_offload(model, offload_root)
+    try:
+        model = FastLanguageModel.get_peft_model(
+            model,
+            r=args.lora_rank,
+            target_modules=[
+                "q_proj", "k_proj", "v_proj", "o_proj",
+                "gate_proj", "up_proj", "down_proj",
+            ],
+            lora_alpha=32,
+            lora_dropout=0.0,
+            bias="none",
+            use_gradient_checkpointing="unsloth",
+            random_state=args.seed,
+            use_rslora=True,
+            loftq_config=None,
+            temporary_location=str(offload_root),
+        )
+    finally:
+        original_config._name_or_path = original_name
+    print(f"[rank {rank}] global LoRA offload={resolved_offload}", flush=True)
+    adapter_before = summarize_lora_b(model)
+    for _name, parameter in model.named_parameters():
+        if parameter.dtype == torch.float32:
+            parameter.data = parameter.data.to(torch.bfloat16)
+
+    BaseTrainer = _make_unsloth_fixed_trainer_class(UnslothTrainer)
+
+    class SequentialCurriculumTrainer(BaseTrainer):
+        def _get_train_sampler(self, train_dataset=None):
+            dataset = self.train_dataset if train_dataset is None else train_dataset
+            return SequentialSampler(dataset)
+
+    trainer = SequentialCurriculumTrainer(
+        model=model,
+        tokenizer=tokenizer,
+        data_collator=completion_collator(tokenizer),
+        train_dataset=Dataset.from_list(ordered_tokenized),
+        max_seq_length=args.max_seq_length,
+        args=UnslothTrainingArguments(
+            output_dir=str(args.output_dir / "trainer_output"),
+            per_device_train_batch_size=1,
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
+            num_train_epochs=args.epochs,
+            warmup_ratio=0.05,
+            max_grad_norm=1.0,
+            learning_rate=args.learning_rate,
+            optim="adamw_torch",
+            weight_decay=0.0,
+            lr_scheduler_type="cosine",
+            seed=args.seed,
+            data_seed=args.seed,
+            report_to="none",
+            save_strategy="no",
+            eval_strategy="no",
+            logging_steps=10,
+            fp16=False,
+            bf16=True,
+            gradient_checkpointing=True,
+            gradient_checkpointing_kwargs={"use_reentrant": False},
+            ddp_find_unused_parameters=False,
+        ),
+    )
+    if trainer.accelerator.num_processes != world_size:
+        raise RuntimeError(
+            f"Trainer world size {trainer.accelerator.num_processes} != {world_size}"
+        )
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats(device=f"cuda:{local_rank}")
+    training_started = time.perf_counter()
+    stats = trainer.train()
+    training_seconds = time.perf_counter() - training_started
+    peak_cuda_gib = torch.cuda.max_memory_allocated(local_rank) / 2**30
+    model = trainer.accelerator.unwrap_model(model, keep_fp32_wrapper=False)
+    del trainer
+    adapter_after = summarize_lora_b(model)
+    if not math.isfinite(float(adapter_after["l2"])) or abs(
+        float(adapter_after["l2"]) - float(adapter_before["l2"])
+    ) <= 1e-8:
+        raise RuntimeError(
+            f"Global LoRA did not update: before={adapter_before} after={adapter_after}"
+        )
+    if is_main:
+        adapter_dir = args.output_dir / "adapter"
+        model.save_pretrained(adapter_dir)
+        tokenizer.save_pretrained(adapter_dir)
+    if world_size > 1:
+        torch.distributed.barrier()
+
+    if is_main:
+        assert scores is not None and curriculum_rows is not None
+        dropped_counts = [len(record["dropped_demonstration_indices"]) for record in formatted]
+        manifest = {
+            "config": {
+                **vars(args),
+                "repair_adapter_path": str(args.repair_adapter_path),
+                "challenges_path": str(args.challenges_path),
+                "output_dir": str(args.output_dir),
+            },
+            "data": {
+                "challenge_sha256": file_sha256(args.challenges_path),
+                "full_task_count": observed_full_task_count,
+                "used_task_count": len(tasks),
+                "summary": summarize_records(raw_records),
+                "formatted_records": len(formatted),
+                "records_dropping_demonstrations": sum(count > 0 for count in dropped_counts),
+                "total_dropped_demonstrations": sum(dropped_counts),
+                "loss_scope": "final_target_reply_only",
+                "test_pairs_loaded": False,
+            },
+            "curriculum": {
+                "metric": "pre_update_mean_target_token_nll",
+                "direction": "descending_hard_to_easy",
+                "nll": nll_summary(scores),
+                "first": curriculum_rows[:10],
+                "last": curriculum_rows[-10:],
+            },
+            "model": {
+                "base_vocab_size": old_vocab_size,
+                "merged_vocab_size": len(tokenizer),
+                "repair_token": REPAIR_TOKEN,
+                "repair_token_id": repair_token_id,
+                "repair_adapter_merged_before_scoring": True,
+                "fresh_global_lora_rank": args.lora_rank,
+            },
+            "environment": {
+                "torch": torch.__version__,
+                "unsloth": importlib.metadata.version("unsloth"),
+                "unsloth_zoo": importlib.metadata.version("unsloth_zoo"),
+                "world_size": world_size,
+            },
+            "adapter_update": {"before": adapter_before, "after": adapter_after},
+            "timings": {
+                "model_load_s": model_load_seconds,
+                "curriculum_scoring_s": scoring_seconds,
+                "training_s": training_seconds,
+            },
+            "peak_train_cuda_gib": peak_cuda_gib,
+            "train_metrics": dict(stats.metrics),
+        }
+        (args.output_dir / "global_eval_curriculum_manifest.json").write_text(
+            json.dumps(manifest, indent=2, sort_keys=True, default=str)
+        )
+        print(json.dumps(manifest, indent=2, sort_keys=True, default=str), flush=True)
+
+    shutil.rmtree(offload_root, ignore_errors=True)
+    if is_main:
+        shutil.rmtree(args.output_dir / "trainer_output", ignore_errors=True)
+    if world_size > 1:
+        torch.distributed.barrier()
+        torch.distributed.destroy_process_group()
+
+
+if __name__ == "__main__":
+    main()
