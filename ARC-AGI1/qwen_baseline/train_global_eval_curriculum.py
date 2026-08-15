@@ -206,7 +206,17 @@ def main() -> None:
         summarize_lora_b,
     )
 
-    if args.output_dir.exists():
+    # The Kaggle working volume is shared by every DDP rank.  Only rank zero
+    # may decide whether this is a stale pre-existing output; otherwise rank
+    # zero's mkdir races with the same check on ranks 1..N.
+    output_exists = torch.tensor(
+        [int(args.output_dir.exists())],
+        device=f"cuda:{local_rank}",
+        dtype=torch.int32,
+    )
+    if world_size > 1:
+        torch.distributed.broadcast(output_exists, src=0)
+    if output_exists.item():
         raise FileExistsError(args.output_dir)
     if is_main:
         args.output_dir.mkdir(parents=True)
