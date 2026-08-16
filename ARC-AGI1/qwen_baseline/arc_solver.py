@@ -140,9 +140,44 @@ def _make_qwen_data_collator_class(DataCollatorForLanguageModeling):
                         start += 2
                         end += 1
                         batch["labels"][i, start:end] = labels[start:end]
+                if not batch["labels"][i].ne(-100).any():
+                    raise RuntimeError(
+                        "Completion-only collator masked every label; "
+                        f"user_positions={user_start_idx} assistant_positions={assistant_start_idx} "
+                        f"eos_positions={end_idx.tolist()}"
+                    )
             return batch
 
     return QwenDataCollatorForCompletionOnlyLM
+
+
+def _restore_qwen_role_tokens(model, tokenizer):
+    """Restore the ordinary role tokens hidden by Transformers 5 token loading."""
+    from transformers import AddedToken
+
+    tokenizer.add_tokens(
+        [
+            AddedToken("user", special=False, normalized=False),
+            AddedToken("assistant", special=False, normalized=False),
+        ],
+        special_tokens=False,
+    )
+    observed = {
+        "user": tokenizer.encode("user", add_special_tokens=False),
+        "assistant": tokenizer.encode("assistant", add_special_tokens=False),
+    }
+    expected = {"user": [USER_TOKEN_ID], "assistant": [ASSISTANT_TOKEN_ID]}
+    if observed != expected:
+        raise RuntimeError(f"Qwen role-token restoration failed: expected={expected} observed={observed}")
+
+    tokenizer_vocab = len(tokenizer)
+    input_vocab = model.get_input_embeddings().weight.shape[0]
+    output_vocab = model.get_output_embeddings().weight.shape[0]
+    if tokenizer_vocab != input_vocab or tokenizer_vocab != output_vocab:
+        raise RuntimeError(
+            "Tokenizer/model vocabulary mismatch after role-token restoration: "
+            f"tokenizer={tokenizer_vocab} input={input_vocab} output={output_vocab}"
+        )
 
 
 def _get_unsloth_training_stack():
@@ -584,7 +619,7 @@ def worker_sglang(rank, queue, end_time, config):
         lora_alpha=32,
         lora_dropout=0.0,
         bias="none",
-        use_gradient_checkpointing=False,
+        use_gradient_checkpointing=True,
         random_state=42,
         use_rslora=True,
         loftq_config=None,
@@ -612,7 +647,7 @@ def worker_sglang(rank, queue, end_time, config):
         fsdp="",
         ddp_find_unused_parameters=False,
         dataloader_num_workers=0,
-        gradient_checkpointing=False,
+        gradient_checkpointing=True,
     )
 
     max_seq_length = 8192
@@ -756,9 +791,10 @@ def worker_sglang(rank, queue, end_time, config):
                         full_finetuning=False,
                         load_in_4bit=False,
                         local_files_only=True,
-                        use_gradient_checkpointing=False,
+                        use_gradient_checkpointing=True,
                         max_seq_length=max_seq_length,
                     )
+                    _restore_qwen_role_tokens(model, tokenizer)
                     model = FastLanguageModel.get_peft_model(model, **peft_params)
                     for _name, param in model.named_parameters():
                         if param.dtype == torch.float32:
@@ -767,7 +803,7 @@ def worker_sglang(rank, queue, end_time, config):
                     collator = QwenDataCollatorForCompletionOnlyLM(tokenizer=tokenizer, mlm=False)
                     formatter = QwenFormatter(tokenizer=tokenizer)
                     max_new_tokens = formatter.max_new_tokens()
-                    model = FastLanguageModel.for_training(model)
+                    model = FastLanguageModel.for_training(model, use_gradient_checkpointing=True)
                     train_ds = puzzle_ds.augment(n=16, shfl_keys=True, seed=1)
                     train_ds = train_ds.cut_to_len(formatter=formatter, name="text", max_len=max_seq_length)
 
@@ -933,7 +969,7 @@ def worker(rank, queue, end_time):
         lora_alpha=32,
         lora_dropout=0.0,
         bias="none",
-        use_gradient_checkpointing=False,
+        use_gradient_checkpointing=True,
         random_state=42,
         use_rslora=True,
         loftq_config=None,
@@ -961,7 +997,7 @@ def worker(rank, queue, end_time):
         fsdp="",
         ddp_find_unused_parameters=False,
         dataloader_num_workers=0,
-        gradient_checkpointing=False,
+        gradient_checkpointing=True,
     )
 
     max_seq_length = 8192
@@ -978,9 +1014,10 @@ def worker(rank, queue, end_time):
         full_finetuning=False,
         load_in_4bit=False,
         local_files_only=True,
-        use_gradient_checkpointing=False,
+        use_gradient_checkpointing=True,
         max_seq_length=max_seq_length,
     )
+    _restore_qwen_role_tokens(model, tokenizer)
 
     model = FastLanguageModel.get_peft_model(model, **peft_params)
     for _name, param in model.named_parameters():
@@ -1031,7 +1068,7 @@ def worker(rank, queue, end_time):
             adapter_name="default",
         )
 
-        model = FastLanguageModel.for_training(model)
+        model = FastLanguageModel.for_training(model, use_gradient_checkpointing=True)
         activate_adapter(model, "default", trainable=True)
         puzzle_ds = arc_test_set.change_keys([key])
         num_train_pairs = len(puzzle_ds.queries[key]["train"])
@@ -1091,7 +1128,7 @@ def worker(rank, queue, end_time):
             if not correction_rows:
                 raise RuntimeError(f"No augmented-SFT C examples fit max_seq_length for {key}")
             activate_adapter(model, "default", trainable=True)
-            model = FastLanguageModel.for_training(model)
+            model = FastLanguageModel.for_training(model, use_gradient_checkpointing=True)
             with io.StringIO() as buf, redirect_stdout(buf), redirect_stderr(buf):
                 correction_trainer = UnslothFixedTrainer(
                     model=model,
