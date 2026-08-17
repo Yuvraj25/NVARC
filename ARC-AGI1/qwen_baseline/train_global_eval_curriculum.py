@@ -27,7 +27,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--repair-adapter-path", type=Path, required=True)
     parser.add_argument("--challenges-path", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--expected-task-count", type=int, default=120)
     parser.add_argument("--views-per-task", type=int, default=20)
     parser.add_argument("--max-tasks", type=int, default=None)
     parser.add_argument("--max-seq-length", type=int, default=8192)
@@ -223,11 +222,19 @@ def main() -> None:
     if world_size > 1:
         torch.distributed.barrier()
 
+    raw_challenges = json.loads(args.challenges_path.read_text())
+    if not isinstance(raw_challenges, dict):
+        raise ValueError("ARC challenges must be a task-id mapping")
+    observed_full_task_count = len(raw_challenges)
     tasks = load_evaluation_training_tasks(args.challenges_path)
-    observed_full_task_count = len(tasks)
-    if args.max_tasks is None and observed_full_task_count != args.expected_task_count:
-        raise RuntimeError(
-            f"Expected {args.expected_task_count} evaluation tasks, found {observed_full_task_count}"
+    skipped_task_ids = sorted(set(raw_challenges) - set(tasks))
+    if not tasks:
+        raise RuntimeError("No tasks have at least two training pairs for global SFT")
+    if is_main:
+        print(
+            f"global curriculum eligible_tasks={len(tasks)} "
+            f"skipped_lt2_train_pairs={len(skipped_task_ids)}",
+            flush=True,
         )
     if args.max_tasks is not None:
         tasks = dict(list(tasks.items())[: args.max_tasks])
@@ -449,6 +456,8 @@ def main() -> None:
                 "challenge_sha256": file_sha256(args.challenges_path),
                 "full_task_count": observed_full_task_count,
                 "used_task_count": len(tasks),
+                "skipped_lt2_train_pair_task_count": len(skipped_task_ids),
+                "skipped_lt2_train_pair_task_ids": skipped_task_ids,
                 "summary": summarize_records(raw_records),
                 "formatted_records": len(formatted),
                 "records_dropping_demonstrations": sum(count > 0 for count in dropped_counts),

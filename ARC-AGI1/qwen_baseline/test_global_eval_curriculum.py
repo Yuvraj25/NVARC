@@ -45,6 +45,28 @@ def test_load_discards_test_pairs(tmp_path: Path):
     }
 
 
+def test_load_skips_one_pair_task_only_from_global_curriculum(tmp_path: Path):
+    path = tmp_path / "challenges.json"
+    path.write_text(
+        json.dumps(
+            {
+                "one_pair": {
+                    "train": [{"input": [[0]], "output": [[1]]}],
+                    "test": [{"input": [[2]]}],
+                },
+                "two_pairs": {
+                    "train": [
+                        {"input": [[3]], "output": [[4]]},
+                        {"input": [[5]], "output": [[6]]},
+                    ],
+                    "test": [{"input": [[7]]}],
+                },
+            }
+        )
+    )
+    assert list(load_evaluation_training_tasks(path)) == ["two_pairs"]
+
+
 def test_exact_count_balanced_targets_and_determinism():
     first = build_exact_curriculum_records(example_tasks(), views_per_task=20)
     second = build_exact_curriculum_records(example_tasks(), views_per_task=20)

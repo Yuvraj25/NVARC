@@ -30,11 +30,20 @@ def _stable_seed(*parts: object) -> int:
 def load_evaluation_training_tasks(path: Path) -> dict[str, list[dict[str, Any]]]:
     """Load only the public training pairs from an ARC challenges file."""
     raw = json.loads(path.read_text())
+    if not isinstance(raw, dict):
+        raise ValueError("ARC challenges must be a task-id mapping")
     tasks: dict[str, list[dict[str, Any]]] = {}
     for task_id, task in sorted(raw.items()):
+        if not isinstance(task, dict):
+            raise ValueError(f"{task_id}: expected a task mapping")
         pairs = task.get("train")
-        if not isinstance(pairs, list) or len(pairs) < 2:
-            raise ValueError(f"{task_id}: expected at least two training pairs")
+        if not isinstance(pairs, list):
+            raise ValueError(f"{task_id}: expected a training-pair list")
+        # Leave-one-out global SFT needs one held-out target and at least one
+        # remaining demonstration.  A one-pair task is still valid for local
+        # TTFT/inference, so exclude it only from this global curriculum.
+        if len(pairs) < 2:
+            continue
         for pair_index, pair in enumerate(pairs):
             if not isinstance(pair, dict) or not validate_grid(pair.get("input")):
                 raise ValueError(f"{task_id} train[{pair_index}]: invalid input grid")
