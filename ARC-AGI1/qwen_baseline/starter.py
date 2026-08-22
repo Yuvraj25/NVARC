@@ -136,7 +136,14 @@ if __name__ == "__main__":
     parser.add_argument("--profile-timings", action="store_true")
     parser.add_argument(
         "--ttft-method",
-        choices=["full_sft", "reduced_sft", "reduced_plus_sft_c", "reduced_plus_opsd"],
+        choices=[
+            "full_sft",
+            "reduced_sft",
+            "reduced_plus_sft_c",
+            "reduced_plus_opsd",
+            "loo_repair_mix",
+            "warm_repair_mix",
+        ],
         default="full_sft",
     )
     parser.add_argument("--fixed-candidate-dir", type=str, default=None)
@@ -150,6 +157,14 @@ if __name__ == "__main__":
     parser.add_argument("--opsd-temperature", type=float, default=1.0)
     parser.add_argument("--opsd-top-p", type=float, default=1.0)
     parser.add_argument("--opsd-lambda-ce", type=float, default=0.0)
+    parser.add_argument("--repair-ttft-log-dir", type=str, default="../repair_ttft_logs")
+    parser.add_argument("--repair-ttft-total-steps", type=int, default=128)
+    parser.add_argument("--repair-ttft-loo-stage1-steps", type=int, default=64)
+    parser.add_argument("--repair-ttft-warm-stage1-steps", type=int, default=32)
+    parser.add_argument("--repair-ttft-stage2-repair-fraction", type=float, default=0.5)
+    parser.add_argument("--repair-ttft-loo-heldout-views", type=int, default=16)
+    parser.add_argument("--repair-ttft-loo-seen-views", type=int, default=4)
+    parser.add_argument("--repair-ttft-warm-views-per-pair", type=int, default=8)
     args = parser.parse_args()
     if args.sglang_train_adapters_only and args.sglang_reuse_adapters:
         raise ValueError("--sglang-train-adapters-only and --sglang-reuse-adapters are mutually exclusive")
@@ -182,6 +197,10 @@ if __name__ == "__main__":
         raise ValueError("--opsd-max-updates must be positive")
     if not 0.0 <= args.opsd_cross_view_probability <= 1.0:
         raise ValueError("--opsd-cross-view-probability must be in [0, 1]")
+    if args.repair_ttft_total_steps != 128:
+        raise ValueError("--repair-ttft-total-steps must remain 128 for the controlled experiment")
+    if not 0.0 <= args.repair_ttft_stage2_repair_fraction <= 1.0:
+        raise ValueError("--repair-ttft-stage2-repair-fraction must be in [0, 1]")
     end_time = args.end_time if args.end_time is not None else time.time() + 12 * 3600
     os.environ["ARC_USE_SPECULATIVE_DFS"] = "1" if args.use_speculative_dfs else "0"
     os.environ["ARC_USE_UNSLOTH_MULTITOKEN_DFS"] = "1" if args.use_unsloth_multitoken_dfs else "0"
@@ -225,6 +244,18 @@ if __name__ == "__main__":
     os.environ["ARC_OPSD_TEMPERATURE"] = str(args.opsd_temperature)
     os.environ["ARC_OPSD_TOP_P"] = str(args.opsd_top_p)
     os.environ["ARC_OPSD_LAMBDA_CE"] = str(args.opsd_lambda_ce)
+    os.environ["ARC_REPAIR_TTFT_LOG_DIR"] = args.repair_ttft_log_dir
+    os.environ["ARC_REPAIR_TTFT_TOTAL_STEPS"] = str(args.repair_ttft_total_steps)
+    os.environ["ARC_REPAIR_TTFT_LOO_STAGE1_STEPS"] = str(args.repair_ttft_loo_stage1_steps)
+    os.environ["ARC_REPAIR_TTFT_WARM_STAGE1_STEPS"] = str(args.repair_ttft_warm_stage1_steps)
+    os.environ["ARC_REPAIR_TTFT_STAGE2_REPAIR_FRACTION"] = str(
+        args.repair_ttft_stage2_repair_fraction
+    )
+    os.environ["ARC_REPAIR_TTFT_LOO_HELDOUT_VIEWS"] = str(args.repair_ttft_loo_heldout_views)
+    os.environ["ARC_REPAIR_TTFT_LOO_SEEN_VIEWS"] = str(args.repair_ttft_loo_seen_views)
+    os.environ["ARC_REPAIR_TTFT_WARM_VIEWS_PER_PAIR"] = str(
+        args.repair_ttft_warm_views_per_pair
+    )
     print(
         "runtime flags:",
         f"speculative_dfs={os.environ['ARC_USE_SPECULATIVE_DFS']}",

@@ -30,6 +30,14 @@ from arc_opsd import (
     split_puzzle_for_opsd,
 )
 from arc_rescoring import FullPassRescorer
+from arc_repair_ttft import (
+    REPAIR_TTFT_METHODS,
+    build_stage_two_mixture,
+    deterministic_rows,
+    mine_repair_examples,
+    mixed_completion_collator,
+    tokenize_ordinary_text,
+)
 from arc_selected_augmentations import load_selected_augmentations, prepare_selected_eval_ds
 from arc_sglang import ArcSglangBackend, SglangConfig, SglangRescorer, inference_sglang_dfs, inference_sglang_speculative_dfs
 from arc_search import ASSISTANT_TOKEN_ID, EOS_ID, USER_TOKEN_ID, default_max_score, inference_turbo_dfs
@@ -51,7 +59,13 @@ def runtime_config():
         raise ValueError(f"ARC_DFS_PROB_THRESHOLD must be in (0, 1), got {dfs_prob_threshold}")
     sglang_mem_fraction = os.environ.get("ARC_SGLANG_MEM_FRACTION_STATIC")
     ttft_method = os.environ.get("ARC_TTFT_METHOD", "full_sft")
-    valid_ttft_methods = {"full_sft", "reduced_sft", "reduced_plus_sft_c", "reduced_plus_opsd"}
+    valid_ttft_methods = {
+        "full_sft",
+        "reduced_sft",
+        "reduced_plus_sft_c",
+        "reduced_plus_opsd",
+        *REPAIR_TTFT_METHODS,
+    }
     if ttft_method not in valid_ttft_methods:
         raise ValueError(f"ARC_TTFT_METHOD must be one of {sorted(valid_ttft_methods)}, got {ttft_method!r}")
     cross_view_probability = float(os.environ.get("ARC_OPSD_CROSS_VIEW_PROBABILITY", "0.2"))
@@ -89,6 +103,22 @@ def runtime_config():
         "opsd_top_p": float(os.environ.get("ARC_OPSD_TOP_P", "1.0")),
         "opsd_lambda_ce": float(os.environ.get("ARC_OPSD_LAMBDA_CE", "0.0")),
         "opsd_log_dir": os.environ.get("ARC_OPSD_LOG_DIR", "../opsd_logs"),
+        "repair_ttft_log_dir": os.environ.get("ARC_REPAIR_TTFT_LOG_DIR", "../repair_ttft_logs"),
+        "repair_ttft_total_steps": int(os.environ.get("ARC_REPAIR_TTFT_TOTAL_STEPS", "128")),
+        "repair_ttft_loo_stage1_steps": int(os.environ.get("ARC_REPAIR_TTFT_LOO_STAGE1_STEPS", "64")),
+        "repair_ttft_warm_stage1_steps": int(os.environ.get("ARC_REPAIR_TTFT_WARM_STAGE1_STEPS", "32")),
+        "repair_ttft_stage2_repair_fraction": float(
+            os.environ.get("ARC_REPAIR_TTFT_STAGE2_REPAIR_FRACTION", "0.5")
+        ),
+        "repair_ttft_loo_heldout_views": int(
+            os.environ.get("ARC_REPAIR_TTFT_LOO_HELDOUT_VIEWS", "16")
+        ),
+        "repair_ttft_loo_seen_views": int(
+            os.environ.get("ARC_REPAIR_TTFT_LOO_SEEN_VIEWS", "4")
+        ),
+        "repair_ttft_warm_views_per_pair": int(
+            os.environ.get("ARC_REPAIR_TTFT_WARM_VIEWS_PER_PAIR", "8")
+        ),
         "fixed_candidate_dir": os.environ.get("ARC_FIXED_CANDIDATE_DIR"),
         "selected_augmentations_path": os.environ.get("ARC_SELECTED_AUGMENTATIONS_PATH"),
     }
@@ -1080,7 +1110,12 @@ def worker(rank, queue, end_time):
                 f"{num_train_pairs} training pairs (< {config['opsd_min_train_pairs']})"
             )
             effective_ttft_method = "full_sft"
-        if effective_ttft_method != "full_sft":
+        if effective_ttft_method in {
+            "reduced_sft",
+            "reduced_plus_sft_c",
+            "reduced_plus_opsd",
+            "loo_repair_mix",
+        }:
             opsd_split = split_puzzle_for_opsd(puzzle_ds, key)
             initial_sft_ds = opsd_split.reduced_dataset
             print(
@@ -1092,6 +1127,37 @@ def worker(rank, queue, end_time):
 
         train_ds = initial_sft_ds.augment(n=16, shfl_keys=True, seed=1)
         train_ds = train_ds.cut_to_len(formatter=formatter, name="text", max_len=max_seq_length)
+        train_rows = train_ds.as_list(formatter)
+        repair_ttft_stats = None
+        if effective_ttft_method in REPAIR_TTFT_METHODS:
+            if config["repair_ttft_total_steps"] != 128:
+                raise ValueError("The controlled repair-TTFT experiment requires exactly 128 total steps")
+            if effective_ttft_method == "loo_repair_mix":
+                stage1_steps = config["repair_ttft_loo_stage1_steps"]
+            else:
+                stage1_steps = config["repair_ttft_warm_stage1_steps"]
+            if not 0 < stage1_steps < config["repair_ttft_total_steps"]:
+                raise ValueError(
+                    f"Invalid repair TTFT stage-1 budget {stage1_steps}/"
+                    f"{config['repair_ttft_total_steps']}"
+                )
+            train_rows = deterministic_rows(
+                train_rows,
+                stage1_steps,
+                stable_seed_from_key(f"{key}:stage1:{effective_ttft_method}"),
+            )
+            repair_ttft_stats = {
+                "puzzle_key": key,
+                "requested_method": config["ttft_method"],
+                "effective_method": effective_ttft_method,
+                "num_train_pairs": num_train_pairs,
+                "reserved_pair_index": (
+                    opsd_split.reserved_pair_index if opsd_split is not None else None
+                ),
+                "stage1_steps": stage1_steps,
+                "total_steps": config["repair_ttft_total_steps"],
+                "timing_s": {},
+            }
 
         training_started_at = time.perf_counter()
         with io.StringIO() as buf, redirect_stdout(buf), redirect_stderr(buf):
@@ -1099,7 +1165,7 @@ def worker(rank, queue, end_time):
                 model=model,
                 tokenizer=tokenizer,
                 data_collator=collator,
-                train_dataset=Dataset.from_list(train_ds.as_list(formatter)),
+                train_dataset=Dataset.from_list(train_rows),
                 dataset_text_field="text",
                 max_seq_length=max_seq_length,
                 args=UnslothTrainingArguments(**train_args),
@@ -1109,6 +1175,99 @@ def worker(rank, queue, end_time):
             model = trainer.accelerator.unwrap_model(model, keep_fp32_wrapper=False)
             del trainer
         timing_stats["training_s"] += time.perf_counter() - training_started_at
+
+        if effective_ttft_method in REPAIR_TTFT_METHODS:
+            mining_started_at = time.perf_counter()
+            model = FastLanguageModel.for_inference(model)
+            if effective_ttft_method == "loo_repair_mix":
+                pair_view_counts = {
+                    pair_index: (
+                        config["repair_ttft_loo_heldout_views"]
+                        if pair_index == opsd_split.reserved_pair_index
+                        else config["repair_ttft_loo_seen_views"]
+                    )
+                    for pair_index in range(num_train_pairs)
+                }
+            else:
+                pair_view_counts = {
+                    pair_index: config["repair_ttft_warm_views_per_pair"]
+                    for pair_index in range(num_train_pairs)
+                }
+            repair_rows, mining_stats = mine_repair_examples(
+                model=model,
+                tokenizer=tokenizer,
+                formatter=formatter,
+                puzzle_ds=puzzle_ds,
+                puzzle_key=key,
+                pair_view_counts=pair_view_counts,
+                max_seq_length=max_seq_length,
+                max_new_tokens=max_new_tokens,
+                seed=stable_seed_from_key(f"{key}:repair-mine:{effective_ttft_method}"),
+            )
+            mining_elapsed = time.perf_counter() - mining_started_at
+            timing_stats["repair_mining_s"] += mining_elapsed
+            repair_ttft_stats["timing_s"]["repair_mining_s"] = mining_elapsed
+            repair_ttft_stats["mining"] = mining_stats
+
+            ordinary_source = puzzle_ds.augment(n=16, shfl_keys=True, seed=1)
+            ordinary_source = ordinary_source.cut_to_len(
+                formatter=formatter,
+                name="text",
+                max_len=max_seq_length,
+            )
+            ordinary_rows = []
+            for row in ordinary_source.as_list(formatter):
+                tokenized = tokenize_ordinary_text(row["text"], tokenizer, max_seq_length)
+                if tokenized is not None:
+                    ordinary_rows.append(tokenized)
+            stage2_steps = config["repair_ttft_total_steps"] - repair_ttft_stats["stage1_steps"]
+            mixed_rows, mixture_stats = build_stage_two_mixture(
+                ordinary_rows=ordinary_rows,
+                repair_rows=repair_rows,
+                total_steps=stage2_steps,
+                repair_fraction=config["repair_ttft_stage2_repair_fraction"],
+                seed=stable_seed_from_key(f"{key}:stage2:{effective_ttft_method}"),
+            )
+            repair_ttft_stats["stage2_steps"] = stage2_steps
+            repair_ttft_stats["stage2_mixture"] = mixture_stats
+
+            correction_started_at = time.perf_counter()
+            activate_adapter(model, "default", trainable=True)
+            model = FastLanguageModel.for_training(model, use_gradient_checkpointing=True)
+            with io.StringIO() as buf, redirect_stdout(buf), redirect_stderr(buf):
+                correction_trainer = UnslothFixedTrainer(
+                    model=model,
+                    tokenizer=tokenizer,
+                    data_collator=mixed_completion_collator(tokenizer),
+                    train_dataset=Dataset.from_list(mixed_rows),
+                    max_seq_length=max_seq_length,
+                    args=UnslothTrainingArguments(**train_args),
+                )
+                correction_stats = correction_trainer.train()
+                model = correction_trainer.accelerator.unwrap_model(
+                    model, keep_fp32_wrapper=False
+                )
+                del correction_trainer
+            correction_elapsed = time.perf_counter() - correction_started_at
+            timing_stats["repair_stage2_training_s"] += correction_elapsed
+            repair_ttft_stats["timing_s"]["stage2_training_s"] = correction_elapsed
+            repair_ttft_stats["stage2_train_stats"] = {
+                "global_step": int(correction_stats.global_step),
+                "training_loss": float(correction_stats.training_loss),
+            }
+            os.makedirs(config["repair_ttft_log_dir"], exist_ok=True)
+            with open(
+                os.path.join(config["repair_ttft_log_dir"], f"{_safe_path_key(key)}.json"),
+                "w",
+            ) as log_file:
+                json.dump(repair_ttft_stats, log_file, indent=2, sort_keys=True)
+                log_file.write("\n")
+            print(
+                f"[Rank {rank}] {key}: repair TTFT method={effective_ttft_method} "
+                f"stage1={repair_ttft_stats['stage1_steps']} "
+                f"stage2={stage2_steps} repairs={len(repair_rows)} "
+                f"mixture={mixture_stats}"
+            )
 
         opsd_stats = None
         if effective_ttft_method == "reduced_plus_sft_c":
