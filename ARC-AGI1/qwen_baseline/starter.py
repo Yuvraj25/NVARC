@@ -133,6 +133,7 @@ if __name__ == "__main__":
     parser.add_argument("--sglang-speculative-repeat-len", type=int, default=5)
     parser.add_argument("--sglang-dynamic-repeat", action="store_true")
     parser.add_argument("--dfs-prob-threshold", type=float, default=0.2)
+    parser.add_argument("--eval-color-permutations", type=int, default=2)
     parser.add_argument("--profile-timings", action="store_true")
     parser.add_argument(
         "--ttft-method",
@@ -189,6 +190,8 @@ if __name__ == "__main__":
         raise ValueError("--use-unsloth-multitoken-dfs is only supported by the Unsloth/HF worker")
     if args.unsloth_multitoken_repeat_len < 2:
         raise ValueError("--unsloth-multitoken-repeat-len must be at least 2")
+    if args.eval_color_permutations < 1:
+        raise ValueError("--eval-color-permutations must be positive")
     if args.opsd_min_train_pairs < 3:
         raise ValueError("--opsd-min-train-pairs must be at least 3")
     if args.opsd_color_permutations < 1:
@@ -222,6 +225,7 @@ if __name__ == "__main__":
     os.environ["ARC_SGLANG_SPECULATIVE_REPEAT_LEN"] = str(args.sglang_speculative_repeat_len)
     os.environ["ARC_SGLANG_DYNAMIC_REPEAT"] = "1" if args.sglang_dynamic_repeat else "0"
     os.environ["ARC_DFS_PROB_THRESHOLD"] = str(args.dfs_prob_threshold)
+    os.environ["ARC_EVAL_COLOR_PERMUTATIONS"] = str(args.eval_color_permutations)
     os.environ["ARC_PROFILE_TIMINGS"] = "1" if args.profile_timings else "0"
     os.environ["ARC_TEST_PATH"] = args.test_path
     os.environ["ARC_MODEL_PATH"] = args.model_path
@@ -273,6 +277,7 @@ if __name__ == "__main__":
         f"sglang_speculative_repeat_len={os.environ['ARC_SGLANG_SPECULATIVE_REPEAT_LEN']}",
         f"sglang_dynamic_repeat={os.environ['ARC_SGLANG_DYNAMIC_REPEAT']}",
         f"dfs_prob_threshold={os.environ['ARC_DFS_PROB_THRESHOLD']}",
+        f"eval_color_permutations={os.environ['ARC_EVAL_COLOR_PERMUTATIONS']}",
         f"profile_timings={os.environ['ARC_PROFILE_TIMINGS']}",
         f"test_path={os.environ['ARC_TEST_PATH']}",
         f"model_path={os.environ['ARC_MODEL_PATH']}",

@@ -73,6 +73,12 @@ def runtime_config():
         raise ValueError(
             f"ARC_OPSD_CROSS_VIEW_PROBABILITY must be in [0, 1], got {cross_view_probability}"
         )
+    eval_color_permutations = int(os.environ.get("ARC_EVAL_COLOR_PERMUTATIONS", "2"))
+    if eval_color_permutations < 1:
+        raise ValueError(
+            "ARC_EVAL_COLOR_PERMUTATIONS must be positive, "
+            f"got {eval_color_permutations}"
+        )
     return {
         "use_speculative_dfs": _env_flag("ARC_USE_SPECULATIVE_DFS", default=False),
         "use_unsloth_multitoken_dfs": _env_flag("ARC_USE_UNSLOTH_MULTITOKEN_DFS", default=False),
@@ -80,6 +86,7 @@ def runtime_config():
         "use_sglang": _env_flag("ARC_USE_SGLANG", default=False),
         "profile_timings": _env_flag("ARC_PROFILE_TIMINGS", default=False),
         "dfs_prob_threshold": dfs_prob_threshold,
+        "eval_color_permutations": eval_color_permutations,
         "model_path": os.environ.get("ARC_MODEL_PATH", "../input/qwen3_4b_grids15_sft139/"),
         "test_path": os.environ.get("ARC_TEST_PATH", "../input/arc-prize-2024/arc-agi_evaluation_challenges.json"),
         "output_dir": os.environ.get("ARC_OUTPUT_DIR", "../inference_outputs"),
@@ -329,7 +336,8 @@ def _build_eval_batches(eval_ds):
 
 def _prepare_eval_ds(puzzle_ds, formatter, max_seq_length: int, max_new_tokens: int):
     puzzle_ds_multi = puzzle_ds.split_multi_replies()
-    eval_ds = puzzle_ds_multi.augment(n=2, seed=2)
+    eval_color_permutations = int(os.environ.get("ARC_EVAL_COLOR_PERMUTATIONS", "2"))
+    eval_ds = puzzle_ds_multi.augment(n=eval_color_permutations, seed=2)
     eval_ds = eval_ds.cut_to_len(formatter=formatter, name="input", max_len=max_seq_length - max_new_tokens)
     return puzzle_ds_multi, eval_ds
 
@@ -1399,37 +1407,10 @@ def worker(rank, queue, end_time):
         print(f"[Rank {rank}] training stats for puzzle {key}: {stats}")
 
         puzzle_ds_multi = puzzle_ds.split_multi_replies()
-        eval_ds = puzzle_ds_multi.augment(n=2, seed=2)
+        eval_ds = puzzle_ds_multi.augment(n=config["eval_color_permutations"], seed=2)
         eval_ds = eval_ds.cut_to_len(formatter=formatter, name="input", max_len=max_seq_length - max_new_tokens)
         timing_stats["eval_prep_s"] += time.perf_counter() - prep_started_at
-
-        test_id_to_subkeys = defaultdict(list)
-        for subkey in sorted(eval_ds.keys):
-            test_id = subkey.split(".")[0].split("_")[1]
-            test_id_to_subkeys[test_id].append(subkey)
-
-        batches = []
-        for test_id, subkeys in test_id_to_subkeys.items():
-            batch = []
-            for offset in [0, 4]:
-                batch.extend(subkeys[offset : offset + 2])
-            batches.append(batch)
-
-            batch = []
-            for offset in [2, 6]:
-                batch.extend(subkeys[offset : offset + 2])
-            batches.append(batch)
-
-        for test_id, subkeys in test_id_to_subkeys.items():
-            batch = []
-            for offset in [8, 12]:
-                batch.extend(subkeys[offset : offset + 2])
-            batches.append(batch)
-
-            batch = []
-            for offset in [10, 14]:
-                batch.extend(subkeys[offset : offset + 2])
-            batches.append(batch)
+        batches = _build_eval_batches(eval_ds)
 
         if config["fixed_candidate_dir"]:
             print(f"[Rank {rank}] rescoring fixed candidate pool for {key}")
