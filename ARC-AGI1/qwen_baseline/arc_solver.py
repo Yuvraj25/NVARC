@@ -296,18 +296,32 @@ def _path_size_bytes(path: str) -> int:
     return total
 
 
-def _build_eval_batches(eval_ds):
+def _build_eval_batches(eval_ds, tokenizer=None, formatter=None):
     test_id_to_subkeys = defaultdict(list)
     for subkey in sorted(eval_ds.keys):
         test_id = subkey.split(".")[0].split("_")[1]
         test_id_to_subkeys[test_id].append(subkey)
 
     if any(len(subkeys) != 16 for subkeys in test_id_to_subkeys.values()):
-        return [
-            subkeys[offset : offset + 4]
-            for subkeys in test_id_to_subkeys.values()
-            for offset in range(0, len(subkeys), 4)
-        ]
+        if tokenizer is None or formatter is None:
+            raise ValueError(
+                "Non-16-view inference requires tokenizer-aware batching so "
+                "each DFS prefill batch has equal-length prompts"
+            )
+        batches = []
+        for _test_id, subkeys in test_id_to_subkeys.items():
+            length_to_subkeys = defaultdict(list)
+            for subkey in subkeys:
+                data = eval_ds.get(subkey, formatter)
+                token_length = len(tokenizer.encode(data["input"]))
+                length_to_subkeys[token_length].append(subkey)
+            for token_length in sorted(length_to_subkeys):
+                matching_subkeys = length_to_subkeys[token_length]
+                batches.extend(
+                    matching_subkeys[offset : offset + 4]
+                    for offset in range(0, len(matching_subkeys), 4)
+                )
+        return batches
 
     batches = []
     for _test_id, subkeys in test_id_to_subkeys.items():
@@ -428,7 +442,7 @@ def _run_sglang_batches(
     timing_stats,
     count_stats,
 ):
-    batches = _build_eval_batches(eval_ds)
+    batches = _build_eval_batches(eval_ds, tokenizer=tokenizer, formatter=formatter)
     known_scores = {}
     rescorers = {}
 
@@ -1410,7 +1424,7 @@ def worker(rank, queue, end_time):
         eval_ds = puzzle_ds_multi.augment(n=config["eval_color_permutations"], seed=2)
         eval_ds = eval_ds.cut_to_len(formatter=formatter, name="input", max_len=max_seq_length - max_new_tokens)
         timing_stats["eval_prep_s"] += time.perf_counter() - prep_started_at
-        batches = _build_eval_batches(eval_ds)
+        batches = _build_eval_batches(eval_ds, tokenizer=tokenizer, formatter=formatter)
 
         if config["fixed_candidate_dir"]:
             print(f"[Rank {rank}] rescoring fixed candidate pool for {key}")
