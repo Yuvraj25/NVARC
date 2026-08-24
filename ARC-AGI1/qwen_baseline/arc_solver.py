@@ -42,6 +42,7 @@ from arc_selected_augmentations import load_selected_augmentations, prepare_sele
 from arc_sglang import ArcSglangBackend, SglangConfig, SglangRescorer, inference_sglang_dfs, inference_sglang_speculative_dfs
 from arc_search import ASSISTANT_TOKEN_ID, EOS_ID, USER_TOKEN_ID, default_max_score, inference_turbo_dfs
 from arc_search_multitoken import inference_turbo_dfs_multitoken
+from arc_scheduled_sampling import make_one_pass_scheduled_sampling_trainer_class
 
 logging.disable(logging.WARNING)
 
@@ -61,6 +62,7 @@ def runtime_config():
     ttft_method = os.environ.get("ARC_TTFT_METHOD", "full_sft")
     valid_ttft_methods = {
         "full_sft",
+        "one_pass_ss",
         "reduced_sft",
         "reduced_plus_sft_c",
         "reduced_plus_opsd",
@@ -125,6 +127,15 @@ def runtime_config():
         ),
         "repair_ttft_warm_views_per_pair": int(
             os.environ.get("ARC_REPAIR_TTFT_WARM_VIEWS_PER_PAIR", "8")
+        ),
+        "scheduled_sampling_warmup_steps": int(
+            os.environ.get("ARC_SCHEDULED_SAMPLING_WARMUP_STEPS", "32")
+        ),
+        "scheduled_sampling_mix_probability": float(
+            os.environ.get("ARC_SCHEDULED_SAMPLING_MIX_PROBABILITY", "0.5")
+        ),
+        "scheduled_sampling_log_dir": os.environ.get(
+            "ARC_SCHEDULED_SAMPLING_LOG_DIR", "../scheduled_sampling_logs"
         ),
         "fixed_candidate_dir": os.environ.get("ARC_FIXED_CANDIDATE_DIR"),
         "selected_augmentations_path": os.environ.get("ARC_SELECTED_AUGMENTATIONS_PATH"),
@@ -1057,6 +1068,9 @@ def worker(rank, queue, end_time):
     FastLanguageModel = training_stack["FastLanguageModel"]
     UnslothTrainingArguments = training_stack["UnslothTrainingArguments"]
     UnslothFixedTrainer = training_stack["UnslothFixedTrainer"]
+    OnePassScheduledSamplingTrainer = make_one_pass_scheduled_sampling_trainer_class(
+        UnslothFixedTrainer
+    )
     QwenDataCollatorForCompletionOnlyLM = training_stack["QwenDataCollatorForCompletionOnlyLM"]
     get_peft_model_state_dict = training_stack["get_peft_model_state_dict"]
     set_peft_model_state_dict = training_stack["set_peft_model_state_dict"]
@@ -1126,7 +1140,12 @@ def worker(rank, queue, end_time):
         num_train_pairs = len(puzzle_ds.queries[key]["train"])
         effective_ttft_method = config["ttft_method"]
         opsd_split = None
-        if effective_ttft_method != "full_sft" and num_train_pairs < config["opsd_min_train_pairs"]:
+        if effective_ttft_method in {
+            "reduced_sft",
+            "reduced_plus_sft_c",
+            "reduced_plus_opsd",
+            "loo_repair_mix",
+        } and num_train_pairs < config["opsd_min_train_pairs"]:
             print(
                 f"[Rank {rank}] {key}: falling back to full_sft because it has "
                 f"{num_train_pairs} training pairs (< {config['opsd_min_train_pairs']})"
@@ -1183,7 +1202,21 @@ def worker(rank, queue, end_time):
 
         training_started_at = time.perf_counter()
         with io.StringIO() as buf, redirect_stdout(buf), redirect_stderr(buf):
-            trainer = UnslothFixedTrainer(
+            trainer_class = (
+                OnePassScheduledSamplingTrainer
+                if effective_ttft_method == "one_pass_ss"
+                else UnslothFixedTrainer
+            )
+            trainer_kwargs = {}
+            if effective_ttft_method == "one_pass_ss":
+                trainer_kwargs = {
+                    "scheduled_sampling_warmup_steps": config["scheduled_sampling_warmup_steps"],
+                    "scheduled_sampling_mix_probability": config[
+                        "scheduled_sampling_mix_probability"
+                    ],
+                    "scheduled_sampling_seed": stable_seed_from_key(f"{key}:one-pass-ss"),
+                }
+            trainer = trainer_class(
                 model=model,
                 tokenizer=tokenizer,
                 data_collator=collator,
@@ -1191,12 +1224,42 @@ def worker(rank, queue, end_time):
                 dataset_text_field="text",
                 max_seq_length=max_seq_length,
                 args=UnslothTrainingArguments(**train_args),
+                **trainer_kwargs,
             )
 
             stats = trainer.train()
+            scheduled_sampling_stats = (
+                trainer.scheduled_sampling_summary()
+                if effective_ttft_method == "one_pass_ss"
+                else None
+            )
             model = trainer.accelerator.unwrap_model(model, keep_fp32_wrapper=False)
             del trainer
         timing_stats["training_s"] += time.perf_counter() - training_started_at
+
+        if scheduled_sampling_stats is not None:
+            scheduled_sampling_stats.update(
+                {
+                    "puzzle_key": key,
+                    "num_train_pairs": num_train_pairs,
+                    "training_s": timing_stats["training_s"],
+                    "trainer_global_step": int(stats.global_step),
+                    "trainer_training_loss": float(stats.training_loss),
+                }
+            )
+            os.makedirs(config["scheduled_sampling_log_dir"], exist_ok=True)
+            with open(
+                os.path.join(config["scheduled_sampling_log_dir"], f"{_safe_path_key(key)}.json"),
+                "w",
+            ) as log_file:
+                json.dump(scheduled_sampling_stats, log_file, indent=2, sort_keys=True)
+                log_file.write("\n")
+            print(
+                f"[Rank {rank}] {key}: one-pass SS "
+                f"steps={scheduled_sampling_stats['scheduled_sampling_steps']} "
+                f"digit_accuracy={scheduled_sampling_stats['teacher_forced_digit_accuracy']} "
+                f"changed_fraction={scheduled_sampling_stats['realized_change_fraction']}"
+            )
 
         if effective_ttft_method in REPAIR_TTFT_METHODS:
             mining_started_at = time.perf_counter()

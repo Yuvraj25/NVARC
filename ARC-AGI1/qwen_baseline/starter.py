@@ -139,6 +139,7 @@ if __name__ == "__main__":
         "--ttft-method",
         choices=[
             "full_sft",
+            "one_pass_ss",
             "reduced_sft",
             "reduced_plus_sft_c",
             "reduced_plus_opsd",
@@ -166,6 +167,9 @@ if __name__ == "__main__":
     parser.add_argument("--repair-ttft-loo-heldout-views", type=int, default=16)
     parser.add_argument("--repair-ttft-loo-seen-views", type=int, default=4)
     parser.add_argument("--repair-ttft-warm-views-per-pair", type=int, default=8)
+    parser.add_argument("--scheduled-sampling-warmup-steps", type=int, default=32)
+    parser.add_argument("--scheduled-sampling-mix-probability", type=float, default=0.5)
+    parser.add_argument("--scheduled-sampling-log-dir", type=str, default="../scheduled_sampling_logs")
     args = parser.parse_args()
     if args.sglang_train_adapters_only and args.sglang_reuse_adapters:
         raise ValueError("--sglang-train-adapters-only and --sglang-reuse-adapters are mutually exclusive")
@@ -204,6 +208,10 @@ if __name__ == "__main__":
         raise ValueError("--repair-ttft-total-steps must remain 128 for the controlled experiment")
     if not 0.0 <= args.repair_ttft_stage2_repair_fraction <= 1.0:
         raise ValueError("--repair-ttft-stage2-repair-fraction must be in [0, 1]")
+    if args.scheduled_sampling_warmup_steps < 0:
+        raise ValueError("--scheduled-sampling-warmup-steps must be non-negative")
+    if not 0.0 <= args.scheduled_sampling_mix_probability <= 1.0:
+        raise ValueError("--scheduled-sampling-mix-probability must be in [0, 1]")
     end_time = args.end_time if args.end_time is not None else time.time() + 12 * 3600
     os.environ["ARC_USE_SPECULATIVE_DFS"] = "1" if args.use_speculative_dfs else "0"
     os.environ["ARC_USE_UNSLOTH_MULTITOKEN_DFS"] = "1" if args.use_unsloth_multitoken_dfs else "0"
@@ -260,6 +268,13 @@ if __name__ == "__main__":
     os.environ["ARC_REPAIR_TTFT_WARM_VIEWS_PER_PAIR"] = str(
         args.repair_ttft_warm_views_per_pair
     )
+    os.environ["ARC_SCHEDULED_SAMPLING_WARMUP_STEPS"] = str(
+        args.scheduled_sampling_warmup_steps
+    )
+    os.environ["ARC_SCHEDULED_SAMPLING_MIX_PROBABILITY"] = str(
+        args.scheduled_sampling_mix_probability
+    )
+    os.environ["ARC_SCHEDULED_SAMPLING_LOG_DIR"] = args.scheduled_sampling_log_dir
     print(
         "runtime flags:",
         f"speculative_dfs={os.environ['ARC_USE_SPECULATIVE_DFS']}",
@@ -294,6 +309,9 @@ if __name__ == "__main__":
         f"opsd_temperature={os.environ['ARC_OPSD_TEMPERATURE']}",
         f"opsd_top_p={os.environ['ARC_OPSD_TOP_P']}",
         f"opsd_lambda_ce={os.environ['ARC_OPSD_LAMBDA_CE']}",
+        f"scheduled_sampling_warmup_steps={os.environ['ARC_SCHEDULED_SAMPLING_WARMUP_STEPS']}",
+        f"scheduled_sampling_mix_probability={os.environ['ARC_SCHEDULED_SAMPLING_MIX_PROBABILITY']}",
+        f"scheduled_sampling_log_dir={os.environ['ARC_SCHEDULED_SAMPLING_LOG_DIR']}",
     )
 
     if args.use_unsloth_multitoken_dfs:
