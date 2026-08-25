@@ -131,6 +131,9 @@ def runtime_config():
         "scheduled_sampling_warmup_steps": int(
             os.environ.get("ARC_SCHEDULED_SAMPLING_WARMUP_STEPS", "32")
         ),
+        "scheduled_sampling_total_steps": int(
+            os.environ.get("ARC_SCHEDULED_SAMPLING_TOTAL_STEPS", "128")
+        ),
         "scheduled_sampling_mix_probability": float(
             os.environ.get("ARC_SCHEDULED_SAMPLING_MIX_PROBABILITY", "0.5")
         ),
@@ -1209,6 +1212,18 @@ def worker(rank, queue, end_time):
             )
             trainer_kwargs = {}
             if effective_ttft_method == "one_pass_ss":
+                if not (
+                    0 <= config["scheduled_sampling_warmup_steps"]
+                    < config["scheduled_sampling_total_steps"]
+                    <= len(train_rows)
+                ):
+                    raise ValueError(
+                        "One-pass scheduled-sampling steps must satisfy "
+                        "0 <= warmup < total <= available training rows; got "
+                        f"warmup={config['scheduled_sampling_warmup_steps']}, "
+                        f"total={config['scheduled_sampling_total_steps']}, "
+                        f"rows={len(train_rows)}"
+                    )
                 trainer_kwargs = {
                     "scheduled_sampling_warmup_steps": config["scheduled_sampling_warmup_steps"],
                     "scheduled_sampling_mix_probability": config[
@@ -1216,6 +1231,9 @@ def worker(rank, queue, end_time):
                     ],
                     "scheduled_sampling_seed": stable_seed_from_key(f"{key}:one-pass-ss"),
                 }
+            initial_train_args = dict(train_args)
+            if effective_ttft_method == "one_pass_ss":
+                initial_train_args["max_steps"] = config["scheduled_sampling_total_steps"]
             trainer = trainer_class(
                 model=model,
                 tokenizer=tokenizer,
@@ -1223,7 +1241,7 @@ def worker(rank, queue, end_time):
                 train_dataset=Dataset.from_list(train_rows),
                 dataset_text_field="text",
                 max_seq_length=max_seq_length,
-                args=UnslothTrainingArguments(**train_args),
+                args=UnslothTrainingArguments(**initial_train_args),
                 **trainer_kwargs,
             )
 

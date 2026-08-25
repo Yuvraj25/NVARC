@@ -168,6 +168,7 @@ if __name__ == "__main__":
     parser.add_argument("--repair-ttft-loo-seen-views", type=int, default=4)
     parser.add_argument("--repair-ttft-warm-views-per-pair", type=int, default=8)
     parser.add_argument("--scheduled-sampling-warmup-steps", type=int, default=32)
+    parser.add_argument("--scheduled-sampling-total-steps", type=int, default=128)
     parser.add_argument("--scheduled-sampling-mix-probability", type=float, default=0.5)
     parser.add_argument("--scheduled-sampling-log-dir", type=str, default="../scheduled_sampling_logs")
     args = parser.parse_args()
@@ -210,6 +211,16 @@ if __name__ == "__main__":
         raise ValueError("--repair-ttft-stage2-repair-fraction must be in [0, 1]")
     if args.scheduled_sampling_warmup_steps < 0:
         raise ValueError("--scheduled-sampling-warmup-steps must be non-negative")
+    if args.scheduled_sampling_total_steps < 1:
+        raise ValueError("--scheduled-sampling-total-steps must be positive")
+    if (
+        args.ttft_method == "one_pass_ss"
+        and args.scheduled_sampling_warmup_steps >= args.scheduled_sampling_total_steps
+    ):
+        raise ValueError(
+            "--scheduled-sampling-warmup-steps must be smaller than "
+            "--scheduled-sampling-total-steps"
+        )
     if not 0.0 <= args.scheduled_sampling_mix_probability <= 1.0:
         raise ValueError("--scheduled-sampling-mix-probability must be in [0, 1]")
     end_time = args.end_time if args.end_time is not None else time.time() + 12 * 3600
@@ -271,6 +282,9 @@ if __name__ == "__main__":
     os.environ["ARC_SCHEDULED_SAMPLING_WARMUP_STEPS"] = str(
         args.scheduled_sampling_warmup_steps
     )
+    os.environ["ARC_SCHEDULED_SAMPLING_TOTAL_STEPS"] = str(
+        args.scheduled_sampling_total_steps
+    )
     os.environ["ARC_SCHEDULED_SAMPLING_MIX_PROBABILITY"] = str(
         args.scheduled_sampling_mix_probability
     )
@@ -310,6 +324,7 @@ if __name__ == "__main__":
         f"opsd_top_p={os.environ['ARC_OPSD_TOP_P']}",
         f"opsd_lambda_ce={os.environ['ARC_OPSD_LAMBDA_CE']}",
         f"scheduled_sampling_warmup_steps={os.environ['ARC_SCHEDULED_SAMPLING_WARMUP_STEPS']}",
+        f"scheduled_sampling_total_steps={os.environ['ARC_SCHEDULED_SAMPLING_TOTAL_STEPS']}",
         f"scheduled_sampling_mix_probability={os.environ['ARC_SCHEDULED_SAMPLING_MIX_PROBABILITY']}",
         f"scheduled_sampling_log_dir={os.environ['ARC_SCHEDULED_SAMPLING_LOG_DIR']}",
     )
