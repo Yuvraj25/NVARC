@@ -37,6 +37,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--expected-world-size", type=int, default=4)
     parser.add_argument("--seed", type=int, default=20260815)
+    parser.add_argument(
+        "--canon-ac",
+        action="store_true",
+        help="Add zero-initialized residual Canon modules at A and C.",
+    )
+    parser.add_argument("--canon-kernel-size", type=int, default=4)
+    parser.add_argument(
+        "--canon-only-warmup-fraction",
+        type=float,
+        default=0.30,
+        help="Fraction of the one-epoch curriculum trained with only Canon unfrozen.",
+    )
     return parser.parse_args()
 
 
@@ -60,6 +72,16 @@ def nll_summary(values: list[float]) -> dict[str, float]:
         "max": float(array.max()),
         "mean": float(array.mean()),
     }
+
+
+def parameter_l2(parameters) -> float:
+    import torch
+
+    total = torch.zeros((), dtype=torch.float64)
+    with torch.no_grad():
+        for parameter in parameters:
+            total += parameter.detach().double().cpu().square().sum()
+    return float(total.sqrt().item())
 
 
 def score_tokenized_examples(
@@ -188,6 +210,12 @@ def main() -> None:
     from unsloth import FastLanguageModel, UnslothTrainer, UnslothTrainingArguments
 
     from arc_solver import _make_unsloth_fixed_trainer_class
+    from arc_canon import (
+        add_canon_ac_modules,
+        canon_parameters,
+        install_canon_ac_training_hooks,
+        save_canon_state,
+    )
     from global_eval_curriculum import (
         build_exact_curriculum_records,
         format_completion_record,
@@ -278,6 +306,24 @@ def main() -> None:
         f"device={next(model.parameters()).device}",
         flush=True,
     )
+
+    canon_hooks = None
+    if args.canon_ac:
+        if args.epochs != 1.0:
+            raise ValueError("The first staged Canon experiment requires --epochs 1.0")
+        if not 0.0 < args.canon_only_warmup_fraction < 1.0:
+            raise ValueError("canon-only warmup fraction must lie strictly between zero and one")
+        add_canon_ac_modules(
+            model,
+            kernel_size=args.canon_kernel_size,
+            zero_init=True,
+        )
+        canon_hooks = install_canon_ac_training_hooks(model)
+        print(
+            f"[rank {rank}] installed residual Canon-AC "
+            f"kernel={args.canon_kernel_size} activation=none zero_init=true",
+            flush=True,
+        )
 
     formatted = [
         format_completion_record(record, tokenizer, max_seq_length=args.max_seq_length)
@@ -375,6 +421,16 @@ def main() -> None:
         original_config._name_or_path = original_name
     print(f"[rank {rank}] global LoRA offload={resolved_offload}", flush=True)
     adapter_before = summarize_lora_b(model)
+    joint_trainable_names = {
+        name for name, parameter in model.named_parameters() if parameter.requires_grad
+    }
+    if args.canon_ac:
+        for parameter in canon_parameters(model):
+            parameter.requires_grad = True
+        joint_trainable_names.update(
+            name for name, parameter in model.named_parameters() if parameter.requires_grad
+        )
+    canon_l2_before = parameter_l2(canon_parameters(model)) if args.canon_ac else None
     for _name, parameter in model.named_parameters():
         if parameter.dtype == torch.float32:
             parameter.data = parameter.data.to(torch.bfloat16)
@@ -386,48 +442,101 @@ def main() -> None:
             dataset = self.train_dataset if train_dataset is None else train_dataset
             return SequentialSampler(dataset)
 
-    trainer = SequentialCurriculumTrainer(
-        model=model,
-        tokenizer=tokenizer,
-        data_collator=completion_collator(tokenizer),
-        train_dataset=Dataset.from_list(ordered_tokenized),
-        max_seq_length=args.max_seq_length,
-        args=UnslothTrainingArguments(
-            output_dir=str(args.output_dir / "trainer_output"),
-            per_device_train_batch_size=1,
-            gradient_accumulation_steps=args.gradient_accumulation_steps,
-            num_train_epochs=args.epochs,
-            warmup_ratio=0.05,
-            max_grad_norm=1.0,
-            learning_rate=args.learning_rate,
-            optim="adamw_torch",
-            weight_decay=0.0,
-            lr_scheduler_type="cosine",
-            seed=args.seed,
-            data_seed=args.seed,
-            report_to="none",
-            save_strategy="no",
-            eval_strategy="no",
-            logging_steps=10,
-            fp16=False,
-            bf16=True,
-            gradient_checkpointing=True,
-            gradient_checkpointing_kwargs={"use_reentrant": False},
-            ddp_find_unused_parameters=False,
-        ),
-    )
-    if trainer.accelerator.num_processes != world_size:
-        raise RuntimeError(
-            f"Trainer world size {trainer.accelerator.num_processes} != {world_size}"
+    def train_stage(stage_name: str, rows: list[dict[str, Any]]):
+        trainer = SequentialCurriculumTrainer(
+            model=model,
+            tokenizer=tokenizer,
+            data_collator=completion_collator(tokenizer),
+            train_dataset=Dataset.from_list(rows),
+            max_seq_length=args.max_seq_length,
+            args=UnslothTrainingArguments(
+                output_dir=str(args.output_dir / f"trainer_output_{stage_name}"),
+                per_device_train_batch_size=1,
+                gradient_accumulation_steps=args.gradient_accumulation_steps,
+                num_train_epochs=1.0 if args.canon_ac else args.epochs,
+                warmup_ratio=0.05,
+                max_grad_norm=1.0,
+                learning_rate=args.learning_rate,
+                optim="adamw_torch",
+                weight_decay=0.0,
+                lr_scheduler_type="cosine",
+                seed=args.seed,
+                data_seed=args.seed,
+                report_to="none",
+                save_strategy="no",
+                eval_strategy="no",
+                logging_steps=10,
+                fp16=False,
+                bf16=True,
+                gradient_checkpointing=True,
+                gradient_checkpointing_kwargs={"use_reentrant": False},
+                ddp_find_unused_parameters=False,
+            ),
         )
+        if trainer.accelerator.num_processes != world_size:
+            raise RuntimeError(
+                f"Trainer world size {trainer.accelerator.num_processes} != {world_size}"
+            )
+        stage_started = time.perf_counter()
+        stage_stats = trainer.train()
+        elapsed = time.perf_counter() - stage_started
+        unwrapped = trainer.accelerator.unwrap_model(model, keep_fp32_wrapper=False)
+        del trainer
+        return unwrapped, stage_stats, elapsed
+
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats(device=f"cuda:{local_rank}")
     training_started = time.perf_counter()
-    stats = trainer.train()
+    stage_metrics = []
+    if args.canon_ac:
+        split = max(
+            1,
+            min(
+                len(ordered_tokenized) - 1,
+                round(len(ordered_tokenized) * args.canon_only_warmup_fraction),
+            ),
+        )
+        for name, parameter in model.named_parameters():
+            parameter.requires_grad = ".canonA." in name or ".canonC." in name
+        model, warmup_stats, warmup_seconds = train_stage(
+            "canon_only",
+            ordered_tokenized[:split],
+        )
+        stage_metrics.append(
+            {
+                "name": "canon_only",
+                "records": split,
+                "seconds": warmup_seconds,
+                "metrics": dict(warmup_stats.metrics),
+            }
+        )
+        for name, parameter in model.named_parameters():
+            parameter.requires_grad = name in joint_trainable_names
+        model, joint_stats, joint_seconds = train_stage(
+            "canon_plus_lora",
+            ordered_tokenized[split:],
+        )
+        stage_metrics.append(
+            {
+                "name": "canon_plus_lora",
+                "records": len(ordered_tokenized) - split,
+                "seconds": joint_seconds,
+                "metrics": dict(joint_stats.metrics),
+            }
+        )
+        stats = joint_stats
+    else:
+        model, stats, vanilla_seconds = train_stage("global_lora", ordered_tokenized)
+        stage_metrics.append(
+            {
+                "name": "global_lora",
+                "records": len(ordered_tokenized),
+                "seconds": vanilla_seconds,
+                "metrics": dict(stats.metrics),
+            }
+        )
     training_seconds = time.perf_counter() - training_started
     peak_cuda_gib = torch.cuda.max_memory_allocated(local_rank) / 2**30
-    model = trainer.accelerator.unwrap_model(model, keep_fp32_wrapper=False)
-    del trainer
     adapter_after = summarize_lora_b(model)
     if not math.isfinite(float(adapter_after["l2"])) or abs(
         float(adapter_after["l2"]) - float(adapter_before["l2"])
@@ -439,6 +548,8 @@ def main() -> None:
         adapter_dir = args.output_dir / "adapter"
         model.save_pretrained(adapter_dir)
         tokenizer.save_pretrained(adapter_dir)
+        if args.canon_ac:
+            save_canon_state(model, adapter_dir / "canon_ac.pt")
     if world_size > 1:
         torch.distributed.barrier()
 
@@ -480,6 +591,14 @@ def main() -> None:
                 "repair_adapter_merged_before_scoring": True,
                 "fresh_global_lora_rank": args.lora_rank,
                 "fresh_global_modules_to_save": ["embed_tokens", "lm_head"],
+                "canon_ac": args.canon_ac,
+                "canon_kernel_size": args.canon_kernel_size if args.canon_ac else None,
+                "canon_activation": None,
+                "canon_residual": args.canon_ac,
+                "canon_l2_before": canon_l2_before,
+                "canon_l2_after": (
+                    parameter_l2(canon_parameters(model)) if args.canon_ac else None
+                ),
             },
             "environment": {
                 "torch": torch.__version__,
@@ -495,6 +614,7 @@ def main() -> None:
             },
             "peak_train_cuda_gib": peak_cuda_gib,
             "train_metrics": dict(stats.metrics),
+            "train_stages": stage_metrics,
         }
         (args.output_dir / "global_eval_curriculum_manifest.json").write_text(
             json.dumps(manifest, indent=2, sort_keys=True, default=str)
@@ -503,7 +623,10 @@ def main() -> None:
 
     shutil.rmtree(offload_root, ignore_errors=True)
     if is_main:
-        shutil.rmtree(args.output_dir / "trainer_output", ignore_errors=True)
+        for path in args.output_dir.glob("trainer_output_*"):
+            shutil.rmtree(path, ignore_errors=True)
+    if canon_hooks is not None:
+        canon_hooks.remove()
     if world_size > 1:
         torch.distributed.barrier()
         torch.distributed.destroy_process_group()

@@ -35,6 +35,11 @@ def _iter_cache_tensors(cache):
     if isinstance(cache, torch.Tensor):
         yield cache
         return
+    if hasattr(cache, "kv") and hasattr(cache, "canon"):
+        yield from _iter_cache_tensors(cache.kv)
+        yield from _iter_cache_tensors(cache.canon.a)
+        yield from _iter_cache_tensors(cache.canon.c)
+        return
     if isinstance(cache, (tuple, list)):
         for item in cache:
             yield from _iter_cache_tensors(item)
@@ -107,13 +112,27 @@ def turbo_dfs(model, logits, max_new_tokens, max_score, scores, pos, cache, star
 
         cache_fp = _cache_fingerprint(cache) if ASSERT_IMMUTABLE_DFS_CACHE else None
 
-        outputs = model(
-            input_ids=torch.tensor(batch_tokens, device=model.device, dtype=torch.long).view(-1, 1),
-            position_ids=torch.full((n, 1), pos, device=model.device),
-            past_key_values=cache,
-            return_dict=True,
-            use_cache=True,
-        )
+        step_input_ids = torch.tensor(
+            batch_tokens, device=model.device, dtype=torch.long
+        ).view(-1, 1)
+        step_position_ids = torch.full((n, 1), pos, device=model.device)
+        if hasattr(model, "_arc_canon_enabled"):
+            from arc_canon import canon_cached_step
+
+            outputs = canon_cached_step(
+                model,
+                input_ids=step_input_ids,
+                position_ids=step_position_ids,
+                cache=cache,
+            )
+        else:
+            outputs = model(
+                input_ids=step_input_ids,
+                position_ids=step_position_ids,
+                past_key_values=cache,
+                return_dict=True,
+                use_cache=True,
+            )
 
         if ASSERT_IMMUTABLE_DFS_CACHE:
             updated_fp = _cache_fingerprint(cache)
@@ -142,7 +161,13 @@ def turbo_dfs(model, logits, max_new_tokens, max_score, scores, pos, cache, star
 @torch.no_grad()
 def inference_turbo_dfs(model, prefix_tokens, max_new_tokens, max_score, end_time):
     input_ids = torch.tensor(prefix_tokens, device=model.device, dtype=torch.long)
-    outputs = model(input_ids=input_ids, return_dict=True, use_cache=True)
+    if hasattr(model, "_arc_canon_enabled"):
+        from arc_canon import canon_prefill
+
+        outputs, initial_cache = canon_prefill(model, input_ids)
+    else:
+        outputs = model(input_ids=input_ids, return_dict=True, use_cache=True)
+        initial_cache = outputs.past_key_values
     suffixes = turbo_dfs(
         model,
         logits=outputs.logits[:, -1],
@@ -150,7 +175,7 @@ def inference_turbo_dfs(model, prefix_tokens, max_new_tokens, max_score, end_tim
         max_score=max_score,
         scores=[0.0] * input_ids.size(0),
         pos=input_ids.size(1),
-        cache=outputs.past_key_values,
+        cache=initial_cache,
         start_time=time.time(),
         end_time=end_time,
     )

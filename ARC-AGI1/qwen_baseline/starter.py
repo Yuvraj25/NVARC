@@ -171,6 +171,12 @@ if __name__ == "__main__":
     parser.add_argument("--scheduled-sampling-total-steps", type=int, default=128)
     parser.add_argument("--scheduled-sampling-mix-probability", type=float, default=0.5)
     parser.add_argument("--scheduled-sampling-log-dir", type=str, default="../scheduled_sampling_logs")
+    parser.add_argument(
+        "--canon-ac-state",
+        type=str,
+        default=None,
+        help="Path to canon_ac.pt produced by staged global Canon training.",
+    )
     args = parser.parse_args()
     if args.sglang_train_adapters_only and args.sglang_reuse_adapters:
         raise ValueError("--sglang-train-adapters-only and --sglang-reuse-adapters are mutually exclusive")
@@ -193,6 +199,10 @@ if __name__ == "__main__":
         raise ValueError("Reduced-pair TTFT methods are only supported by the Unsloth/HF worker")
     if args.use_unsloth_multitoken_dfs and args.use_sglang:
         raise ValueError("--use-unsloth-multitoken-dfs is only supported by the Unsloth/HF worker")
+    if args.canon_ac_state and args.use_unsloth_multitoken_dfs:
+        raise ValueError("The initial Canon-AC experiment uses one-token DFS, not speculative DFS")
+    if args.canon_ac_state and args.use_sglang:
+        raise ValueError("Canon-AC is initially supported only by the Unsloth/HF worker")
     if args.unsloth_multitoken_repeat_len < 2:
         raise ValueError("--unsloth-multitoken-repeat-len must be at least 2")
     if args.eval_color_permutations < 1:
@@ -289,6 +299,10 @@ if __name__ == "__main__":
         args.scheduled_sampling_mix_probability
     )
     os.environ["ARC_SCHEDULED_SAMPLING_LOG_DIR"] = args.scheduled_sampling_log_dir
+    if args.canon_ac_state is not None:
+        os.environ["ARC_CANON_AC_STATE"] = args.canon_ac_state
+    else:
+        os.environ.pop("ARC_CANON_AC_STATE", None)
     print(
         "runtime flags:",
         f"speculative_dfs={os.environ['ARC_USE_SPECULATIVE_DFS']}",
@@ -327,6 +341,7 @@ if __name__ == "__main__":
         f"scheduled_sampling_total_steps={os.environ['ARC_SCHEDULED_SAMPLING_TOTAL_STEPS']}",
         f"scheduled_sampling_mix_probability={os.environ['ARC_SCHEDULED_SAMPLING_MIX_PROBABILITY']}",
         f"scheduled_sampling_log_dir={os.environ['ARC_SCHEDULED_SAMPLING_LOG_DIR']}",
+        f"canon_ac_state={os.environ.get('ARC_CANON_AC_STATE')}",
     )
 
     if args.use_unsloth_multitoken_dfs:

@@ -142,6 +142,7 @@ def runtime_config():
         ),
         "fixed_candidate_dir": os.environ.get("ARC_FIXED_CANDIDATE_DIR"),
         "selected_augmentations_path": os.environ.get("ARC_SELECTED_AUGMENTATIONS_PATH"),
+        "canon_ac_state": os.environ.get("ARC_CANON_AC_STATE"),
     }
 
 
@@ -1088,6 +1089,22 @@ def worker(rank, queue, end_time):
     )
     _restore_qwen_role_tokens(model, tokenizer)
 
+    canon_hooks = None
+    if config["canon_ac_state"]:
+        from arc_canon import (
+            add_canon_ac_modules,
+            install_canon_ac_training_hooks,
+            load_canon_state,
+        )
+
+        canon_path = os.path.abspath(config["canon_ac_state"])
+        if not os.path.isfile(canon_path):
+            raise FileNotFoundError(canon_path)
+        add_canon_ac_modules(model, kernel_size=4, zero_init=True)
+        load_canon_state(model, canon_path)
+        canon_hooks = install_canon_ac_training_hooks(model)
+        print(f"[Rank {rank}] loaded residual Canon-AC from {canon_path}", flush=True)
+
     model = FastLanguageModel.get_peft_model(model, **peft_params)
     for _name, param in model.named_parameters():
         if param.dtype == torch.float32:
@@ -1107,7 +1124,8 @@ def worker(rank, queue, end_time):
     print(
         f"[Rank {rank}] config: speculative_dfs={config['use_speculative_dfs']} "
         f"dfs_prob_threshold={config['dfs_prob_threshold']} "
-        f"ttft_method={config['ttft_method']} fixed_candidate_dir={config['fixed_candidate_dir']}"
+        f"ttft_method={config['ttft_method']} fixed_candidate_dir={config['fixed_candidate_dir']} "
+        f"canon_ac={config['canon_ac_state'] is not None}"
     )
     if config["ttft_method"] != "full_sft" and config["use_sglang"]:
         raise ValueError("Reduced-pair and OPSD TTFT modes require the gradient-capable Unsloth/HF worker")
@@ -1493,6 +1511,10 @@ def worker(rank, queue, end_time):
 
         prep_started_at = time.perf_counter()
         model = FastLanguageModel.for_inference(model)
+        if config["canon_ac_state"]:
+            from arc_canon import prepare_canon_inference
+
+            prepare_canon_inference(model)
         gc.collect()
         torch.cuda.empty_cache()
 
