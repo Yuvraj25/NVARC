@@ -400,7 +400,7 @@ def main() -> None:
 
     summary = {
         "puzzle_key": args.puzzle_key,
-        "subkey": row["key"],
+        "subkey": str(row["key"]),
         "prefix_tokens": len(prefix_ids),
         "reply_tokens": len(reply_ids),
         "positions_compared": len(reply_ids),

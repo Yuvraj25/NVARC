@@ -80,7 +80,7 @@ def _can_accept_repeat(logits, scores, remaining, repeat_tokens, active, max_sco
 
 def _bump(stats, name, value=1):
     if stats is not None:
-        stats[name] = stats.get(name, 0) + value
+        stats[name] = int(stats.get(name, 0)) + int(value)
 
 
 def turbo_dfs_multitoken(
