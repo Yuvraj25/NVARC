@@ -96,7 +96,7 @@ old_parts = [
     part for part in environment.get('PYTHONPATH', '').split(os.pathsep)
     if part and 'pip_install_unsloth_' not in part and 'flash_attention_' not in part
 ]
-environment.update({{
+environment.update({
     'PYTHONPATH': os.pathsep.join([
         str(FA2_ROOT), str(WRITABLE_UNSLOTH_PARENT), str(MODERN_UTILITY_ROOT), '/kaggle/working',
         str(WORK_CODE_DIR), *old_parts,
@@ -110,12 +110,12 @@ environment.update({{
     'TRITON_PTXAS_PATH': '/usr/local/cuda/bin/ptxas',
     'OMP_NUM_THREADS': '3',
     'PYTHONUNBUFFERED': '1',
-}})
+})
 gpu_names = subprocess.check_output(
     ['nvidia-smi', '--query-gpu=name', '--format=csv,noheader'], text=True
 ).strip().splitlines()
 if len(gpu_names) != 4 or any('L4' not in name for name in gpu_names):
-    raise RuntimeError(f'Expected four L4 GPUs, observed {{gpu_names}}')
+    raise RuntimeError(f'Expected four L4 GPUs, observed {gpu_names}')
 print('GPUs =', gpu_names)
 print('code =', CODE_ROOT)
 print('premerged model =', MODEL_PATH)
