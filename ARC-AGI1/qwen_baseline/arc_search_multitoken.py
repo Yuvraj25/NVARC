@@ -172,6 +172,12 @@ def turbo_dfs_multitoken(
         if draft_len > 1 and consumed == 1:
             _bump(stats, "zero_extra_blocks")
         cache_len = pos + consumed
+        # A depth-first call can remain on the Python stack for hundreds of
+        # output tokens.  Do not let that stack retain the complete q-token
+        # result (full-vocabulary logits plus every Canon prefix snapshot) at
+        # each depth.  Materialize only the accepted position required by the
+        # child before releasing the block result.
+        child_logits = outputs.logits[:, consumed - 1].clone()
         if hasattr(model, "_arc_canon_enabled"):
             child_cache = _slice_canon_cache(
                 outputs.past_key_values,
@@ -180,9 +186,10 @@ def turbo_dfs_multitoken(
             )
         else:
             child_cache = _slice_cache(outputs.past_key_values, cache_len)
+        del outputs
         next_suffixes = turbo_dfs_multitoken(
             model=model,
-            logits=outputs.logits[:, consumed - 1],
+            logits=child_logits,
             max_new_tokens=max_new_tokens - consumed,
             max_score=max_score,
             scores=chain_scores,
