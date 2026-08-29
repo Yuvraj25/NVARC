@@ -34,6 +34,26 @@ class ResidualCanon1dTests(unittest.TestCase):
         incremental = torch.cat(pieces, dim=1)
         torch.testing.assert_close(incremental, full)
 
+    def test_cached_block_exposes_every_prefix_state(self):
+        torch.manual_seed(4)
+        layer = ResidualCanon1d(5, kernel_size=4, zero_init=False)
+        inputs = torch.randn(2, 6, 5)
+        parent = layer.initial_state(2, dtype=inputs.dtype, device=inputs.device)
+        block_output, prefix_states = layer.step_sequence(inputs, parent)
+
+        state = parent
+        pieces = []
+        expected_states = []
+        for index in range(inputs.shape[1]):
+            output, state = layer.step(inputs[:, index : index + 1], state)
+            pieces.append(output)
+            expected_states.append(state)
+
+        torch.testing.assert_close(block_output, torch.cat(pieces, dim=1))
+        self.assertEqual(len(prefix_states), inputs.shape[1])
+        for observed, expected in zip(prefix_states, expected_states):
+            torch.testing.assert_close(observed, expected)
+
     def test_sequence_boundary_blocks_previous_record(self):
         layer = ResidualCanon1d(1, kernel_size=2, zero_init=True)
         with torch.no_grad():

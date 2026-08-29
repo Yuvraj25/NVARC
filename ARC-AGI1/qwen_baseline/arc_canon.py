@@ -205,6 +205,33 @@ class ResidualCanon1d(nn.Module):
             next_state = torch.cat((current.unsqueeze(1), state[:, :-1]), dim=1)
         return output, next_state
 
+    def step_sequence(
+        self,
+        hidden_states: torch.Tensor,
+        state: torch.Tensor,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
+        """Apply Canon causally to a cached token block.
+
+        The returned states correspond to every accepted prefix of the block.
+        Multi-token DFS needs these snapshots because a q9 draft may accept
+        only its first ``m`` tokens before backtracking to a sibling.
+        """
+        if hidden_states.ndim != 3 or hidden_states.shape[-1] != self.hidden_size:
+            raise ValueError(
+                f"Expected [batch, sequence, {self.hidden_size}], got "
+                f"{tuple(hidden_states.shape)}"
+            )
+        outputs = []
+        states = []
+        current_state = state
+        for offset in range(hidden_states.shape[1]):
+            output, current_state = self.step(
+                hidden_states[:, offset : offset + 1], current_state
+            )
+            outputs.append(output)
+            states.append(current_state)
+        return torch.cat(outputs, dim=1), tuple(states)
+
 
 @dataclass(frozen=True)
 class CanonACState:
@@ -380,8 +407,11 @@ def save_canon_state(model: nn.Module, path: str | Path) -> None:
     torch.save(canon_state_dict(model), Path(path))
 
 
-def load_canon_state(model: nn.Module, path: str | Path) -> None:
-    payload = torch.load(Path(path), map_location="cpu", weights_only=True)
+def load_canon_state_dict(
+    model: nn.Module,
+    payload: dict[str, torch.Tensor],
+) -> None:
+    """Restore Canon weights from an in-memory CPU state dictionary."""
     expected = set(canon_state_dict(model))
     if set(payload) != expected:
         missing = sorted(expected - set(payload))
@@ -392,6 +422,11 @@ def load_canon_state(model: nn.Module, path: str | Path) -> None:
             module = getattr(layer, f"canon{site}")
             key = f"layers.{index}.canon{site}.weight"
             module.weight.data.copy_(payload[key].to(module.weight.device, module.weight.dtype))
+
+
+def load_canon_state(model: nn.Module, path: str | Path) -> None:
+    payload = torch.load(Path(path), map_location="cpu", weights_only=True)
+    load_canon_state_dict(model, payload)
 
 
 def captured_canon_ac_state(model: nn.Module) -> CanonACState:
@@ -463,9 +498,15 @@ def canon_cached_step(
     only recreates the lightweight decoder-block wiring so Canon can be placed
     immediately after both RMSNorm operations.
     """
-    if input_ids.ndim != 2 or input_ids.shape[1] != 1:
-        raise ValueError("Initial Canon DFS supports exactly one token per cached step")
-    from unsloth.models.llama import fast_rms_layernorm_inference, fast_swiglu_inference
+    if input_ids.ndim != 2 or input_ids.shape[1] < 1:
+        raise ValueError("Canon cached inference requires at least one token")
+    from unsloth.models.llama import (
+        dtype_from_config,
+        fast_rms_layernorm_inference,
+        fast_swiglu_inference,
+    )
+    from unsloth.models.qwen3 import Qwen3Attention_fast_forward_inference
+    from unsloth_zoo.utils import _get_dtype
 
     causal_lm, backbone = _causal_lm_and_backbone(model)
     layers = _decoder_layers(model)
@@ -475,47 +516,120 @@ def canon_cached_step(
         raise ValueError("Canon cache layer count does not match the decoder")
 
     hidden = backbone.embed_tokens(input_ids)
+    hidden = hidden.to(_get_dtype(dtype_from_config(causal_lm.config)))
+    batch_size, query_length, hidden_size = hidden.shape
+    intermediate_size = causal_lm.config.intermediate_size
+    residual = torch.empty(
+        (batch_size, query_length, hidden_size),
+        dtype=torch.float32,
+        device=hidden.device,
+    )
+    work = torch.empty(
+        (2, batch_size, query_length, hidden_size),
+        dtype=torch.float32,
+        device=hidden.device,
+    )
+    work_one, work_two = work[0], work[1]
+    variance = torch.empty(
+        (batch_size, query_length, 1),
+        dtype=torch.float32,
+        device=hidden.device,
+    )
+    mlp_work = torch.empty(
+        (2, batch_size, query_length, intermediate_size),
+        dtype=hidden.dtype,
+        device=hidden.device,
+    )
+    temp_gate, temp_up = mlp_work[0], mlp_work[1]
     next_kv = []
     next_a = []
     next_c = []
+    prefix_a = [[] for _ in range(query_length)]
+    prefix_c = [[] for _ in range(query_length)]
     for index, layer in enumerate(layers):
-        residual = hidden
-        normalized = fast_rms_layernorm_inference(layer.input_layernorm, hidden)
-        normalized, state_a = layer.canonA.step(normalized, cache.canon.a[index])
+        residual.copy_(hidden)
+        normalized = fast_rms_layernorm_inference(
+            layer.input_layernorm,
+            hidden,
+            XX=work_one,
+            XX2=work_two,
+            variance=variance,
+        )
+        normalized, states_a = layer.canonA.step_sequence(
+            normalized, cache.canon.a[index]
+        )
+        state_a = states_a[-1]
+        prior_key = cache.kv[index][0]
+        kv_sequence_length = prior_key.shape[-2] + input_ids.shape[1]
+        rotary_sequence_length = max(
+            kv_sequence_length,
+            int(position_ids.max().item()) + 1,
+        )
+        attention_hidden, present_view = Qwen3Attention_fast_forward_inference(
+            layer.self_attn,
+            hidden_states=normalized,
+            past_key_value=cache.kv[index],
+            position_ids=position_ids,
+            attention_mask=None,
+            # Seed the module-local paged buffer once from the ordinary
+            # prefill KV.  Recursive DFS is depth-first: backtracking to a
+            # sibling retains the shared prefix and overwrites only positions
+            # at and after that parent's sequence length.
+            do_prefill=not hasattr(layer.self_attn, "paged_attention"),
+            rotary_seq_len=rotary_sequence_length,
+        )
+        # Keep the short views into the single paged buffer.  Cloning the full
+        # 4k-8k-token KV at every recursion depth exhausts a 24 GB L4.
+        present = present_view
+        hidden = attention_hidden
+        hidden += residual
+
+        residual.copy_(hidden)
+        normalized = fast_rms_layernorm_inference(
+            layer.post_attention_layernorm,
+            hidden,
+            XX=work_one,
+            XX2=work_two,
+            variance=variance,
+        )
+        normalized, states_c = layer.canonC.step_sequence(
+            normalized, cache.canon.c[index]
+        )
+        state_c = states_c[-1]
         layer._arc_canon_explicit_step = True
         try:
-            attention_outputs = layer.self_attn(
-                hidden_states=normalized,
-                position_ids=position_ids,
-                past_key_value=cache.kv[index],
-                output_attentions=False,
-                use_cache=True,
+            hidden = fast_swiglu_inference(
+                layer.mlp,
+                normalized,
+                temp_gate=temp_gate,
+                temp_up=temp_up,
             )
         finally:
             layer._arc_canon_explicit_step = False
-        attention_hidden = attention_outputs[0]
-        present = attention_outputs[2] if len(attention_outputs) >= 3 else attention_outputs[1]
-        hidden = residual + attention_hidden
-
-        residual = hidden
-        normalized = fast_rms_layernorm_inference(layer.post_attention_layernorm, hidden)
-        normalized, state_c = layer.canonC.step(normalized, cache.canon.c[index])
-        layer._arc_canon_explicit_step = True
-        try:
-            hidden = fast_swiglu_inference(layer.mlp, normalized)
-        finally:
-            layer._arc_canon_explicit_step = False
-        hidden = residual + hidden
+        hidden += residual
         next_kv.append(present)
         next_a.append(state_a)
         next_c.append(state_c)
+        for offset in range(query_length):
+            prefix_a[offset].append(states_a[offset])
+            prefix_c[offset].append(states_c[offset])
 
-    hidden = fast_rms_layernorm_inference(backbone.norm, hidden)
+    hidden = fast_rms_layernorm_inference(
+        backbone.norm,
+        hidden,
+        XX=work_one,
+        XX2=work_two,
+        variance=variance,
+    )
     logits = causal_lm.lm_head(hidden.to(causal_lm.lm_head.weight.dtype))
     return SimpleNamespace(
         logits=logits,
         past_key_values=CanonDFSCache(
             kv=next_kv,
             canon=CanonACState(a=tuple(next_a), c=tuple(next_c)),
+        ),
+        canon_prefix_states=tuple(
+            CanonACState(a=tuple(a), c=tuple(c))
+            for a, c in zip(prefix_a, prefix_c)
         ),
     )

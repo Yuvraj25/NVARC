@@ -35,6 +35,12 @@ def _slice_cache(cache, length: int):
     return tuple(sliced) if isinstance(cache, tuple) else sliced
 
 
+def _slice_canon_cache(cache, length: int, canon_state):
+    from arc_canon import CanonDFSCache
+
+    return CanonDFSCache(kv=_slice_cache(cache.kv, length), canon=canon_state)
+
+
 def _classify_frame(logits, scores, remaining: int, max_score: float):
     n = logits.size(0)
     nll = torch.tensor(scores, dtype=torch.float32).view(n, 1) - logits.float().cpu().log_softmax(-1)
@@ -120,13 +126,24 @@ def turbo_dfs_multitoken(
             input_ids = token_tensor[:, None].expand(-1, draft_len)
 
         call_started = time.perf_counter()
-        outputs = model(
-            input_ids=input_ids,
-            position_ids=_position_ids(n, pos, draft_len, model.device),
-            past_key_values=cache,
-            return_dict=True,
-            use_cache=True,
-        )
+        position_ids = _position_ids(n, pos, draft_len, model.device)
+        if hasattr(model, "_arc_canon_enabled"):
+            from arc_canon import canon_cached_step
+
+            outputs = canon_cached_step(
+                model,
+                input_ids=input_ids,
+                position_ids=position_ids,
+                cache=cache,
+            )
+        else:
+            outputs = model(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                past_key_values=cache,
+                return_dict=True,
+                use_cache=True,
+            )
         _bump(stats, "model_calls")
         _bump(stats, "model_tokens", n * draft_len)
         if stats is not None:
@@ -155,7 +172,14 @@ def turbo_dfs_multitoken(
         if draft_len > 1 and consumed == 1:
             _bump(stats, "zero_extra_blocks")
         cache_len = pos + consumed
-        child_cache = _slice_cache(outputs.past_key_values, cache_len)
+        if hasattr(model, "_arc_canon_enabled"):
+            child_cache = _slice_canon_cache(
+                outputs.past_key_values,
+                cache_len,
+                outputs.canon_prefix_states[consumed - 1],
+            )
+        else:
+            child_cache = _slice_cache(outputs.past_key_values, cache_len)
         next_suffixes = turbo_dfs_multitoken(
             model=model,
             logits=outputs.logits[:, consumed - 1],
@@ -190,7 +214,13 @@ def inference_turbo_dfs_multitoken(
 ):
     input_ids = torch.tensor(prefix_tokens, device=model.device, dtype=torch.long)
     started = time.time()
-    outputs = model(input_ids=input_ids, return_dict=True, use_cache=True)
+    if hasattr(model, "_arc_canon_enabled"):
+        from arc_canon import canon_prefill
+
+        outputs, initial_cache = canon_prefill(model, input_ids)
+    else:
+        outputs = model(input_ids=input_ids, return_dict=True, use_cache=True)
+        initial_cache = outputs.past_key_values
     _bump(stats, "prefill_calls")
     suffixes = turbo_dfs_multitoken(
         model=model,
@@ -199,7 +229,7 @@ def inference_turbo_dfs_multitoken(
         max_score=max_score,
         scores=[0.0] * input_ids.size(0),
         pos=input_ids.size(1),
-        cache=outputs.past_key_values,
+        cache=initial_cache,
         start_time=started,
         end_time=end_time,
         repeat_len=repeat_len,

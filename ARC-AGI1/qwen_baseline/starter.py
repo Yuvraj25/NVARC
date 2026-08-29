@@ -199,8 +199,6 @@ if __name__ == "__main__":
         raise ValueError("Reduced-pair TTFT methods are only supported by the Unsloth/HF worker")
     if args.use_unsloth_multitoken_dfs and args.use_sglang:
         raise ValueError("--use-unsloth-multitoken-dfs is only supported by the Unsloth/HF worker")
-    if args.canon_ac_state and args.use_unsloth_multitoken_dfs:
-        raise ValueError("The initial Canon-AC experiment uses one-token DFS, not speculative DFS")
     if args.canon_ac_state and args.use_sglang:
         raise ValueError("Canon-AC is initially supported only by the Unsloth/HF worker")
     if args.unsloth_multitoken_repeat_len < 2:

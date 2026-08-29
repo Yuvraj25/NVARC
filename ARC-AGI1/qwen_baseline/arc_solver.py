@@ -1090,11 +1090,15 @@ def worker(rank, queue, end_time):
     _restore_qwen_role_tokens(model, tokenizer)
 
     canon_hooks = None
+    default_canon_weights = None
     if config["canon_ac_state"]:
         from arc_canon import (
             add_canon_ac_modules,
+            canon_parameters,
+            canon_state_dict,
             install_canon_ac_training_hooks,
             load_canon_state,
+            load_canon_state_dict,
         )
 
         canon_path = os.path.abspath(config["canon_ac_state"])
@@ -1106,6 +1110,21 @@ def worker(rank, queue, end_time):
         print(f"[Rank {rank}] loaded residual Canon-AC from {canon_path}", flush=True)
 
     model = FastLanguageModel.get_peft_model(model, **peft_params)
+    if config["canon_ac_state"]:
+        # PEFT freezes every base-model parameter when it installs the fresh
+        # per-task adapter. Canon is deliberately trainable during TTFT, so it
+        # must be re-enabled explicitly after get_peft_model.
+        for parameter in canon_parameters(model):
+            parameter.requires_grad = True
+        default_canon_weights = {
+            key: value.clone().detach()
+            for key, value in canon_state_dict(model).items()
+        }
+        print(
+            f"[Rank {rank}] Canon TTFT trainable parameters="
+            f"{sum(parameter.numel() for parameter in canon_parameters(model))}",
+            flush=True,
+        )
     for _name, param in model.named_parameters():
         if param.dtype == torch.float32:
             param.data = param.data.to(torch.bfloat16)
@@ -1154,9 +1173,14 @@ def worker(rank, queue, end_time):
             default_weights.copy(),
             adapter_name="default",
         )
+        if default_canon_weights is not None:
+            load_canon_state_dict(model, default_canon_weights)
 
         model = FastLanguageModel.for_training(model, use_gradient_checkpointing=True)
         activate_adapter(model, "default", trainable=True)
+        if default_canon_weights is not None:
+            for parameter in canon_parameters(model):
+                parameter.requires_grad = True
         puzzle_ds = arc_test_set.change_keys([key])
         num_train_pairs = len(puzzle_ds.queries[key]["train"])
         effective_ttft_method = config["ttft_method"]
@@ -1272,6 +1296,20 @@ def worker(rank, queue, end_time):
             model = trainer.accelerator.unwrap_model(model, keep_fp32_wrapper=False)
             del trainer
         timing_stats["training_s"] += time.perf_counter() - training_started_at
+
+        if default_canon_weights is not None:
+            adapted_canon_weights = canon_state_dict(model)
+            canon_delta_l2 = sum(
+                (adapted_canon_weights[name].float() - default_canon_weights[name].float())
+                .square()
+                .sum()
+                .item()
+                for name in default_canon_weights
+            ) ** 0.5
+            print(
+                f"[Rank {rank}] {key}: Canon TTFT delta_l2={canon_delta_l2:.8f}",
+                flush=True,
+            )
 
         if scheduled_sampling_stats is not None:
             scheduled_sampling_stats.update(
