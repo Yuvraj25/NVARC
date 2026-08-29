@@ -36,7 +36,7 @@ Mechanical one-prompt gate on `0934a4d8`. Loads the premerged Canon-CPT model an
             f"""from pathlib import Path
 import os, shutil, subprocess, sys
 
-PREMERGED_ROOT = Path('/kaggle/input/notebooks/yuvraj/arc26-canon-cpt-premerged-model/canon_cpt_premerged')
+PREMERGED_ROOT = Path('/kaggle/input/arc26-canon-cpt-premerged-model/canon_cpt_premerged')
 MODEL_PATH = PREMERGED_ROOT / 'model'
 CANON_STATE = PREMERGED_ROOT / 'canon_ac.pt'
 COMP_ROOT = Path('/kaggle/input/competitions/arc-prize-2026-arc-agi-2')
