@@ -16,8 +16,9 @@ OUTPUT = ARC_ROOT / "arc26-canon-cpt-q9-24-submit-competition.ipynb"
 
 def source(cell: dict, text: str) -> None:
     cell["source"] = text
-    cell["outputs"] = []
-    cell["execution_count"] = None
+    if cell["cell_type"] == "code":
+        cell["outputs"] = []
+        cell["execution_count"] = None
 
 
 vanilla = json.loads(VANILLA.read_text())
@@ -42,9 +43,8 @@ source(
 from pathlib import Path
 
 CODE_DATASET_ROOT = Path("/kaggle/input/datasets/yuvraj/arc2026")
-PREMERGED_ROOT = Path("/kaggle/input/arc26-canon-cpt-premerged-model/canon_cpt_premerged")
-MODEL_PATH = PREMERGED_ROOT / "model"
-CANON_STATE = PREMERGED_ROOT / "canon_ac.pt"
+PREMERGED_COMPETITION_ROOT = Path("/kaggle/input/arc26-canon-cpt-premerged-model/canon_cpt_premerged")
+PREMERGED_NOTEBOOK_ROOT = Path("/kaggle/input/notebooks/yuvraj/arc26-canon-cpt-premerged-model/canon_cpt_premerged")
 COMP_ROOT = Path("/kaggle/input/competitions/arc-prize-2026-arc-agi-2")
 MODERN_UTILITY_ROOT = Path("/kaggle/usr/lib/notebooks/yuvraj/pip_install_unsloth_ddp_repair")
 FA2_ROOT = Path("/kaggle/input/notebooks/yuvraj/flash-attention-cu13-torch-2-11-cp312/flash_attn_cu13_torch211_cp312")
@@ -79,6 +79,9 @@ def _truthy_env(name: str) -> bool:
 
 IS_KAGGLE_RERUN = _truthy_env("KAGGLE_IS_COMPETITION_RERUN")
 EFFECTIVE_MODE = "submit_competition" if IS_KAGGLE_RERUN else MODE
+PREMERGED_ROOT = PREMERGED_COMPETITION_ROOT if IS_KAGGLE_RERUN else PREMERGED_NOTEBOOK_ROOT
+MODEL_PATH = PREMERGED_ROOT / "model"
+CANON_STATE = PREMERGED_ROOT / "canon_ac.pt"
 
 EVAL_CHALLENGES = COMP_ROOT / "arc-agi_evaluation_challenges.json"
 EVAL_SOLUTIONS = COMP_ROOT / "arc-agi_evaluation_solutions.json"
@@ -125,14 +128,15 @@ import shutil
 import subprocess
 import sys
 
-for required in (
+required_files = [
     CODE_DATASET_ROOT / "ARC-AGI1/qwen_baseline/starter.py",
-    MODEL_PATH / "config.json",
-    CANON_STATE,
     TEST_PATH,
     MODERN_UTILITY_ROOT / "unsloth/__init__.py",
     FA2_ROOT / "flash_attn/__init__.py",
-):
+]
+if RUN_INFERENCE:
+    required_files.extend([MODEL_PATH / "config.json", CANON_STATE])
+for required in required_files:
     if not required.is_file():
         raise FileNotFoundError(required)
 
