@@ -36,9 +36,16 @@ def _slice_cache(cache, length: int):
 
 
 def _slice_canon_cache(cache, length: int, canon_state):
-    from arc_canon import CanonDFSCache
+    from arc_canon import CanonACState, CanonDFSCache
 
-    return CanonDFSCache(kv=_slice_cache(cache.kv, length), canon=canon_state)
+    # q-block prefix states are views into a shared rolling-state tensor.
+    # Clone only the chosen prefix so recursive DFS does not retain the other
+    # q-1 state snapshots after the full block output is released.
+    selected_state = CanonACState(
+        a=tuple(tensor.clone() for tensor in canon_state.a),
+        c=tuple(tensor.clone() for tensor in canon_state.c),
+    )
+    return CanonDFSCache(kv=_slice_cache(cache.kv, length), canon=selected_state)
 
 
 def _classify_frame(logits, scores, remaining: int, max_score: float):

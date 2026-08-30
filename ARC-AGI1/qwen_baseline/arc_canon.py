@@ -221,16 +221,36 @@ class ResidualCanon1d(nn.Module):
                 f"Expected [batch, sequence, {self.hidden_size}], got "
                 f"{tuple(hidden_states.shape)}"
             )
-        outputs = []
-        states = []
-        current_state = state
-        for offset in range(hidden_states.shape[1]):
-            output, current_state = self.step(
-                hidden_states[:, offset : offset + 1], current_state
-            )
-            outputs.append(output)
-            states.append(current_state)
-        return torch.cat(outputs, dim=1), tuple(states)
+        batch_size, sequence_length, _ = hidden_states.shape
+        expected_state = (batch_size, self.history_length, self.hidden_size)
+        if state.shape != expected_state:
+            raise ValueError(f"Expected state {expected_state}, got {tuple(state.shape)}")
+
+        # Apply all q cached positions at once.  The previous implementation
+        # called ``step`` q times, which placed two Python loops per decoder
+        # layer on every q9 DFS model call.  That dominated Canon inference.
+        mixed = hidden_states * self.weight[0]
+        for lag in range(1, self.kernel_size):
+            prefix_count = min(lag, sequence_length)
+            prefix = state[:, lag - prefix_count : lag].flip(1)
+            if sequence_length > lag:
+                shifted = torch.cat(
+                    (prefix, hidden_states[:, : sequence_length - lag]), dim=1
+                )
+            else:
+                shifted = prefix
+            mixed = mixed + shifted * self.weight[lag]
+
+        if self.history_length == 0:
+            states = tuple(state for _ in range(sequence_length))
+        else:
+            # Chronological timeline -> rolling windows -> recent-first Canon
+            # histories for every accepted prefix of this q-block.
+            timeline = torch.cat((state.flip(1), hidden_states), dim=1)
+            windows = timeline.unfold(1, self.history_length, 1)[:, 1:]
+            state_matrix = windows.permute(0, 1, 3, 2).flip(2)
+            states = tuple(state_matrix[:, offset] for offset in range(sequence_length))
+        return hidden_states + mixed, states
 
 
 @dataclass(frozen=True)
