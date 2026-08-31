@@ -22,6 +22,7 @@ class FakeModel:
         self.targets = targets
         self.ambiguous_positions = set(ambiguous_positions)
         self.q_lens = []
+        self.batch_sizes = []
 
     def _row(self, generated):
         row = torch.full((16,), -20.0)
@@ -34,6 +35,7 @@ class FakeModel:
     def __call__(self, input_ids, past_key_values=None, **_kwargs):
         batch, q_len = input_ids.shape
         self.q_lens.append(q_len)
+        self.batch_sizes.append(batch)
         previous = 0 if past_key_values is None else past_key_values[0][0].shape[-2]
         logits = torch.empty((batch, q_len, 16))
         for offset in range(q_len):
@@ -164,6 +166,11 @@ class MultiTokenDfsTest(unittest.TestCase):
         self.assertIn(3, model.q_lens)
         self.assertGreaterEqual(stats["q4_calls"], 1)
         self.assertGreaterEqual(stats["q3_calls"], 1)
+        # Cached Unsloth allocates its paged-attention scratch buffers at the
+        # prefill batch size. Logical length buckets therefore use duplicated
+        # real lanes as disposable fillers instead of changing physical batch.
+        self.assertEqual(set(model.batch_sizes), {2})
+        self.assertGreater(stats["padded_model_tokens"], 0)
 
 
 if __name__ == "__main__":

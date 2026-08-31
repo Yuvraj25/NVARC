@@ -341,6 +341,7 @@ def turbo_dfs_multitoken_structured(
     end_time,
     repeat_len=9,
     stats=None,
+    physical_batch_size=None,
 ):
     """Rectangular-grid DFS with active lanes bucketed by safe draft length."""
     if hasattr(model, "_arc_canon_enabled"):
@@ -349,6 +350,12 @@ def turbo_dfs_multitoken_structured(
         )
 
     n = logits.size(0)
+    if physical_batch_size is None:
+        physical_batch_size = n
+    if n > physical_batch_size:
+        raise ValueError(
+            f"Logical batch {n} exceeds physical batch {physical_batch_size}"
+        )
     suffixes, candidates = _classify_structured_frame(
         logits, scores, max_new_tokens, max_score, states
     )
@@ -372,19 +379,27 @@ def turbo_dfs_multitoken_structured(
 
         for draft_len in sorted(buckets, reverse=True):
             group = buckets[draft_len]
-            lanes = [item[0] for item in group]
-            batch_scores = [item[1] for item in group]
-            batch_tokens = [item[2] for item in group]
+            logical_group_size = len(group)
+            # Unsloth's paged-attention scratch buffers are allocated at the
+            # prefill batch size and cannot change batch dimension mid-DFS.
+            # Duplicate one real lane to fill unused physical slots, then
+            # discard those duplicate outputs before recursing.
+            padded_group = group + [group[-1]] * (
+                physical_batch_size - logical_group_size
+            )
+            lanes = [item[0] for item in padded_group]
+            batch_scores = [item[1] for item in padded_group]
+            batch_tokens = [item[2] for item in padded_group]
             chain_states = [
                 states[lane].advance(token_id)
-                for lane, _score, token_id in group
+                for lane, _score, token_id in padded_group
             ]
             token_tensor = torch.tensor(
                 batch_tokens, device=model.device, dtype=torch.long
             )
             input_ids = token_tensor[:, None].expand(-1, draft_len)
             position_ids = _position_ids(
-                len(group), pos, draft_len, model.device
+                physical_batch_size, pos, draft_len, model.device
             )
             group_cache = _select_cache_lanes(cache, lanes)
 
@@ -397,14 +412,20 @@ def turbo_dfs_multitoken_structured(
                 use_cache=True,
             )
             _bump(stats, "model_calls")
-            _bump(stats, "model_tokens", len(group) * draft_len)
+            _bump(stats, "model_tokens", physical_batch_size * draft_len)
+            _bump(stats, "useful_model_tokens", logical_group_size * draft_len)
+            _bump(
+                stats,
+                "padded_model_tokens",
+                (physical_batch_size - logical_group_size) * draft_len,
+            )
             _bump(stats, "length_bucket_calls")
             _bump(stats, f"q{draft_len}_calls")
             if stats is not None:
                 stats["model_time_s"] = stats.get("model_time_s", 0.0) + time.perf_counter() - call_started
             if draft_len > 1:
                 _bump(stats, "block_calls")
-                _bump(stats, "draft_tokens", len(group) * draft_len)
+                _bump(stats, "draft_tokens", physical_batch_size * draft_len)
 
             consumed = 1
             chain_scores = list(batch_scores)
@@ -422,26 +443,36 @@ def turbo_dfs_multitoken_structured(
                 chain_scores, chain_states = accepted
                 consumed += 1
 
-            _bump(stats, "accepted_extra_tokens", len(group) * (consumed - 1))
+            _bump(
+                stats,
+                "accepted_extra_tokens",
+                logical_group_size * (consumed - 1),
+            )
             if draft_len > 1 and consumed == 1:
                 _bump(stats, "zero_extra_blocks")
 
-            child_logits = outputs.logits[:, consumed - 1].clone()
-            child_cache = _slice_cache(outputs.past_key_values, pos + consumed)
+            child_logits = outputs.logits[
+                :logical_group_size, consumed - 1
+            ].clone()
+            child_cache = _select_cache_lanes(
+                _slice_cache(outputs.past_key_values, pos + consumed),
+                list(range(logical_group_size)),
+            )
             del outputs
             next_suffixes = turbo_dfs_multitoken_structured(
                 model=model,
                 logits=child_logits,
                 max_new_tokens=max_new_tokens - consumed,
                 max_score=max_score,
-                scores=chain_scores,
+                scores=chain_scores[:logical_group_size],
                 pos=pos + consumed,
                 cache=child_cache,
-                states=chain_states,
+                states=chain_states[:logical_group_size],
                 start_time=start_time,
                 end_time=end_time,
                 repeat_len=repeat_len,
                 stats=stats,
+                physical_batch_size=physical_batch_size,
             )
 
             for local_lane, beams in next_suffixes.items():
@@ -490,6 +521,7 @@ def inference_turbo_dfs_multitoken(
     if structured_rows:
         suffixes = turbo_dfs_multitoken_structured(
             states=[_GridState() for _ in range(input_ids.size(0))],
+            physical_batch_size=input_ids.size(0),
             **common,
         )
     else:
