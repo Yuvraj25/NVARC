@@ -50,6 +50,26 @@ def _load_selected_keys(args, data):
     return keys
 
 
+def _estimated_task_work(task):
+    def grid_tokens(grid):
+        return len(grid) * (len(grid[0]) + 1)
+
+    train_tokens = sum(
+        grid_tokens(pair["input"]) + grid_tokens(pair["output"])
+        for pair in task["train"]
+    )
+    ratios = sorted(
+        grid_tokens(pair["output"]) / max(1, grid_tokens(pair["input"]))
+        for pair in task["train"]
+    )
+    median_ratio = ratios[len(ratios) // 2]
+    test_tokens = sum(
+        grid_tokens(item["input"]) * (1 + median_ratio)
+        for item in task["test"]
+    )
+    return train_tokens * 16 + test_tokens * 8 * len(task["test"])
+
+
 def _load_manifest_jobs(args):
     with open(args.sglang_infer_from_manifest, "r") as f:
         data = json.load(f)
@@ -134,6 +154,12 @@ if __name__ == "__main__":
     parser.add_argument("--sglang-dynamic-repeat", action="store_true")
     parser.add_argument("--dfs-prob-threshold", type=float, default=0.2)
     parser.add_argument("--eval-color-permutations", type=int, default=2)
+    parser.add_argument("--shared-eval-augmentations", action="store_true")
+    parser.add_argument("--adaptive-output-dir", type=str, default=None)
+    parser.add_argument("--adaptive-dfs-prob-threshold", type=float, default=0.1)
+    parser.add_argument("--adaptive-color-permutations", type=int, default=3)
+    parser.add_argument("--adaptive-min-unique-candidates", type=int, default=2)
+    parser.add_argument("--cheap-first", action="store_true")
     parser.add_argument("--profile-timings", action="store_true")
     parser.add_argument(
         "--ttft-method",
@@ -205,6 +231,16 @@ if __name__ == "__main__":
         raise ValueError("--unsloth-multitoken-repeat-len must be at least 2")
     if args.eval_color_permutations < 1:
         raise ValueError("--eval-color-permutations must be positive")
+    if args.adaptive_color_permutations < 1:
+        raise ValueError("--adaptive-color-permutations must be positive")
+    if args.adaptive_min_unique_candidates < 1:
+        raise ValueError("--adaptive-min-unique-candidates must be positive")
+    if not 0.0 < args.adaptive_dfs_prob_threshold < 1.0:
+        raise ValueError("--adaptive-dfs-prob-threshold must be in (0, 1)")
+    if args.adaptive_output_dir and not args.shared_eval_augmentations:
+        raise ValueError(
+            "--adaptive-output-dir requires --shared-eval-augmentations"
+        )
     if args.opsd_min_train_pairs < 3:
         raise ValueError("--opsd-min-train-pairs must be at least 3")
     if args.opsd_color_permutations < 1:
@@ -253,6 +289,22 @@ if __name__ == "__main__":
     os.environ["ARC_SGLANG_DYNAMIC_REPEAT"] = "1" if args.sglang_dynamic_repeat else "0"
     os.environ["ARC_DFS_PROB_THRESHOLD"] = str(args.dfs_prob_threshold)
     os.environ["ARC_EVAL_COLOR_PERMUTATIONS"] = str(args.eval_color_permutations)
+    os.environ["ARC_SHARED_EVAL_AUGMENTATIONS"] = (
+        "1" if args.shared_eval_augmentations else "0"
+    )
+    if args.adaptive_output_dir is not None:
+        os.environ["ARC_ADAPTIVE_OUTPUT_DIR"] = args.adaptive_output_dir
+    else:
+        os.environ.pop("ARC_ADAPTIVE_OUTPUT_DIR", None)
+    os.environ["ARC_ADAPTIVE_DFS_PROB_THRESHOLD"] = str(
+        args.adaptive_dfs_prob_threshold
+    )
+    os.environ["ARC_ADAPTIVE_COLOR_PERMUTATIONS"] = str(
+        args.adaptive_color_permutations
+    )
+    os.environ["ARC_ADAPTIVE_MIN_UNIQUE_CANDIDATES"] = str(
+        args.adaptive_min_unique_candidates
+    )
     os.environ["ARC_PROFILE_TIMINGS"] = "1" if args.profile_timings else "0"
     os.environ["ARC_TEST_PATH"] = args.test_path
     os.environ["ARC_MODEL_PATH"] = args.model_path
@@ -368,6 +420,9 @@ if __name__ == "__main__":
         with open(args.test_path, "r") as f:
             data = json.load(f)
         selected_keys = _load_selected_keys(args, data)
+        if args.cheap_first:
+            selected_keys.sort(key=lambda key: (_estimated_task_work(data[key]), key))
+            print("cheap-first task order:", selected_keys, flush=True)
         for key in selected_keys:
             assert key in data, f"Unknown puzzle key: {key}"
             queue.put(key)
