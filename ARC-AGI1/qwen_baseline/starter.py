@@ -137,6 +137,7 @@ if __name__ == "__main__":
     parser.add_argument("--cuda-device-offset", type=int, default=0)
     parser.add_argument("--use-speculative-dfs", action="store_true")
     parser.add_argument("--use-unsloth-multitoken-dfs", action="store_true")
+    parser.add_argument("--use-unsloth-structured-rows", action="store_true")
     parser.add_argument("--unsloth-multitoken-repeat-len", type=int, default=9)
     parser.add_argument("--use-sglang", action="store_true")
     parser.add_argument("--sglang-tp-size", type=int, default=1)
@@ -229,6 +230,14 @@ if __name__ == "__main__":
         raise ValueError("Canon-AC is initially supported only by the Unsloth/HF worker")
     if args.unsloth_multitoken_repeat_len < 2:
         raise ValueError("--unsloth-multitoken-repeat-len must be at least 2")
+    if args.use_unsloth_structured_rows and not args.use_unsloth_multitoken_dfs:
+        raise ValueError(
+            "--use-unsloth-structured-rows requires --use-unsloth-multitoken-dfs"
+        )
+    if args.use_unsloth_structured_rows and args.canon_ac_state:
+        raise ValueError(
+            "--use-unsloth-structured-rows is initially a Vanilla-only experiment"
+        )
     if args.eval_color_permutations < 1:
         raise ValueError("--eval-color-permutations must be positive")
     if args.adaptive_color_permutations < 1:
@@ -270,6 +279,7 @@ if __name__ == "__main__":
     end_time = args.end_time if args.end_time is not None else time.time() + 12 * 3600
     os.environ["ARC_USE_SPECULATIVE_DFS"] = "1" if args.use_speculative_dfs else "0"
     os.environ["ARC_USE_UNSLOTH_MULTITOKEN_DFS"] = "1" if args.use_unsloth_multitoken_dfs else "0"
+    os.environ["ARC_USE_UNSLOTH_STRUCTURED_ROWS"] = "1" if args.use_unsloth_structured_rows else "0"
     os.environ["ARC_UNSLOTH_MULTITOKEN_REPEAT_LEN"] = str(args.unsloth_multitoken_repeat_len)
     os.environ["ARC_USE_SGLANG"] = "1" if args.use_sglang else "0"
     os.environ["ARC_SGLANG_TP_SIZE"] = str(args.sglang_tp_size)
@@ -357,6 +367,7 @@ if __name__ == "__main__":
         "runtime flags:",
         f"speculative_dfs={os.environ['ARC_USE_SPECULATIVE_DFS']}",
         f"unsloth_multitoken_dfs={os.environ['ARC_USE_UNSLOTH_MULTITOKEN_DFS']}",
+        f"unsloth_structured_rows={os.environ['ARC_USE_UNSLOTH_STRUCTURED_ROWS']}",
         f"unsloth_multitoken_repeat_len={os.environ['ARC_UNSLOTH_MULTITOKEN_REPEAT_LEN']}",
         f"use_sglang={os.environ['ARC_USE_SGLANG']}",
         f"sglang_tp_size={os.environ['ARC_SGLANG_TP_SIZE']}",

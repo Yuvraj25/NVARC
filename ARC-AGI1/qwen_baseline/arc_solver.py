@@ -90,6 +90,7 @@ def runtime_config():
     return {
         "use_speculative_dfs": _env_flag("ARC_USE_SPECULATIVE_DFS", default=False),
         "use_unsloth_multitoken_dfs": _env_flag("ARC_USE_UNSLOTH_MULTITOKEN_DFS", default=False),
+        "use_unsloth_structured_rows": _env_flag("ARC_USE_UNSLOTH_STRUCTURED_ROWS", default=False),
         "unsloth_multitoken_repeat_len": int(os.environ.get("ARC_UNSLOTH_MULTITOKEN_REPEAT_LEN", "9")),
         "use_sglang": _env_flag("ARC_USE_SGLANG", default=False),
         "profile_timings": _env_flag("ARC_PROFILE_TIMINGS", default=False),
@@ -490,6 +491,7 @@ def _run_hf_eval_batches(
     max_new_tokens,
     max_score,
     use_multitoken,
+    use_structured_rows,
     repeat_len,
     start_time,
     end_time,
@@ -535,6 +537,7 @@ def _run_hf_eval_batches(
                 end_time,
                 repeat_len=repeat_len,
                 stats=multitoken_stats,
+                structured_rows=use_structured_rows,
             )
             for name, value in multitoken_stats.items():
                 if name == "model_time_s":
@@ -1320,6 +1323,8 @@ def worker(rank, queue, end_time):
     print(
         f"[Rank {rank}] config: speculative_dfs={config['use_speculative_dfs']} "
         f"dfs_prob_threshold={config['dfs_prob_threshold']} "
+        f"multitoken_dfs={config['use_unsloth_multitoken_dfs']} "
+        f"structured_rows={config['use_unsloth_structured_rows']} "
         f"ttft_method={config['ttft_method']} fixed_candidate_dir={config['fixed_candidate_dir']} "
         f"shared_eval_augmentations={config['shared_eval_augmentations']} "
         f"adaptive_output_dir={config['adaptive_output_dir']} "
@@ -1788,6 +1793,7 @@ def worker(rank, queue, end_time):
                 max_new_tokens=max_new_tokens,
                 max_score=max_score,
                 use_multitoken=config["use_unsloth_multitoken_dfs"],
+                use_structured_rows=config["use_unsloth_structured_rows"],
                 repeat_len=config["unsloth_multitoken_repeat_len"],
                 start_time=start_time,
                 end_time=end_time,
@@ -1845,6 +1851,7 @@ def worker(rank, queue, end_time):
                             config["adaptive_dfs_prob_threshold"]
                         ),
                         use_multitoken=config["use_unsloth_multitoken_dfs"],
+                        use_structured_rows=config["use_unsloth_structured_rows"],
                         repeat_len=config["unsloth_multitoken_repeat_len"],
                         start_time=start_time,
                         end_time=end_time,

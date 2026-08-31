@@ -17,6 +17,56 @@ import torch
 from arc_search import ARC_TOKENS, EOS_ID, PAD_ID
 
 
+NEWLINE_ID = 10
+MAX_GRID_SIDE = 30
+
+
+class _GridState:
+    """Branch-local structural state for one generated ARC grid."""
+
+    __slots__ = ("width", "column", "completed_rows")
+
+    def __init__(self, width=None, column=0, completed_rows=0):
+        self.width = width
+        self.column = column
+        self.completed_rows = completed_rows
+
+    def advance(self, token_id):
+        if 0 <= token_id <= 9:
+            return _GridState(self.width, self.column + 1, self.completed_rows)
+        if token_id == NEWLINE_ID:
+            width = self.column if self.width is None else self.width
+            return _GridState(width, 0, self.completed_rows + 1)
+        if token_id == EOS_ID:
+            return self
+        raise ValueError(f"Not an ARC grid token: {token_id}")
+
+
+def _token_is_structurally_legal(state, token_id):
+    """Whether appending ``token_id`` can still form a <=30x30 rectangle."""
+    if 0 <= token_id <= 9:
+        width_limit = MAX_GRID_SIDE if state.width is None else state.width
+        return state.completed_rows < MAX_GRID_SIDE and state.column < width_limit
+    row_complete = (
+        state.column > 0
+        and state.column <= MAX_GRID_SIDE
+        and (state.width is None or state.column == state.width)
+    )
+    if token_id == NEWLINE_ID:
+        return row_complete and state.completed_rows < MAX_GRID_SIDE - 1
+    if token_id == EOS_ID:
+        return row_complete
+    return False
+
+
+def _draft_len_for_token(state, token_id, repeat_len, remaining):
+    if not 0 <= token_id <= 9:
+        return 1
+    width_limit = MAX_GRID_SIDE if state.width is None else state.width
+    cells_left = width_limit - state.column
+    return min(max(1, repeat_len), cells_left, remaining - 1)
+
+
 def _position_ids(batch_size: int, start: int, length: int, device):
     values = torch.arange(start, start + length, device=device, dtype=torch.long)
     return values.unsqueeze(0).expand(batch_size, -1)
@@ -33,6 +83,20 @@ def _slice_cache(cache, length: int):
         values[1] = values[1][..., :length, :]
         sliced.append(tuple(values) if isinstance(layer, tuple) else values)
     return tuple(sliced) if isinstance(cache, tuple) else sliced
+
+
+def _select_cache_lanes(cache, lanes):
+    """Copy selected batch lanes from the tuple cache used by this DFS path."""
+    selected = []
+    for layer in cache:
+        if not isinstance(layer, (tuple, list)) or len(layer) < 2:
+            raise TypeError(f"Unsupported cache layer type: {type(layer)!r}")
+        values = list(layer)
+        for index in (0, 1):
+            lane_index = torch.tensor(lanes, device=values[index].device)
+            values[index] = values[index].index_select(0, lane_index)
+        selected.append(tuple(values) if isinstance(layer, tuple) else values)
+    return tuple(selected) if isinstance(cache, tuple) else selected
 
 
 def _slice_canon_cache(cache, length: int, canon_state):
@@ -67,6 +131,27 @@ def _classify_frame(logits, scores, remaining: int, max_score: float):
     return eos, candidates
 
 
+def _classify_structured_frame(logits, scores, remaining, max_score, states):
+    n = logits.size(0)
+    nll = torch.tensor(scores, dtype=torch.float32).view(n, 1) - logits.float().cpu().log_softmax(-1)
+    eos = defaultdict(list)
+    candidates = {}
+    for lane in range(n):
+        candidates[lane] = []
+        for token_id in ARC_TOKENS:
+            if not _token_is_structurally_legal(states[lane], token_id):
+                continue
+            score = nll[lane, token_id].item()
+            if score >= max_score:
+                continue
+            if token_id == EOS_ID:
+                eos[lane].append((score, [token_id]))
+            elif remaining > 1:
+                candidates[lane].append((score, token_id))
+        candidates[lane].sort(key=lambda item: item[0])
+    return eos, candidates
+
+
 def _can_accept_repeat(logits, scores, remaining, repeat_tokens, active, max_score):
     if remaining <= 1:
         return None
@@ -83,6 +168,33 @@ def _can_accept_repeat(logits, scores, remaining, repeat_tokens, active, max_sco
             return None
         next_scores[lane] = score
     return next_scores
+
+
+def _can_accept_structured_repeat(
+    logits,
+    scores,
+    remaining,
+    repeat_tokens,
+    states,
+    max_score,
+):
+    if remaining <= 1:
+        return None
+    eos, candidates = _classify_structured_frame(
+        logits, scores, remaining, max_score, states
+    )
+    next_scores = list(scores)
+    next_states = list(states)
+    for lane in range(len(states)):
+        lane_candidates = candidates[lane]
+        if eos.get(lane) or len(lane_candidates) != 1:
+            return None
+        score, token_id = lane_candidates[0]
+        if token_id != repeat_tokens[lane]:
+            return None
+        next_scores[lane] = score
+        next_states[lane] = states[lane].advance(token_id)
+    return next_scores, next_states
 
 
 def _bump(stats, name, value=1):
@@ -216,6 +328,131 @@ def turbo_dfs_multitoken(
     return suffixes
 
 
+def turbo_dfs_multitoken_structured(
+    model,
+    logits,
+    max_new_tokens,
+    max_score,
+    scores,
+    pos,
+    cache,
+    states,
+    start_time,
+    end_time,
+    repeat_len=9,
+    stats=None,
+):
+    """Rectangular-grid DFS with active lanes bucketed by safe draft length."""
+    if hasattr(model, "_arc_canon_enabled"):
+        raise NotImplementedError(
+            "Structured length-bucketed DFS is currently a Vanilla-only path"
+        )
+
+    n = logits.size(0)
+    suffixes, candidates = _classify_structured_frame(
+        logits, scores, max_new_tokens, max_score, states
+    )
+    _bump(stats, "structured_frames", n)
+
+    while time.time() - start_time < 540 and time.time() < end_time:
+        picked = []
+        for lane in range(n):
+            if candidates[lane]:
+                score, token_id = candidates[lane].pop(0)
+                picked.append((lane, score, token_id))
+        if not picked:
+            break
+
+        buckets = defaultdict(list)
+        for lane, score, token_id in picked:
+            draft_len = _draft_len_for_token(
+                states[lane], token_id, repeat_len, max_new_tokens
+            )
+            buckets[draft_len].append((lane, score, token_id))
+
+        for draft_len in sorted(buckets, reverse=True):
+            group = buckets[draft_len]
+            lanes = [item[0] for item in group]
+            batch_scores = [item[1] for item in group]
+            batch_tokens = [item[2] for item in group]
+            chain_states = [
+                states[lane].advance(token_id)
+                for lane, _score, token_id in group
+            ]
+            token_tensor = torch.tensor(
+                batch_tokens, device=model.device, dtype=torch.long
+            )
+            input_ids = token_tensor[:, None].expand(-1, draft_len)
+            position_ids = _position_ids(
+                len(group), pos, draft_len, model.device
+            )
+            group_cache = _select_cache_lanes(cache, lanes)
+
+            call_started = time.perf_counter()
+            outputs = model(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                past_key_values=group_cache,
+                return_dict=True,
+                use_cache=True,
+            )
+            _bump(stats, "model_calls")
+            _bump(stats, "model_tokens", len(group) * draft_len)
+            _bump(stats, "length_bucket_calls")
+            _bump(stats, f"q{draft_len}_calls")
+            if stats is not None:
+                stats["model_time_s"] = stats.get("model_time_s", 0.0) + time.perf_counter() - call_started
+            if draft_len > 1:
+                _bump(stats, "block_calls")
+                _bump(stats, "draft_tokens", len(group) * draft_len)
+
+            consumed = 1
+            chain_scores = list(batch_scores)
+            while consumed < draft_len:
+                accepted = _can_accept_structured_repeat(
+                    outputs.logits[:, consumed - 1],
+                    chain_scores,
+                    max_new_tokens - consumed,
+                    batch_tokens,
+                    chain_states,
+                    max_score,
+                )
+                if accepted is None:
+                    break
+                chain_scores, chain_states = accepted
+                consumed += 1
+
+            _bump(stats, "accepted_extra_tokens", len(group) * (consumed - 1))
+            if draft_len > 1 and consumed == 1:
+                _bump(stats, "zero_extra_blocks")
+
+            child_logits = outputs.logits[:, consumed - 1].clone()
+            child_cache = _slice_cache(outputs.past_key_values, pos + consumed)
+            del outputs
+            next_suffixes = turbo_dfs_multitoken_structured(
+                model=model,
+                logits=child_logits,
+                max_new_tokens=max_new_tokens - consumed,
+                max_score=max_score,
+                scores=chain_scores,
+                pos=pos + consumed,
+                cache=child_cache,
+                states=chain_states,
+                start_time=start_time,
+                end_time=end_time,
+                repeat_len=repeat_len,
+                stats=stats,
+            )
+
+            for local_lane, beams in next_suffixes.items():
+                parent_lane = lanes[local_lane]
+                prefix = [batch_tokens[local_lane]] * consumed
+                for score, suffix_tokens in beams:
+                    suffixes[parent_lane].append((score, prefix + suffix_tokens))
+
+    return suffixes
+
+
 @torch.no_grad()
 def inference_turbo_dfs_multitoken(
     model,
@@ -225,6 +462,7 @@ def inference_turbo_dfs_multitoken(
     end_time,
     repeat_len=9,
     stats=None,
+    structured_rows=False,
 ):
     input_ids = torch.tensor(prefix_tokens, device=model.device, dtype=torch.long)
     started = time.time()
@@ -236,7 +474,7 @@ def inference_turbo_dfs_multitoken(
         outputs = model(input_ids=input_ids, return_dict=True, use_cache=True)
         initial_cache = outputs.past_key_values
     _bump(stats, "prefill_calls")
-    suffixes = turbo_dfs_multitoken(
+    common = dict(
         model=model,
         logits=outputs.logits[:, -1],
         max_new_tokens=max_new_tokens,
@@ -249,6 +487,13 @@ def inference_turbo_dfs_multitoken(
         repeat_len=repeat_len,
         stats=stats,
     )
+    if structured_rows:
+        suffixes = turbo_dfs_multitoken_structured(
+            states=[_GridState() for _ in range(input_ids.size(0))],
+            **common,
+        )
+    else:
+        suffixes = turbo_dfs_multitoken(**common)
     return [
         (lane, sorted(beams, key=lambda item: item[0]))
         for lane, beams in suffixes.items()

@@ -5,7 +5,13 @@ from types import SimpleNamespace
 import torch
 
 from arc_search import inference_turbo_dfs
-from arc_search_multitoken import inference_turbo_dfs_multitoken
+from arc_search_multitoken import (
+    _GridState,
+    _draft_len_for_token,
+    _token_is_structurally_legal,
+    inference_turbo_dfs_multitoken,
+    turbo_dfs_multitoken_structured,
+)
 
 
 class FakeModel:
@@ -80,6 +86,84 @@ class MultiTokenDfsTest(unittest.TestCase):
     def test_ambiguous_frame_falls_back_without_reordering_results(self):
         _baseline, _speculative, stats = self.compare_paths({2})
         self.assertGreater(stats["zero_extra_blocks"], 0)
+
+    def test_structured_path_preserves_rectangular_candidate(self):
+        prefix = [[11, 12], [11, 12]]
+        targets = [4, 4, 10, 2, 2, 15]
+        baseline_model = FakeModel(len(prefix[0]), targets)
+        structured_model = FakeModel(len(prefix[0]), targets)
+        deadline = time.time() + 30
+        baseline = inference_turbo_dfs(
+            baseline_model,
+            prefix,
+            max_new_tokens=12,
+            max_score=2.302585,
+            end_time=deadline,
+        )
+        stats = {}
+        structured = inference_turbo_dfs_multitoken(
+            structured_model,
+            prefix,
+            max_new_tokens=12,
+            max_score=2.302585,
+            end_time=deadline,
+            repeat_len=4,
+            stats=stats,
+            structured_rows=True,
+        )
+        self.assertEqual(token_results(structured), token_results(baseline))
+        self.assertGreater(stats["length_bucket_calls"], 0)
+
+    def test_grid_state_rejects_ragged_rows_and_caps_first_row(self):
+        state = _GridState()
+        for _ in range(30):
+            self.assertTrue(_token_is_structurally_legal(state, 1))
+            state = state.advance(1)
+        self.assertFalse(_token_is_structurally_legal(state, 1))
+        self.assertTrue(_token_is_structurally_legal(state, 10))
+
+        state = state.advance(10)
+        for _ in range(29):
+            state = state.advance(2)
+        self.assertFalse(_token_is_structurally_legal(state, 10))
+        self.assertFalse(_token_is_structurally_legal(state, 15))
+        self.assertTrue(_token_is_structurally_legal(state, 2))
+        state = state.advance(2)
+        self.assertTrue(_token_is_structurally_legal(state, 10))
+        self.assertTrue(_token_is_structurally_legal(state, 15))
+
+    def test_draft_length_stops_at_known_row_boundary(self):
+        first_row = _GridState(column=27)
+        self.assertEqual(_draft_len_for_token(first_row, 3, 9, 100), 3)
+        known_width = _GridState(width=20, column=13, completed_rows=2)
+        self.assertEqual(_draft_len_for_token(known_width, 3, 9, 100), 7)
+        self.assertEqual(_draft_len_for_token(known_width, 10, 9, 100), 1)
+
+    def test_different_safe_lengths_make_separate_calls(self):
+        prompt_len = 2
+        model = FakeModel(prompt_len, [1, 1, 1, 1, 1, 15])
+        logits = torch.full((2, 16), -20.0)
+        logits[:, 1] = 8.0
+        cache_tensor = torch.zeros((2, 1, prompt_len, 1))
+        stats = {}
+        turbo_dfs_multitoken_structured(
+            model=model,
+            logits=logits,
+            max_new_tokens=8,
+            max_score=2.302585,
+            scores=[0.0, 0.0],
+            pos=prompt_len,
+            cache=[(cache_tensor, cache_tensor.clone())],
+            states=[_GridState(width=3), _GridState(width=5)],
+            start_time=time.time(),
+            end_time=time.time() + 30,
+            repeat_len=4,
+            stats=stats,
+        )
+        self.assertIn(4, model.q_lens)
+        self.assertIn(3, model.q_lens)
+        self.assertGreaterEqual(stats["q4_calls"], 1)
+        self.assertGreaterEqual(stats["q3_calls"], 1)
 
 
 if __name__ == "__main__":
