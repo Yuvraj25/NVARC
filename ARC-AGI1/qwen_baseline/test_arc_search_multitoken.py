@@ -23,6 +23,8 @@ class FakeModel:
         self.ambiguous_positions = set(ambiguous_positions)
         self.q_lens = []
         self.batch_sizes = []
+        self.input_batches = []
+        self.cache_batch_sizes = []
 
     def _row(self, generated):
         row = torch.full((16,), -20.0)
@@ -36,6 +38,9 @@ class FakeModel:
         batch, q_len = input_ids.shape
         self.q_lens.append(q_len)
         self.batch_sizes.append(batch)
+        self.input_batches.append(input_ids[:, 0].tolist())
+        if past_key_values is not None:
+            self.cache_batch_sizes.append(past_key_values[0][0].shape[0])
         previous = 0 if past_key_values is None else past_key_values[0][0].shape[-2]
         logits = torch.empty((batch, q_len, 16))
         for offset in range(q_len):
@@ -170,6 +175,15 @@ class MultiTokenDfsTest(unittest.TestCase):
         # prefill batch size. Logical length buckets therefore use duplicated
         # real lanes as disposable fillers instead of changing physical batch.
         self.assertEqual(set(model.batch_sizes), {2})
+        self.assertEqual(set(model.cache_batch_sizes), {2})
+        self.assertTrue(
+            any(q_len == 4 and tokens == [0, 1]
+                for q_len, tokens in zip(model.q_lens, model.input_batches))
+        )
+        self.assertTrue(
+            any(q_len == 3 and tokens == [1, 0]
+                for q_len, tokens in zip(model.q_lens, model.input_batches))
+        )
         self.assertGreater(stats["padded_model_tokens"], 0)
 
 
