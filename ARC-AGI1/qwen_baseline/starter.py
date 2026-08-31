@@ -157,6 +157,7 @@ if __name__ == "__main__":
     parser.add_argument("--eval-color-permutations", type=int, default=2)
     parser.add_argument("--shared-eval-augmentations", action="store_true")
     parser.add_argument("--adaptive-output-dir", type=str, default=None)
+    parser.add_argument("--adaptive-resume-frontier", action="store_true")
     parser.add_argument("--adaptive-dfs-prob-threshold", type=float, default=0.1)
     parser.add_argument("--adaptive-color-permutations", type=int, default=3)
     parser.add_argument("--adaptive-min-unique-candidates", type=int, default=2)
@@ -250,6 +251,22 @@ if __name__ == "__main__":
         raise ValueError(
             "--adaptive-output-dir requires --shared-eval-augmentations"
         )
+    if args.adaptive_resume_frontier and not args.adaptive_output_dir:
+        raise ValueError(
+            "--adaptive-resume-frontier requires --adaptive-output-dir"
+        )
+    if args.adaptive_resume_frontier and not args.use_unsloth_multitoken_dfs:
+        raise ValueError(
+            "--adaptive-resume-frontier requires --use-unsloth-multitoken-dfs"
+        )
+    if (
+        args.adaptive_resume_frontier
+        and args.adaptive_dfs_prob_threshold >= args.dfs_prob_threshold
+    ):
+        raise ValueError(
+            "--adaptive-resume-frontier requires an adaptive probability "
+            "threshold lower than the primary threshold"
+        )
     if args.opsd_min_train_pairs < 3:
         raise ValueError("--opsd-min-train-pairs must be at least 3")
     if args.opsd_color_permutations < 1:
@@ -306,6 +323,9 @@ if __name__ == "__main__":
         os.environ["ARC_ADAPTIVE_OUTPUT_DIR"] = args.adaptive_output_dir
     else:
         os.environ.pop("ARC_ADAPTIVE_OUTPUT_DIR", None)
+    os.environ["ARC_ADAPTIVE_RESUME_FRONTIER"] = (
+        "1" if args.adaptive_resume_frontier else "0"
+    )
     os.environ["ARC_ADAPTIVE_DFS_PROB_THRESHOLD"] = str(
         args.adaptive_dfs_prob_threshold
     )

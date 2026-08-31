@@ -1,10 +1,12 @@
 import json
+import copy
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "arc26-vanilla-v2-q9-24-submit-competition.ipynb"
-TARGET = ROOT / "arc26-shared-views-adaptive49-validation.ipynb"
+TARGET = ROOT / "arc26-shared-views-frontier-resume49-validation.ipynb"
+SUBMISSION_TARGET = ROOT / "arc26-vanilla-v2-shared-frontier-bounded-submit.ipynb"
 CHALLENGES = (
     Path(__file__).resolve().parents[2]
     / "external/TinyRecursiveModels/kaggle/combined/arc-agi_evaluation2_challenges.json"
@@ -22,9 +24,10 @@ notebook["cells"][0]["source"] = (
     "Vanilla V2 production TTFT with q9 and 24 primary views. Every test output "
     "within a puzzle receives the identical geometry, color permutation, and "
     "demonstration ordering. Outputs with fewer than two distinct primary "
-    "candidates receive a fresh 24-view threshold-0.1 adaptive pass while the "
-    "same per-task LoRA remains live. Primary and adaptive pools are preserved "
-    "separately.\n"
+    "candidates resume only the primary DFS boundary branches newly admitted "
+    "when the cumulative threshold relaxes from 0.2 to 0.1. The same per-task "
+    "LoRA and primary augmentation views remain live; primary and resumed pools "
+    "are preserved separately.\n"
 )
 
 notebook["cells"][2]["source"] = f'''MODE = "validation"
@@ -58,6 +61,7 @@ source = command_cell["source"]
 needle = '        "--eval-color-permutations", str(EVAL_COLOR_PERMUTATIONS),\n'
 replacement = needle + '''        "--shared-eval-augmentations",
         "--adaptive-output-dir", ADAPTIVE_OUTPUT_DIR,
+        "--adaptive-resume-frontier",
         "--adaptive-dfs-prob-threshold", str(ADAPTIVE_DFS_PROB_THRESHOLD),
         "--adaptive-color-permutations", str(ADAPTIVE_COLOR_PERMUTATIONS),
         "--adaptive-min-unique-candidates", str(ADAPTIVE_MIN_UNIQUE_CANDIDATES),
@@ -80,15 +84,16 @@ if WORK_CODE_DIR not in sys.path:
 
 from arc_loader import ArcDataset
 from arc_decoder import ArcDecoder, score_kgmon
+from arc_shared_selection import select_bounded_shared_support, fill_missing_attempts
 
 data = ArcDataset.from_file(TEST_PATH, keys=SELECTED_KEYS).load_replies(SOLUTION_PATH)
 split_data = data.split_multi_replies()
 Path(ADAPTIVE_OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
 
-primary_decoder = ArcDecoder(split_data, n_guesses=2)
-if Path(OUTPUT_DIR).exists():
-    primary_decoder.load_decoded_results(OUTPUT_DIR)
-primary_ranked = primary_decoder.run_selection_algo(score_kgmon)
+primary_ranked, primary_counts, primary_decoder = select_bounded_shared_support(
+    data, split_data, OUTPUT_DIR, support_weight=2.0, n_guesses=2
+)
+primary_kgmon = primary_decoder.run_selection_algo(score_kgmon)
 
 combined_decoder = ArcDecoder(split_data, n_guesses=2)
 if Path(OUTPUT_DIR).exists():
@@ -97,24 +102,9 @@ if Path(ADAPTIVE_OUTPUT_DIR).exists():
     combined_decoder.load_decoded_results(ADAPTIVE_OUTPUT_DIR, run_name=".adaptive")
 combined_ranked = combined_decoder.run_selection_algo(score_kgmon)
 
-safe_adaptive = {}
-for base_key in split_data.keys:
-    primary = primary_ranked.get(base_key, [])
-    adaptive_and_primary = combined_ranked.get(base_key, [])
-    if len(primary) >= 2:
-        safe_adaptive[base_key] = primary[:2]
-    elif len(primary) == 1:
-        distinct = next(
-            (
-                candidate
-                for candidate in adaptive_and_primary
-                if not np.array_equal(candidate, primary[0])
-            ),
-            primary[0],
-        )
-        safe_adaptive[base_key] = [primary[0], distinct]
-    else:
-        safe_adaptive[base_key] = adaptive_and_primary[:2]
+safe_adaptive = fill_missing_attempts(
+    primary_ranked, combined_ranked, primary_counts, n_guesses=2
+)
 
 def score(selected):
     submission = data.get_submission(selected)
@@ -128,14 +118,6 @@ def oracle(decoder):
         if any(np.array_equal(record["solution"], gold) for record in records.values()):
             total += 1 / len(data.queries[puzzle_key]["test"])
     return total
-
-primary_counts = {}
-for base_key in split_data.keys:
-    grids = {
-        tuple(map(tuple, record["solution"]))
-        for record in primary_decoder.decoded_results.get(base_key, {}).values()
-    }
-    primary_counts[base_key] = len(grids)
 
 summary = {
     "requested_tasks": len(SELECTED_KEYS),
@@ -151,7 +133,8 @@ summary = {
     "primary_zero_candidate_outputs": sum(value == 0 for value in primary_counts.values()),
     "primary_one_candidate_outputs": sum(value == 1 for value in primary_counts.values()),
     "primary_two_plus_candidate_outputs": sum(value >= 2 for value in primary_counts.values()),
-    "primary_score": score(primary_ranked),
+    "primary_kgmon_score": score(primary_kgmon),
+    "primary_bounded_support_score": score(primary_ranked),
     "safe_adaptive_score": score(safe_adaptive),
     "primary_oracle": oracle(primary_decoder),
     "combined_oracle": oracle(combined_decoder),
@@ -181,6 +164,62 @@ for cell in notebook["cells"]:
         cell["outputs"] = []
 
 TARGET.write_text(json.dumps(notebook, indent=1) + "\n")
+
+submission_notebook = copy.deepcopy(notebook)
+submission_notebook["cells"][0]["source"] = (
+    "# ARC26 Vanilla V2 shared-frontier bounded submission\n\n"
+    "The 31.94 Vanilla V2 q9/24-view control with shared multi-output views, "
+    "cheap-first ordering, threshold-0.2 primary DFS, starved-output frontier "
+    "resume to threshold 0.1, bounded shared-tuple support weight 2, and safe "
+    "adaptive filling that never displaces two primary attempts.\n"
+)
+submission_notebook["cells"][2]["source"] = submission_notebook["cells"][2][
+    "source"
+].replace('MODE = "validation"', 'MODE = "submit_competition"', 1)
+submission_notebook["cells"][8]["source"] = r'''import json
+import sys
+from pathlib import Path
+
+if WORK_CODE_DIR not in sys.path:
+    sys.path.insert(0, WORK_CODE_DIR)
+
+from arc_loader import ArcDataset
+from arc_decoder import ArcDecoder, score_kgmon
+from arc_shared_selection import select_bounded_shared_support, fill_missing_attempts
+
+Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+Path(ADAPTIVE_OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+data = ArcDataset.from_file(TEST_PATH, keys=SELECTED_KEYS)
+split_data = data.split_multi_replies()
+
+primary_ranked, primary_counts, primary_decoder = select_bounded_shared_support(
+    data, split_data, OUTPUT_DIR, support_weight=2.0, n_guesses=2
+)
+combined_decoder = ArcDecoder(split_data, n_guesses=2)
+combined_decoder.load_decoded_results(OUTPUT_DIR)
+combined_decoder.load_decoded_results(ADAPTIVE_OUTPUT_DIR, run_name=".adaptive")
+combined_ranked = combined_decoder.run_selection_algo(score_kgmon)
+selected = fill_missing_attempts(
+    primary_ranked, combined_ranked, primary_counts, n_guesses=2
+)
+
+submission = data.get_submission(selected)
+Path(SUBMISSION_PATH).write_text(json.dumps(submission))
+print("submission tasks =", len(submission))
+print("primary zero/one/two+ =", {
+    "zero": sum(value == 0 for value in primary_counts.values()),
+    "one": sum(value == 1 for value in primary_counts.values()),
+    "two_plus": sum(value >= 2 for value in primary_counts.values()),
+})
+print("submission_path =", SUBMISSION_PATH)
+'''
+for cell in submission_notebook["cells"]:
+    if cell["cell_type"] == "code":
+        cell["execution_count"] = None
+        cell["outputs"] = []
+SUBMISSION_TARGET.write_text(json.dumps(submission_notebook, indent=1) + "\n")
+
 print(TARGET)
+print(SUBMISSION_TARGET)
 print("multi-output tasks:", len(multi_output_keys))
 print("test outputs:", sum(len(challenges[key]["test"]) for key in multi_output_keys))

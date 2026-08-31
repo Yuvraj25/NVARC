@@ -98,7 +98,17 @@ def _slice_canon_cache(cache, length: int, canon_state):
     return CanonDFSCache(kv=_slice_cache(cache.kv, length), canon=selected_state)
 
 
-def _classify_frame(logits, scores, remaining: int, max_score: float):
+def _classify_frame(
+    logits,
+    scores,
+    remaining: int,
+    max_score: float,
+    *,
+    generated_prefixes=None,
+    frontier=None,
+    frontier_max_score=None,
+    root_lanes=None,
+):
     n = logits.size(0)
     nll = torch.tensor(scores, dtype=torch.float32).view(n, 1) - logits.float().cpu().log_softmax(-1)
     eos = defaultdict(list)
@@ -108,6 +118,23 @@ def _classify_frame(logits, scores, remaining: int, max_score: float):
         for token_id in ARC_TOKENS:
             score = nll[lane, token_id].item()
             if score >= max_score:
+                can_finish = token_id == EOS_ID
+                can_continue = token_id != EOS_ID and remaining > 1
+                if (
+                    frontier is not None
+                    and frontier_max_score is not None
+                    and score < frontier_max_score
+                    and (can_finish or can_continue)
+                    and scores[lane] < max_score
+                ):
+                    frontier.append(
+                        {
+                            "lane": lane if root_lanes is None else root_lanes[lane],
+                            "score": score,
+                            "tokens": list(generated_prefixes[lane]) + [token_id],
+                            "finished": can_finish,
+                        }
+                    )
                 continue
             if token_id == EOS_ID:
                 eos[lane].append((score, [token_id]))
@@ -138,10 +165,31 @@ def _classify_structured_frame(logits, scores, remaining, max_score, states):
     return eos, candidates
 
 
-def _can_accept_repeat(logits, scores, remaining, repeat_tokens, active, max_score):
+def _can_accept_repeat(
+    logits,
+    scores,
+    remaining,
+    repeat_tokens,
+    active,
+    max_score,
+    *,
+    generated_prefixes=None,
+    frontier=None,
+    frontier_max_score=None,
+    root_lanes=None,
+):
     if remaining <= 1:
         return None
-    eos, candidates = _classify_frame(logits, scores, remaining, max_score)
+    eos, candidates = _classify_frame(
+        logits,
+        scores,
+        remaining,
+        max_score,
+        generated_prefixes=generated_prefixes,
+        frontier=frontier,
+        frontier_max_score=frontier_max_score,
+        root_lanes=root_lanes,
+    )
     next_scores = list(scores)
     for lane, is_active in enumerate(active):
         if not is_active:
@@ -188,6 +236,16 @@ def _bump(stats, name, value=1):
         stats[name] = int(stats.get(name, 0)) + int(value)
 
 
+def _reset_unsloth_paged_attention(model):
+    """Force the next cached step to import the newly prefetched KV cache."""
+    modules = model.modules() if hasattr(model, "modules") else ()
+    for module in modules:
+        if hasattr(module, "paged_attention"):
+            for name in ("paged_attention_K", "paged_attention_V", "paged_attention"):
+                if hasattr(module, name):
+                    delattr(module, name)
+
+
 def turbo_dfs_multitoken(
     model,
     logits,
@@ -200,10 +258,27 @@ def turbo_dfs_multitoken(
     end_time,
     repeat_len=9,
     stats=None,
+    generated_prefixes=None,
+    frontier=None,
+    frontier_max_score=None,
+    root_lanes=None,
 ):
     """Run DFS with conservative repeated-token block verification."""
     n = logits.size(0)
-    suffixes, candidates = _classify_frame(logits, scores, max_new_tokens, max_score)
+    if generated_prefixes is None:
+        generated_prefixes = [[] for _ in range(n)]
+    if root_lanes is None:
+        root_lanes = list(range(n))
+    suffixes, candidates = _classify_frame(
+        logits,
+        scores,
+        max_new_tokens,
+        max_score,
+        generated_prefixes=generated_prefixes,
+        frontier=frontier,
+        frontier_max_score=frontier_max_score,
+        root_lanes=root_lanes,
+    )
     _bump(stats, "frames", sum(score < max_score for score in scores))
 
     while time.time() - start_time < 540 and time.time() < end_time:
@@ -260,6 +335,11 @@ def turbo_dfs_multitoken(
         consumed = 1
         chain_scores = list(batch_scores)
         while consumed < draft_len:
+            intermediate_prefixes = [
+                list(generated_prefixes[lane])
+                + ([batch_tokens[lane]] * consumed if active[lane] else [])
+                for lane in range(n)
+            ]
             accepted_scores = _can_accept_repeat(
                 outputs.logits[:, consumed - 1],
                 chain_scores,
@@ -267,6 +347,10 @@ def turbo_dfs_multitoken(
                 batch_tokens,
                 active,
                 max_score,
+                generated_prefixes=intermediate_prefixes,
+                frontier=frontier,
+                frontier_max_score=frontier_max_score,
+                root_lanes=root_lanes,
             )
             if accepted_scores is None:
                 break
@@ -304,6 +388,14 @@ def turbo_dfs_multitoken(
             end_time=end_time,
             repeat_len=repeat_len,
             stats=stats,
+            generated_prefixes=[
+                list(generated_prefixes[lane])
+                + ([batch_tokens[lane]] * consumed if active[lane] else [])
+                for lane in range(n)
+            ],
+            frontier=frontier,
+            frontier_max_score=frontier_max_score,
+            root_lanes=root_lanes,
         )
 
         for lane, beams in next_suffixes.items():
@@ -492,6 +584,8 @@ def inference_turbo_dfs_multitoken(
     repeat_len=9,
     stats=None,
     structured_rows=False,
+    frontier_max_score=None,
+    return_frontier=False,
 ):
     input_ids = torch.tensor(prefix_tokens, device=model.device, dtype=torch.long)
     started = time.time()
@@ -516,6 +610,12 @@ def inference_turbo_dfs_multitoken(
         repeat_len=repeat_len,
         stats=stats,
     )
+    if structured_rows and frontier_max_score is not None:
+        raise NotImplementedError(
+            "Threshold-frontier capture is currently implemented for the "
+            "production unstructured q9 path only"
+        )
+    frontier = [] if frontier_max_score is not None else None
     if structured_rows:
         suffixes = turbo_dfs_multitoken_structured(
             states=[_GridState() for _ in range(input_ids.size(0))],
@@ -523,8 +623,110 @@ def inference_turbo_dfs_multitoken(
             **common,
         )
     else:
-        suffixes = turbo_dfs_multitoken(**common)
-    return [
+        suffixes = turbo_dfs_multitoken(
+            frontier=frontier,
+            frontier_max_score=frontier_max_score,
+            **common,
+        )
+    result = [
         (lane, sorted(beams, key=lambda item: item[0]))
         for lane, beams in suffixes.items()
+    ]
+    if return_frontier:
+        return result, sorted(
+            frontier or [],
+            key=lambda item: (item["lane"], item["score"], item["tokens"]),
+        )
+    return result
+
+
+@torch.no_grad()
+def resume_turbo_dfs_multitoken(
+    model,
+    prefix_tokens,
+    frontier,
+    max_new_tokens,
+    max_score,
+    end_time,
+    repeat_len=9,
+    stats=None,
+):
+    """Resume only branches captured at a stricter threshold boundary.
+
+    KV tensors are deliberately not retained in ``frontier``: doing so would
+    keep an entire cache per rejected sibling.  Entries of equal generated
+    length are instead replayed together at the original physical batch size.
+    """
+    if hasattr(model, "_arc_canon_enabled"):
+        raise NotImplementedError("Frontier resume is currently Vanilla-only")
+    physical_batch_size = len(prefix_tokens)
+    grouped = defaultdict(list)
+    completed = defaultdict(list)
+    for entry in frontier:
+        lane = int(entry["lane"])
+        tokens = list(entry["tokens"])
+        if entry.get("finished", False):
+            completed[lane].append((float(entry["score"]), tokens))
+        else:
+            grouped[len(tokens)].append(entry)
+
+    started = time.time()
+    for generated_length in sorted(grouped):
+        entries = grouped[generated_length]
+        for offset in range(0, len(entries), physical_batch_size):
+            if time.time() >= end_time or time.time() - started >= 540:
+                break
+            active_entries = entries[offset : offset + physical_batch_size]
+            padded_entries = list(active_entries)
+            while len(padded_entries) < physical_batch_size:
+                padded_entries.append(active_entries[0])
+
+            replay_tokens = [
+                list(prefix_tokens[int(entry["lane"])]) + list(entry["tokens"])
+                for entry in padded_entries
+            ]
+            _reset_unsloth_paged_attention(model)
+            input_ids = torch.tensor(
+                replay_tokens, device=model.device, dtype=torch.long
+            )
+            call_started = time.perf_counter()
+            outputs = model(input_ids=input_ids, return_dict=True, use_cache=True)
+            if stats is not None:
+                stats["resume_prefill_time_s"] = (
+                    stats.get("resume_prefill_time_s", 0.0)
+                    + time.perf_counter()
+                    - call_started
+                )
+            _bump(stats, "resume_prefill_calls")
+            _bump(stats, "resume_prefill_tokens", input_ids.numel())
+
+            scores = [float(entry["score"]) for entry in active_entries]
+            scores.extend([1000.0] * (physical_batch_size - len(scores)))
+            suffixes = turbo_dfs_multitoken(
+                model=model,
+                logits=outputs.logits[:, -1],
+                max_new_tokens=max_new_tokens - generated_length,
+                max_score=max_score,
+                scores=scores,
+                pos=input_ids.size(1),
+                cache=outputs.past_key_values,
+                start_time=started,
+                end_time=end_time,
+                repeat_len=repeat_len,
+                stats=stats,
+            )
+            for local_lane, beams in suffixes.items():
+                if local_lane >= len(active_entries):
+                    continue
+                entry = active_entries[local_lane]
+                root_lane = int(entry["lane"])
+                entry_tokens = list(entry["tokens"])
+                for score, suffix_tokens in beams:
+                    completed[root_lane].append(
+                        (score, entry_tokens + suffix_tokens)
+                    )
+
+    return [
+        (lane, sorted(beams, key=lambda item: item[0]))
+        for lane, beams in completed.items()
     ]

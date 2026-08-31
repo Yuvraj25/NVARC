@@ -10,6 +10,7 @@ from arc_search_multitoken import (
     _draft_len_for_token,
     _token_is_structurally_legal,
     inference_turbo_dfs_multitoken,
+    resume_turbo_dfs_multitoken,
     turbo_dfs_multitoken_structured,
 )
 
@@ -54,6 +55,16 @@ class FakeModel:
         )
 
 
+class FrontierFakeModel(FakeModel):
+    def _row(self, generated):
+        row = torch.full((16,), -20.0)
+        target = self.targets[min(generated, len(self.targets) - 1)]
+        row[target] = 8.0
+        if generated in self.ambiguous_positions:
+            row[3 if target != 3 else 4] = 6.4
+        return row
+
+
 def token_results(result):
     return {
         lane: [tokens for _score, tokens in beams]
@@ -93,6 +104,62 @@ class MultiTokenDfsTest(unittest.TestCase):
     def test_ambiguous_frame_falls_back_without_reordering_results(self):
         _baseline, _speculative, stats = self.compare_paths({2})
         self.assertGreater(stats["zero_extra_blocks"], 0)
+
+    def test_relaxed_threshold_resumes_only_captured_boundary_branches(self):
+        prefix = [[11, 12], [11, 12]]
+        targets = [4, 4, 10, 2, 2, 15]
+        primary_max = -torch.log(torch.tensor(0.2)).item()
+        relaxed_max = -torch.log(torch.tensor(0.1)).item()
+        deadline = time.time() + 30
+
+        primary_model = FrontierFakeModel(len(prefix[0]), targets, {0, 2})
+        primary, frontier = inference_turbo_dfs_multitoken(
+            primary_model,
+            prefix,
+            max_new_tokens=12,
+            max_score=primary_max,
+            end_time=deadline,
+            repeat_len=4,
+            frontier_max_score=relaxed_max,
+            return_frontier=True,
+        )
+        self.assertTrue(frontier)
+        # Position 2 is traversed inside a speculative block. Its rejected
+        # sibling must still be captured, not only ordinary recursion frames.
+        self.assertTrue(any(len(entry["tokens"]) == 3 for entry in frontier))
+
+        resumed_model = FrontierFakeModel(len(prefix[0]), targets, {0, 2})
+        resumed = resume_turbo_dfs_multitoken(
+            resumed_model,
+            prefix,
+            frontier,
+            max_new_tokens=12,
+            max_score=relaxed_max,
+            end_time=deadline,
+            repeat_len=4,
+        )
+        full_model = FrontierFakeModel(len(prefix[0]), targets, {0, 2})
+        full_relaxed = inference_turbo_dfs_multitoken(
+            full_model,
+            prefix,
+            max_new_tokens=12,
+            max_score=relaxed_max,
+            end_time=deadline,
+            repeat_len=4,
+        )
+        combined = {
+            lane: {tuple(tokens) for _score, tokens in beams}
+            for lane, beams in primary
+        }
+        for lane, beams in resumed:
+            combined.setdefault(lane, set()).update(
+                tuple(tokens) for _score, tokens in beams
+            )
+        expected = {
+            lane: {tuple(tokens) for _score, tokens in beams}
+            for lane, beams in full_relaxed
+        }
+        self.assertEqual(combined, expected)
 
     def test_structured_path_preserves_rectangular_candidate(self):
         prefix = [[11, 12], [11, 12]]
