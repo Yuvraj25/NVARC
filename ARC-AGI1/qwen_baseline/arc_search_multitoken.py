@@ -67,6 +67,25 @@ def _draft_len_for_token(state, token_id, repeat_len, remaining):
     return min(max(1, repeat_len), cells_left, remaining - 1)
 
 
+def _advance_unconstrained_diagnostic(state, already_invalid, token_id, count):
+    """Track when ordinary DFS first makes a rectangular grid impossible.
+
+    This is diagnostic only: it never changes ordinary DFS branch selection.
+    """
+    became_invalid = False
+    current = state
+    invalid = already_invalid
+    for _ in range(count):
+        if invalid:
+            continue
+        if not _token_is_structurally_legal(current, token_id):
+            invalid = True
+            became_invalid = True
+            continue
+        current = current.advance(token_id)
+    return current, invalid, became_invalid
+
+
 def _position_ids(batch_size: int, start: int, length: int, device):
     values = torch.arange(start, start + length, device=device, dtype=torch.long)
     return values.unsqueeze(0).expand(batch_size, -1)
@@ -262,6 +281,8 @@ def turbo_dfs_multitoken(
     frontier=None,
     frontier_max_score=None,
     root_lanes=None,
+    diagnostic_grid_states=None,
+    diagnostic_invalid=None,
 ):
     """Run DFS with conservative repeated-token block verification."""
     n = logits.size(0)
@@ -269,6 +290,10 @@ def turbo_dfs_multitoken(
         generated_prefixes = [[] for _ in range(n)]
     if root_lanes is None:
         root_lanes = list(range(n))
+    if diagnostic_grid_states is None:
+        diagnostic_grid_states = [_GridState() for _ in range(n)]
+    if diagnostic_invalid is None:
+        diagnostic_invalid = [False for _ in range(n)]
     suffixes, candidates = _classify_frame(
         logits,
         scores,
@@ -280,6 +305,14 @@ def turbo_dfs_multitoken(
         root_lanes=root_lanes,
     )
     _bump(stats, "frames", sum(score < max_score for score in scores))
+    for lane, beams in suffixes.items():
+        if beams and (
+            diagnostic_invalid[lane]
+            or not _token_is_structurally_legal(
+                diagnostic_grid_states[lane], EOS_ID
+            )
+        ):
+            _bump(stats, "structural_invalid_eos_candidates", len(beams))
 
     while time.time() - start_time < 540 and time.time() < end_time:
         batch_tokens = []
@@ -360,6 +393,32 @@ def turbo_dfs_multitoken(
         _bump(stats, "accepted_extra_tokens", sum(active) * (consumed - 1))
         if draft_len > 1 and consumed == 1:
             _bump(stats, "zero_extra_blocks")
+        child_diagnostic_states = list(diagnostic_grid_states)
+        child_diagnostic_invalid = list(diagnostic_invalid)
+        invalid_model_lanes = 0
+        for lane, is_active in enumerate(active):
+            if not is_active:
+                continue
+            (
+                child_diagnostic_states[lane],
+                child_diagnostic_invalid[lane],
+                became_invalid,
+            ) = _advance_unconstrained_diagnostic(
+                diagnostic_grid_states[lane],
+                diagnostic_invalid[lane],
+                batch_tokens[lane],
+                consumed,
+            )
+            if became_invalid:
+                _bump(stats, "structural_invalid_branches_started")
+            if child_diagnostic_invalid[lane]:
+                invalid_model_lanes += 1
+        _bump(stats, "structural_invalid_model_lanes", invalid_model_lanes)
+        _bump(
+            stats,
+            "structural_invalid_model_tokens",
+            invalid_model_lanes * draft_len,
+        )
         cache_len = pos + consumed
         # A depth-first call can remain on the Python stack for hundreds of
         # output tokens.  Do not let that stack retain the complete q-token
@@ -396,6 +455,8 @@ def turbo_dfs_multitoken(
             frontier=frontier,
             frontier_max_score=frontier_max_score,
             root_lanes=root_lanes,
+            diagnostic_grid_states=child_diagnostic_states,
+            diagnostic_invalid=child_diagnostic_invalid,
         )
 
         for lane, beams in next_suffixes.items():
@@ -499,6 +560,7 @@ def turbo_dfs_multitoken_structured(
                 return_dict=True,
                 use_cache=True,
             )
+            call_elapsed = time.perf_counter() - call_started
             _bump(stats, "model_calls")
             _bump(stats, "model_tokens", physical_batch_size * draft_len)
             _bump(stats, "useful_model_tokens", logical_group_size * draft_len)
@@ -509,8 +571,23 @@ def turbo_dfs_multitoken_structured(
             )
             _bump(stats, "length_bucket_calls")
             _bump(stats, f"q{draft_len}_calls")
+            _bump(
+                stats,
+                f"q{draft_len}_model_time_us",
+                round(call_elapsed * 1_000_000),
+            )
+            _bump(
+                stats,
+                f"q{draft_len}_logical_lanes",
+                logical_group_size,
+            )
+            _bump(
+                stats,
+                f"q{draft_len}_physical_lanes",
+                physical_batch_size,
+            )
             if stats is not None:
-                stats["model_time_s"] = stats.get("model_time_s", 0.0) + time.perf_counter() - call_started
+                stats["model_time_s"] = stats.get("model_time_s", 0.0) + call_elapsed
             if draft_len > 1:
                 _bump(stats, "block_calls")
                 _bump(stats, "draft_tokens", physical_batch_size * draft_len)

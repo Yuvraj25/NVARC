@@ -161,6 +161,8 @@ if __name__ == "__main__":
     parser.add_argument("--adaptive-dfs-prob-threshold", type=float, default=0.1)
     parser.add_argument("--adaptive-color-permutations", type=int, default=3)
     parser.add_argument("--adaptive-min-unique-candidates", type=int, default=2)
+    parser.add_argument("--compare-structured-output-dir", type=str, default=None)
+    parser.add_argument("--compare-fresh-adaptive-output-dir", type=str, default=None)
     parser.add_argument("--cheap-first", action="store_true")
     parser.add_argument("--profile-timings", action="store_true")
     parser.add_argument(
@@ -335,6 +337,14 @@ if __name__ == "__main__":
     os.environ["ARC_ADAPTIVE_MIN_UNIQUE_CANDIDATES"] = str(
         args.adaptive_min_unique_candidates
     )
+    if args.compare_structured_output_dir is not None:
+        os.environ["ARC_COMPARE_STRUCTURED_OUTPUT_DIR"] = args.compare_structured_output_dir
+    else:
+        os.environ.pop("ARC_COMPARE_STRUCTURED_OUTPUT_DIR", None)
+    if args.compare_fresh_adaptive_output_dir is not None:
+        os.environ["ARC_COMPARE_FRESH_ADAPTIVE_OUTPUT_DIR"] = args.compare_fresh_adaptive_output_dir
+    else:
+        os.environ.pop("ARC_COMPARE_FRESH_ADAPTIVE_OUTPUT_DIR", None)
     os.environ["ARC_PROFILE_TIMINGS"] = "1" if args.profile_timings else "0"
     os.environ["ARC_TEST_PATH"] = args.test_path
     os.environ["ARC_MODEL_PATH"] = args.model_path

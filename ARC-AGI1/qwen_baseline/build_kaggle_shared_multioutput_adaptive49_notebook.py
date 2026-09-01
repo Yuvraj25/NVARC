@@ -7,6 +7,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "arc26-vanilla-v2-q9-24-submit-competition.ipynb"
 TARGET = ROOT / "arc26-shared-views-frontier-resume49-validation.ipynb"
 SUBMISSION_TARGET = ROOT / "arc26-vanilla-v2-shared-frontier-bounded-submit.ipynb"
+SMOKE_TARGET = ROOT / "arc26-shared-frontier-bounded-smoke4.ipynb"
 CHALLENGES = (
     Path(__file__).resolve().parents[2]
     / "external/TinyRecursiveModels/kaggle/combined/arc-agi_evaluation2_challenges.json"
@@ -61,7 +62,6 @@ source = command_cell["source"]
 needle = '        "--eval-color-permutations", str(EVAL_COLOR_PERMUTATIONS),\n'
 replacement = needle + '''        "--shared-eval-augmentations",
         "--adaptive-output-dir", ADAPTIVE_OUTPUT_DIR,
-        "--adaptive-resume-frontier",
         "--adaptive-dfs-prob-threshold", str(ADAPTIVE_DFS_PROB_THRESHOLD),
         "--adaptive-color-permutations", str(ADAPTIVE_COLOR_PERMUTATIONS),
         "--adaptive-min-unique-candidates", str(ADAPTIVE_MIN_UNIQUE_CANDIDATES),
@@ -167,10 +167,11 @@ TARGET.write_text(json.dumps(notebook, indent=1) + "\n")
 
 submission_notebook = copy.deepcopy(notebook)
 submission_notebook["cells"][0]["source"] = (
-    "# ARC26 Vanilla V2 shared-frontier bounded submission\n\n"
+    "# ARC26 Vanilla V2 shared-view bounded submission\n\n"
     "The 31.94 Vanilla V2 q9/24-view control with shared multi-output views, "
-    "cheap-first ordering, threshold-0.2 primary DFS, starved-output frontier "
-    "resume to threshold 0.1, bounded shared-tuple support weight 2, and safe "
+    "cheap-first ordering, threshold-0.2 primary DFS, the validated fresh "
+    "adaptive pass at threshold 0.1 for starved outputs, bounded shared-tuple "
+    "support weight 2, and safe "
     "adaptive filling that never displaces two primary attempts.\n"
 )
 submission_notebook["cells"][2]["source"] = submission_notebook["cells"][2][
@@ -219,7 +220,45 @@ for cell in submission_notebook["cells"]:
         cell["outputs"] = []
 SUBMISSION_TARGET.write_text(json.dumps(submission_notebook, indent=1) + "\n")
 
+smoke_keys = ["5dbc8537", "b6f77b65", "142ca369", "38007db0"]
+smoke_notebook = copy.deepcopy(notebook)
+smoke_notebook["cells"][0]["source"] = (
+    "# ARC26 shared-frontier bounded four-task smoke\n\n"
+    "Production-faithful public-validation gate for the final shared-view, "
+    "cheap-first, frontier-resume, bounded-selector submission path.\n"
+)
+config_source = smoke_notebook["cells"][2]["source"]
+config_source = config_source.replace(
+    f"VALIDATION_KEYS = {multi_output_keys!r}",
+    f"VALIDATION_KEYS = {smoke_keys!r}",
+)
+config_source = config_source.replace(
+    "VALIDATION_END_TIME_HOURS = 4.0",
+    "VALIDATION_END_TIME_HOURS = 1.0",
+)
+config_source = config_source.replace(
+    'WORK_NOTEBOOK_ROOT = "/kaggle/working/arc2026_shared_adaptive49"',
+    'WORK_NOTEBOOK_ROOT = "/kaggle/working/arc2026_shared_frontier_smoke4"',
+)
+config_source = config_source.replace(
+    'WRITABLE_UNSLOTH_PARENT = "/kaggle/working/shared_adaptive49_stack"',
+    'WRITABLE_UNSLOTH_PARENT = "/kaggle/working/shared_frontier_smoke4_stack"',
+)
+smoke_notebook["cells"][2]["source"] = config_source
+smoke_notebook["cells"][3]["source"] = smoke_notebook["cells"][3][
+    "source"
+].replace(
+    'ADAPTIVE_OUTPUT_DIR = "/kaggle/working/shared_adaptive_candidates"',
+    'ADAPTIVE_OUTPUT_DIR = "/kaggle/working/shared_frontier_smoke4_adaptive"',
+)
+for cell in smoke_notebook["cells"]:
+    if cell["cell_type"] == "code":
+        cell["execution_count"] = None
+        cell["outputs"] = []
+SMOKE_TARGET.write_text(json.dumps(smoke_notebook, indent=1) + "\n")
+
 print(TARGET)
 print(SUBMISSION_TARGET)
+print(SMOKE_TARGET)
 print("multi-output tasks:", len(multi_output_keys))
 print("test outputs:", sum(len(challenges[key]["test"]) for key in multi_output_keys))

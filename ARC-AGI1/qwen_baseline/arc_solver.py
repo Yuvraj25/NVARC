@@ -113,6 +113,12 @@ def runtime_config():
         "adaptive_min_unique_candidates": int(
             os.environ.get("ARC_ADAPTIVE_MIN_UNIQUE_CANDIDATES", "2")
         ),
+        "compare_structured_output_dir": os.environ.get(
+            "ARC_COMPARE_STRUCTURED_OUTPUT_DIR"
+        ),
+        "compare_fresh_adaptive_output_dir": os.environ.get(
+            "ARC_COMPARE_FRESH_ADAPTIVE_OUTPUT_DIR"
+        ),
         "model_path": os.environ.get("ARC_MODEL_PATH", "../input/qwen3_4b_grids15_sft139/"),
         "test_path": os.environ.get("ARC_TEST_PATH", "../input/arc-prize-2024/arc-agi_evaluation_challenges.json"),
         "output_dir": os.environ.get("ARC_OUTPUT_DIR", "../inference_outputs"),
@@ -1870,6 +1876,7 @@ def worker(rank, queue, end_time):
             )
 
             adaptive_output_dir = config["adaptive_output_dir"]
+            starved = set()
             if adaptive_output_dir:
                 unique_counts = {
                     base_key: sum(1 for candidate_key in known_scores if candidate_key[0] == base_key)
@@ -1979,6 +1986,98 @@ def worker(rank, queue, end_time):
                             known_scores=known_scores,
                             rescorers=rescorers,
                         )
+
+            compare_fresh_dir = config["compare_fresh_adaptive_output_dir"]
+            if compare_fresh_dir and starved and time.time() < end_time:
+                fresh_eval_ds = eval_ds.change_keys(
+                    [
+                        subkey
+                        for subkey in eval_ds.keys
+                        if subkey.split(".")[0] in starved
+                    ]
+                )
+                fresh_timing_stats = defaultdict(float)
+                fresh_count_stats = defaultdict(int)
+                _run_hf_eval_batches(
+                    rank=rank,
+                    key=key,
+                    model=model,
+                    tokenizer=tokenizer,
+                    formatter=formatter,
+                    puzzle_ds_multi=puzzle_ds_multi,
+                    eval_ds=fresh_eval_ds,
+                    output_dir=compare_fresh_dir,
+                    max_seq_length=max_seq_length,
+                    max_new_tokens=max_new_tokens,
+                    max_score=default_max_score(
+                        config["adaptive_dfs_prob_threshold"]
+                    ),
+                    use_multitoken=config["use_unsloth_multitoken_dfs"],
+                    use_structured_rows=False,
+                    repeat_len=config["unsloth_multitoken_repeat_len"],
+                    start_time=time.time(),
+                    end_time=end_time,
+                    timing_stats=fresh_timing_stats,
+                    count_stats=fresh_count_stats,
+                    timing_prefix="fresh_compare",
+                    known_scores={},
+                    rescorers={},
+                )
+                diagnostics_dir = f"{compare_fresh_dir}_diagnostics"
+                os.makedirs(diagnostics_dir, exist_ok=True)
+                with open(os.path.join(diagnostics_dir, f"{key}.json"), "w") as f:
+                    json.dump(
+                        {
+                            "timing": dict(fresh_timing_stats),
+                            "counts": dict(fresh_count_stats),
+                            "starved_outputs": sorted(starved),
+                        },
+                        f,
+                        indent=2,
+                        sort_keys=True,
+                    )
+
+            compare_structured_dir = config["compare_structured_output_dir"]
+            if compare_structured_dir and time.time() < end_time:
+                structured_timing_stats = defaultdict(float)
+                structured_count_stats = defaultdict(int)
+                _run_hf_eval_batches(
+                    rank=rank,
+                    key=key,
+                    model=model,
+                    tokenizer=tokenizer,
+                    formatter=formatter,
+                    puzzle_ds_multi=puzzle_ds_multi,
+                    eval_ds=eval_ds,
+                    output_dir=compare_structured_dir,
+                    max_seq_length=max_seq_length,
+                    max_new_tokens=max_new_tokens,
+                    max_score=max_score,
+                    use_multitoken=True,
+                    use_structured_rows=True,
+                    repeat_len=config["unsloth_multitoken_repeat_len"],
+                    start_time=time.time(),
+                    end_time=end_time,
+                    timing_stats=structured_timing_stats,
+                    count_stats=structured_count_stats,
+                    timing_prefix="structured_compare",
+                    known_scores={},
+                    rescorers={},
+                )
+                diagnostics_dir = f"{compare_structured_dir}_diagnostics"
+                os.makedirs(diagnostics_dir, exist_ok=True)
+                with open(os.path.join(diagnostics_dir, f"{key}.json"), "w") as f:
+                    json.dump(
+                        {
+                            "control_timing": dict(timing_stats),
+                            "control_counts": dict(count_stats),
+                            "structured_timing": dict(structured_timing_stats),
+                            "structured_counts": dict(structured_count_stats),
+                        },
+                        f,
+                        indent=2,
+                        sort_keys=True,
+                    )
 
         memory_allocated = torch.cuda.max_memory_allocated() // 1024**2
         print(f"[Rank {rank}] allocated {memory_allocated}MB for inference")
