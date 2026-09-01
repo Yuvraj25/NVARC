@@ -138,6 +138,7 @@ if __name__ == "__main__":
     parser.add_argument("--use-speculative-dfs", action="store_true")
     parser.add_argument("--use-unsloth-multitoken-dfs", action="store_true")
     parser.add_argument("--use-unsloth-structured-rows", action="store_true")
+    parser.add_argument("--prune-structural-invalid", action="store_true")
     parser.add_argument("--unsloth-multitoken-repeat-len", type=int, default=9)
     parser.add_argument("--use-sglang", action="store_true")
     parser.add_argument("--sglang-tp-size", type=int, default=1)
@@ -241,6 +242,15 @@ if __name__ == "__main__":
         raise ValueError(
             "--use-unsloth-structured-rows is initially a Vanilla-only experiment"
         )
+    if args.prune_structural_invalid and not args.use_unsloth_multitoken_dfs:
+        raise ValueError(
+            "--prune-structural-invalid requires --use-unsloth-multitoken-dfs"
+        )
+    if args.prune_structural_invalid and args.use_unsloth_structured_rows:
+        raise ValueError(
+            "--prune-structural-invalid and --use-unsloth-structured-rows "
+            "are alternative grammar implementations"
+        )
     if args.eval_color_permutations < 1:
         raise ValueError("--eval-color-permutations must be positive")
     if args.adaptive_color_permutations < 1:
@@ -299,6 +309,7 @@ if __name__ == "__main__":
     os.environ["ARC_USE_SPECULATIVE_DFS"] = "1" if args.use_speculative_dfs else "0"
     os.environ["ARC_USE_UNSLOTH_MULTITOKEN_DFS"] = "1" if args.use_unsloth_multitoken_dfs else "0"
     os.environ["ARC_USE_UNSLOTH_STRUCTURED_ROWS"] = "1" if args.use_unsloth_structured_rows else "0"
+    os.environ["ARC_PRUNE_STRUCTURAL_INVALID"] = "1" if args.prune_structural_invalid else "0"
     os.environ["ARC_UNSLOTH_MULTITOKEN_REPEAT_LEN"] = str(args.unsloth_multitoken_repeat_len)
     os.environ["ARC_USE_SGLANG"] = "1" if args.use_sglang else "0"
     os.environ["ARC_SGLANG_TP_SIZE"] = str(args.sglang_tp_size)
@@ -398,6 +409,7 @@ if __name__ == "__main__":
         f"speculative_dfs={os.environ['ARC_USE_SPECULATIVE_DFS']}",
         f"unsloth_multitoken_dfs={os.environ['ARC_USE_UNSLOTH_MULTITOKEN_DFS']}",
         f"unsloth_structured_rows={os.environ['ARC_USE_UNSLOTH_STRUCTURED_ROWS']}",
+        f"prune_structural_invalid={os.environ['ARC_PRUNE_STRUCTURAL_INVALID']}",
         f"unsloth_multitoken_repeat_len={os.environ['ARC_UNSLOTH_MULTITOKEN_REPEAT_LEN']}",
         f"use_sglang={os.environ['ARC_USE_SGLANG']}",
         f"sglang_tp_size={os.environ['ARC_SGLANG_TP_SIZE']}",

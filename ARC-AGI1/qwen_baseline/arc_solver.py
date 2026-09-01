@@ -94,6 +94,9 @@ def runtime_config():
         "use_speculative_dfs": _env_flag("ARC_USE_SPECULATIVE_DFS", default=False),
         "use_unsloth_multitoken_dfs": _env_flag("ARC_USE_UNSLOTH_MULTITOKEN_DFS", default=False),
         "use_unsloth_structured_rows": _env_flag("ARC_USE_UNSLOTH_STRUCTURED_ROWS", default=False),
+        "prune_structural_invalid": _env_flag(
+            "ARC_PRUNE_STRUCTURAL_INVALID", default=False
+        ),
         "unsloth_multitoken_repeat_len": int(os.environ.get("ARC_UNSLOTH_MULTITOKEN_REPEAT_LEN", "9")),
         "use_sglang": _env_flag("ARC_USE_SGLANG", default=False),
         "profile_timings": _env_flag("ARC_PROFILE_TIMINGS", default=False),
@@ -590,6 +593,7 @@ def _run_hf_eval_batches(
     max_score,
     use_multitoken,
     use_structured_rows,
+    prune_structural_invalid,
     repeat_len,
     start_time,
     end_time,
@@ -640,6 +644,7 @@ def _run_hf_eval_batches(
                 repeat_len=repeat_len,
                 stats=multitoken_stats,
                 structured_rows=use_structured_rows,
+                prune_structural_invalid=prune_structural_invalid,
                 frontier_max_score=frontier_max_score,
                 return_frontier=frontier_max_score is not None,
             )
@@ -1392,6 +1397,7 @@ def worker(rank, queue, end_time):
         f"dfs_prob_threshold={config['dfs_prob_threshold']} "
         f"multitoken_dfs={config['use_unsloth_multitoken_dfs']} "
         f"structured_rows={config['use_unsloth_structured_rows']} "
+        f"prune_structural_invalid={config['prune_structural_invalid']} "
         f"ttft_method={config['ttft_method']} fixed_candidate_dir={config['fixed_candidate_dir']} "
         f"shared_eval_augmentations={config['shared_eval_augmentations']} "
         f"adaptive_output_dir={config['adaptive_output_dir']} "
@@ -1862,6 +1868,7 @@ def worker(rank, queue, end_time):
                 max_score=max_score,
                 use_multitoken=config["use_unsloth_multitoken_dfs"],
                 use_structured_rows=config["use_unsloth_structured_rows"],
+                prune_structural_invalid=config["prune_structural_invalid"],
                 repeat_len=config["unsloth_multitoken_repeat_len"],
                 start_time=start_time,
                 end_time=end_time,
@@ -1981,6 +1988,7 @@ def worker(rank, queue, end_time):
                             ),
                             use_multitoken=config["use_unsloth_multitoken_dfs"],
                             use_structured_rows=config["use_unsloth_structured_rows"],
+                            prune_structural_invalid=config["prune_structural_invalid"],
                             repeat_len=config["unsloth_multitoken_repeat_len"],
                             start_time=start_time,
                             end_time=end_time,
@@ -2018,6 +2026,7 @@ def worker(rank, queue, end_time):
                     ),
                     use_multitoken=config["use_unsloth_multitoken_dfs"],
                     use_structured_rows=False,
+                    prune_structural_invalid=config["prune_structural_invalid"],
                     repeat_len=config["unsloth_multitoken_repeat_len"],
                     start_time=time.time(),
                     end_time=end_time,
@@ -2059,6 +2068,7 @@ def worker(rank, queue, end_time):
                     max_score=max_score,
                     use_multitoken=True,
                     use_structured_rows=True,
+                    prune_structural_invalid=False,
                     repeat_len=config["unsloth_multitoken_repeat_len"],
                     start_time=time.time(),
                     end_time=end_time,

@@ -127,6 +127,8 @@ def _classify_frame(
     frontier=None,
     frontier_max_score=None,
     root_lanes=None,
+    structural_states=None,
+    stats=None,
 ):
     n = logits.size(0)
     nll = torch.tensor(scores, dtype=torch.float32).view(n, 1) - logits.float().cpu().log_softmax(-1)
@@ -136,9 +138,18 @@ def _classify_frame(
         candidates[lane] = []
         for token_id in ARC_TOKENS:
             score = nll[lane, token_id].item()
+            can_finish = token_id == EOS_ID
+            can_continue = token_id != EOS_ID and remaining > 1
+            if (
+                structural_states is not None
+                and not _token_is_structurally_legal(
+                    structural_states[lane], token_id
+                )
+            ):
+                if score < max_score and (can_finish or can_continue):
+                    _bump(stats, "structural_pruned_candidates")
+                continue
             if score >= max_score:
-                can_finish = token_id == EOS_ID
-                can_continue = token_id != EOS_ID and remaining > 1
                 if (
                     frontier is not None
                     and frontier_max_score is not None
@@ -196,6 +207,8 @@ def _can_accept_repeat(
     frontier=None,
     frontier_max_score=None,
     root_lanes=None,
+    structural_states=None,
+    stats=None,
 ):
     if remaining <= 1:
         return None
@@ -208,6 +221,8 @@ def _can_accept_repeat(
         frontier=frontier,
         frontier_max_score=frontier_max_score,
         root_lanes=root_lanes,
+        structural_states=structural_states,
+        stats=stats,
     )
     next_scores = list(scores)
     for lane, is_active in enumerate(active):
@@ -283,6 +298,7 @@ def turbo_dfs_multitoken(
     root_lanes=None,
     diagnostic_grid_states=None,
     diagnostic_invalid=None,
+    prune_structural_invalid=False,
 ):
     """Run DFS with conservative repeated-token block verification."""
     n = logits.size(0)
@@ -303,6 +319,10 @@ def turbo_dfs_multitoken(
         frontier=frontier,
         frontier_max_score=frontier_max_score,
         root_lanes=root_lanes,
+        structural_states=(
+            diagnostic_grid_states if prune_structural_invalid else None
+        ),
+        stats=stats,
     )
     _bump(stats, "frames", sum(score < max_score for score in scores))
     for lane, beams in suffixes.items():
@@ -367,6 +387,13 @@ def turbo_dfs_multitoken(
 
         consumed = 1
         chain_scores = list(batch_scores)
+        chain_grid_states = list(diagnostic_grid_states)
+        if prune_structural_invalid:
+            for lane, is_active in enumerate(active):
+                if is_active:
+                    chain_grid_states[lane] = chain_grid_states[lane].advance(
+                        batch_tokens[lane]
+                    )
         while consumed < draft_len:
             intermediate_prefixes = [
                 list(generated_prefixes[lane])
@@ -384,31 +411,48 @@ def turbo_dfs_multitoken(
                 frontier=frontier,
                 frontier_max_score=frontier_max_score,
                 root_lanes=root_lanes,
+                structural_states=(
+                    chain_grid_states if prune_structural_invalid else None
+                ),
+                stats=stats,
             )
             if accepted_scores is None:
                 break
             chain_scores = accepted_scores
+            if prune_structural_invalid:
+                for lane, is_active in enumerate(active):
+                    if is_active:
+                        chain_grid_states[lane] = chain_grid_states[lane].advance(
+                            batch_tokens[lane]
+                        )
             consumed += 1
 
         _bump(stats, "accepted_extra_tokens", sum(active) * (consumed - 1))
         if draft_len > 1 and consumed == 1:
             _bump(stats, "zero_extra_blocks")
-        child_diagnostic_states = list(diagnostic_grid_states)
+        child_diagnostic_states = (
+            chain_grid_states
+            if prune_structural_invalid
+            else list(diagnostic_grid_states)
+        )
         child_diagnostic_invalid = list(diagnostic_invalid)
         invalid_model_lanes = 0
         for lane, is_active in enumerate(active):
             if not is_active:
                 continue
-            (
-                child_diagnostic_states[lane],
-                child_diagnostic_invalid[lane],
-                became_invalid,
-            ) = _advance_unconstrained_diagnostic(
-                diagnostic_grid_states[lane],
-                diagnostic_invalid[lane],
-                batch_tokens[lane],
-                consumed,
-            )
+            if prune_structural_invalid:
+                became_invalid = False
+            else:
+                (
+                    child_diagnostic_states[lane],
+                    child_diagnostic_invalid[lane],
+                    became_invalid,
+                ) = _advance_unconstrained_diagnostic(
+                    diagnostic_grid_states[lane],
+                    diagnostic_invalid[lane],
+                    batch_tokens[lane],
+                    consumed,
+                )
             if became_invalid:
                 _bump(stats, "structural_invalid_branches_started")
             if child_diagnostic_invalid[lane]:
@@ -457,6 +501,7 @@ def turbo_dfs_multitoken(
             root_lanes=root_lanes,
             diagnostic_grid_states=child_diagnostic_states,
             diagnostic_invalid=child_diagnostic_invalid,
+            prune_structural_invalid=prune_structural_invalid,
         )
 
         for lane, beams in next_suffixes.items():
@@ -663,6 +708,7 @@ def inference_turbo_dfs_multitoken(
     structured_rows=False,
     frontier_max_score=None,
     return_frontier=False,
+    prune_structural_invalid=False,
 ):
     input_ids = torch.tensor(prefix_tokens, device=model.device, dtype=torch.long)
     started = time.time()
@@ -692,6 +738,10 @@ def inference_turbo_dfs_multitoken(
             "Threshold-frontier capture is currently implemented for the "
             "production unstructured q9 path only"
         )
+    if structured_rows and prune_structural_invalid:
+        raise ValueError(
+            "structured_rows already enforces the rectangular-grid grammar"
+        )
     frontier = [] if frontier_max_score is not None else None
     if structured_rows:
         suffixes = turbo_dfs_multitoken_structured(
@@ -703,6 +753,7 @@ def inference_turbo_dfs_multitoken(
         suffixes = turbo_dfs_multitoken(
             frontier=frontier,
             frontier_max_score=frontier_max_score,
+            prune_structural_invalid=prune_structural_invalid,
             **common,
         )
     result = [

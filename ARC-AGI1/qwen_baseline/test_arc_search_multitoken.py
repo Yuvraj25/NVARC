@@ -188,6 +188,52 @@ class MultiTokenDfsTest(unittest.TestCase):
         self.assertEqual(token_results(structured), token_results(baseline))
         self.assertGreater(stats["length_bucket_calls"], 0)
 
+    def test_unbucketed_pruning_rejects_ragged_branch(self):
+        prefix = [[11, 12]]
+        # First row has width two; the third digit in row two is therefore
+        # structurally impossible and must end the branch without another
+        # length-bucketed model path.
+        targets = [1, 1, 10, 2, 2, 2, 15]
+        model = FakeModel(len(prefix[0]), targets)
+        stats = {}
+        result = inference_turbo_dfs_multitoken(
+            model,
+            prefix,
+            max_new_tokens=12,
+            max_score=2.302585,
+            end_time=time.time() + 30,
+            repeat_len=4,
+            stats=stats,
+            prune_structural_invalid=True,
+        )
+        self.assertEqual(token_results(result), {})
+        self.assertGreater(stats["structural_pruned_candidates"], 0)
+        self.assertEqual(stats.get("structural_invalid_model_lanes", 0), 0)
+
+    def test_unbucketed_pruning_preserves_rectangular_candidate(self):
+        prefix = [[11, 12]]
+        targets = [1, 1, 10, 2, 2, 15]
+        control_model = FakeModel(len(prefix[0]), targets)
+        pruned_model = FakeModel(len(prefix[0]), targets)
+        control = inference_turbo_dfs_multitoken(
+            control_model,
+            prefix,
+            max_new_tokens=12,
+            max_score=2.302585,
+            end_time=time.time() + 30,
+            repeat_len=4,
+        )
+        pruned = inference_turbo_dfs_multitoken(
+            pruned_model,
+            prefix,
+            max_new_tokens=12,
+            max_score=2.302585,
+            end_time=time.time() + 30,
+            repeat_len=4,
+            prune_structural_invalid=True,
+        )
+        self.assertEqual(token_results(pruned), token_results(control))
+
     def test_grid_state_rejects_ragged_rows_and_caps_first_row(self):
         state = _GridState()
         for _ in range(30):
