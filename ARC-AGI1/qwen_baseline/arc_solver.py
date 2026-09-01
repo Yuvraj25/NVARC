@@ -1878,6 +1878,10 @@ def worker(rank, queue, end_time):
             adaptive_output_dir = config["adaptive_output_dir"]
             starved = set()
             if adaptive_output_dir:
+                # Frontier-resume writes decoded candidates directly via
+                # _consume_hf_dfs_result rather than through
+                # _run_hf_eval_batches, so create its output directory here.
+                os.makedirs(adaptive_output_dir, exist_ok=True)
                 unique_counts = {
                     base_key: sum(1 for candidate_key in known_scores if candidate_key[0] == base_key)
                     for base_key in puzzle_ds_multi.keys
