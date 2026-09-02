@@ -32,7 +32,7 @@ def main() -> None:
 This notebook trains one rank-256 LoRA on leave-one-out records made only from
 the provided training pairs of all 120 public evaluation tasks. It starts from
 the published Vanilla V2 model: no Repair adapter, no evaluation test outputs,
-and no per-puzzle TTFT. Eight deterministic views per task give exactly 960
+and no per-puzzle TTFT. Twenty deterministic views per task give exactly 2,400
 records. The adapter includes the same
 seven projection families, `embed_tokens`, and `lm_head` used by Vanilla V2."""
         ),
@@ -69,7 +69,7 @@ challenges = json.loads(CHALLENGES_PATH.read_text())
 if len(challenges) != 120:
     raise RuntimeError(f"Expected 120 evaluation tasks, found {{len(challenges)}}")
 print("global task count =", len(challenges))
-print("global nominal records =", len(challenges) * 8)
+print("global nominal records =", len(challenges) * 20)
 """
         ),
         code(
@@ -109,7 +109,7 @@ command = [
     "--model-path", str(MODEL_PATH),
     "--challenges-path", str(CHALLENGES_PATH),
     "--output-dir", str(OUTPUT_ROOT),
-    "--views-per-task", "8",
+    "--views-per-task", "20",
     "--score-batch-size", "2",
     "--max-seq-length", "8192",
     "--epochs", "1.0",
@@ -126,7 +126,7 @@ print("global wall_s =", round(elapsed, 3))
 (OUTPUT_ROOT / "global_notebook_runtime.json").write_text(json.dumps({
     "global_notebook_wall_s": elapsed,
     "task_count": len(challenges),
-    "views_per_task": 8,
+    "views_per_task": 20,
 }, indent=2))
 """
         ),
