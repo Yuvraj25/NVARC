@@ -146,6 +146,7 @@ def runtime_config():
         "opsd_lambda_ce": float(os.environ.get("ARC_OPSD_LAMBDA_CE", "0.0")),
         "opsd_log_dir": os.environ.get("ARC_OPSD_LOG_DIR", "../opsd_logs"),
         "repair_ttft_log_dir": os.environ.get("ARC_REPAIR_TTFT_LOG_DIR", "../repair_ttft_logs"),
+        "full_sft_total_steps": int(os.environ.get("ARC_FULL_SFT_TOTAL_STEPS", "128")),
         "repair_ttft_total_steps": int(os.environ.get("ARC_REPAIR_TTFT_TOTAL_STEPS", "128")),
         "repair_ttft_loo_stage1_steps": int(os.environ.get("ARC_REPAIR_TTFT_LOO_STAGE1_STEPS", "64")),
         "repair_ttft_warm_stage1_steps": int(os.environ.get("ARC_REPAIR_TTFT_WARM_STAGE1_STEPS", "32")),
@@ -1399,6 +1400,7 @@ def worker(rank, queue, end_time):
         f"structured_rows={config['use_unsloth_structured_rows']} "
         f"prune_structural_invalid={config['prune_structural_invalid']} "
         f"ttft_method={config['ttft_method']} fixed_candidate_dir={config['fixed_candidate_dir']} "
+        f"full_sft_total_steps={config['full_sft_total_steps']} "
         f"shared_eval_augmentations={config['shared_eval_augmentations']} "
         f"adaptive_output_dir={config['adaptive_output_dir']} "
         f"canon_ac={config['canon_ac_state'] is not None}"
@@ -1531,6 +1533,13 @@ def worker(rank, queue, end_time):
                     "scheduled_sampling_seed": stable_seed_from_key(f"{key}:one-pass-ss"),
                 }
             initial_train_args = dict(train_args)
+            if effective_ttft_method == "full_sft" and config["full_sft_total_steps"] < 128:
+                if config["full_sft_total_steps"] > len(train_rows):
+                    raise ValueError(
+                        f"Requested {config['full_sft_total_steps']} full-SFT steps but "
+                        f"only {len(train_rows)} training rows are available for {key}"
+                    )
+                initial_train_args["max_steps"] = config["full_sft_total_steps"]
             if effective_ttft_method == "one_pass_ss":
                 initial_train_args["max_steps"] = config["scheduled_sampling_total_steps"]
             trainer = trainer_class(

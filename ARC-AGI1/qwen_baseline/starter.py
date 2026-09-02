@@ -191,6 +191,7 @@ if __name__ == "__main__":
     parser.add_argument("--opsd-top-p", type=float, default=1.0)
     parser.add_argument("--opsd-lambda-ce", type=float, default=0.0)
     parser.add_argument("--repair-ttft-log-dir", type=str, default="../repair_ttft_logs")
+    parser.add_argument("--full-sft-total-steps", type=int, default=128)
     parser.add_argument("--repair-ttft-total-steps", type=int, default=128)
     parser.add_argument("--repair-ttft-loo-stage1-steps", type=int, default=64)
     parser.add_argument("--repair-ttft-warm-stage1-steps", type=int, default=32)
@@ -285,6 +286,8 @@ if __name__ == "__main__":
         raise ValueError("--opsd-color-permutations must be positive")
     if args.opsd_max_updates < 1:
         raise ValueError("--opsd-max-updates must be positive")
+    if not 1 <= args.full_sft_total_steps <= 128:
+        raise ValueError("--full-sft-total-steps must be between 1 and 128")
     if not 0.0 <= args.opsd_cross_view_probability <= 1.0:
         raise ValueError("--opsd-cross-view-probability must be in [0, 1]")
     if args.repair_ttft_total_steps != 128:
@@ -379,6 +382,7 @@ if __name__ == "__main__":
     os.environ["ARC_OPSD_TOP_P"] = str(args.opsd_top_p)
     os.environ["ARC_OPSD_LAMBDA_CE"] = str(args.opsd_lambda_ce)
     os.environ["ARC_REPAIR_TTFT_LOG_DIR"] = args.repair_ttft_log_dir
+    os.environ["ARC_FULL_SFT_TOTAL_STEPS"] = str(args.full_sft_total_steps)
     os.environ["ARC_REPAIR_TTFT_TOTAL_STEPS"] = str(args.repair_ttft_total_steps)
     os.environ["ARC_REPAIR_TTFT_LOO_STAGE1_STEPS"] = str(args.repair_ttft_loo_stage1_steps)
     os.environ["ARC_REPAIR_TTFT_WARM_STAGE1_STEPS"] = str(args.repair_ttft_warm_stage1_steps)

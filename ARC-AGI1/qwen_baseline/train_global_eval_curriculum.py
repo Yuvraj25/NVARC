@@ -1,9 +1,9 @@
 """Train a global LoRA on reverse-NLL-ordered ARC evaluation training pairs.
 
 The input challenge file supplies only the public per-task demonstrations.  No
-evaluation solution file is accepted or opened.  A frozen repair-v2 adapter is
-first merged into the base model; pre-training target NLL then determines a
-hard-to-easy curriculum for a fresh global LoRA.
+evaluation solution file is accepted or opened.  An optional frozen starting
+adapter may be merged before pre-training target NLL determines a hard-to-easy
+curriculum for a fresh global LoRA.
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ from typing import Any
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", required=True)
-    parser.add_argument("--repair-adapter-path", type=Path, required=True)
+    parser.add_argument("--repair-adapter-path", type=Path, default=None)
     parser.add_argument("--challenges-path", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--views-per-task", type=int, default=20)
@@ -281,28 +281,31 @@ def main() -> None:
         max_seq_length=args.max_seq_length,
     )
     old_vocab_size = len(tokenizer)
-    repair_token_id = add_and_initialize_repair_token(model, tokenizer)
-    if repair_token_id != old_vocab_size:
-        raise RuntimeError(f"Unexpected {REPAIR_TOKEN} ID {repair_token_id}")
+    repair_token_id = None
+    repair_adapter = None
+    if args.repair_adapter_path is not None:
+        repair_token_id = add_and_initialize_repair_token(model, tokenizer)
+        if repair_token_id != old_vocab_size:
+            raise RuntimeError(f"Unexpected {REPAIR_TOKEN} ID {repair_token_id}")
 
-    repair_adapter = args.repair_adapter_path.resolve()
-    for required in ("adapter_config.json", "adapter_model.safetensors"):
-        if not (repair_adapter / required).is_file():
-            raise FileNotFoundError(repair_adapter / required)
-    model = PeftModel.from_pretrained(
-        model, str(repair_adapter), is_trainable=False, local_files_only=True
-    )
-    model = model.merge_and_unload(safe_merge=True)
-    remaining_repair_lora = [
-        name for name, _parameter in model.named_parameters() if "lora_" in name
-    ]
-    if remaining_repair_lora:
-        raise RuntimeError(
-            f"Repair LoRA tensors remained after merge: {remaining_repair_lora[:5]}"
+        repair_adapter = args.repair_adapter_path.resolve()
+        for required in ("adapter_config.json", "adapter_model.safetensors"):
+            if not (repair_adapter / required).is_file():
+                raise FileNotFoundError(repair_adapter / required)
+        model = PeftModel.from_pretrained(
+            model, str(repair_adapter), is_trainable=False, local_files_only=True
         )
+        model = model.merge_and_unload(safe_merge=True)
+        remaining_repair_lora = [
+            name for name, _parameter in model.named_parameters() if "lora_" in name
+        ]
+        if remaining_repair_lora:
+            raise RuntimeError(
+                f"Starting LoRA tensors remained after merge: {remaining_repair_lora[:5]}"
+            )
     model_load_seconds = time.perf_counter() - load_started
     print(
-        f"[rank {rank}] merged repair adapter; vocab={len(tokenizer)} "
+        f"[rank {rank}] starting_adapter={repair_adapter}; vocab={len(tokenizer)} "
         f"device={next(model.parameters()).device}",
         flush=True,
     )
@@ -402,11 +405,8 @@ def main() -> None:
                 "q_proj", "k_proj", "v_proj", "o_proj",
                 "gate_proj", "up_proj", "down_proj",
             ],
-            # The repair-v2 base already contains its trained structural
-            # embedding/head values.  Keep those matrices trainable in the
-            # fresh global stage as well; the vocabulary is only 17 tokens, so
-            # this adds negligible storage while allowing the global corpus to
-            # recalibrate ARC-token logits directly.
+            # Match Vanilla V2: update the compact ARC embedding and output
+            # head alongside the seven projection-family LoRAs.
             modules_to_save=["embed_tokens", "lm_head"],
             lora_alpha=32,
             lora_dropout=0.0,
@@ -559,7 +559,10 @@ def main() -> None:
         manifest = {
             "config": {
                 **vars(args),
-                "repair_adapter_path": str(args.repair_adapter_path),
+                "repair_adapter_path": (
+                    str(args.repair_adapter_path)
+                    if args.repair_adapter_path is not None else None
+                ),
                 "challenges_path": str(args.challenges_path),
                 "output_dir": str(args.output_dir),
             },
@@ -586,9 +589,9 @@ def main() -> None:
             "model": {
                 "base_vocab_size": old_vocab_size,
                 "merged_vocab_size": len(tokenizer),
-                "repair_token": REPAIR_TOKEN,
+                "repair_token": REPAIR_TOKEN if repair_token_id is not None else None,
                 "repair_token_id": repair_token_id,
-                "repair_adapter_merged_before_scoring": True,
+                "repair_adapter_merged_before_scoring": repair_adapter is not None,
                 "fresh_global_lora_rank": args.lora_rank,
                 "fresh_global_modules_to_save": ["embed_tokens", "lm_head"],
                 "canon_ac": args.canon_ac,
