@@ -1,4 +1,4 @@
-"""Build the clean 48-task global-LoRA training notebook."""
+"""Build the clean 120-task global-LoRA training notebook."""
 
 from __future__ import annotations
 
@@ -7,20 +7,7 @@ from pathlib import Path
 
 
 HERE = Path(__file__).resolve().parent
-OUTPUT = HERE.parent / "arc26-global48-vanilla-lora.ipynb"
-
-VALIDATION_KEYS = [
-    "0934a4d8", "135a2760", "136b0064", "13e47133", "142ca369",
-    "16b78196", "16de56c4", "1818057f", "195c6913", "1ae2feb7",
-    "20270e3b", "20a9e565", "21897d95", "221dfab4", "247ef758",
-    "269e22fb", "271d71e2", "28a6681f", "291dc1e1", "2b83f449",
-    "2ba387bc", "2c181942", "2d0172a1", "31f7f899", "332f06d7",
-    "35ab12c3", "36a08778", "38007db0", "3a25b0d8", "3dc255db",
-    "3e6067c3", "409aa875", "446ef5d2", "45a5af55", "4a21e3da",
-    "4c3d4a41", "4c416de3", "4c7dc4dd", "4e34c42c", "53fb4810",
-    "5545f144", "581f7754", "58490d8a", "58f5dbd5", "5961cc34",
-    "5dbc8537", "62593bfd", "64efde09",
-]
+OUTPUT = HERE.parent / "arc26-global120-vanilla-lora.ipynb"
 
 
 def markdown(source: str) -> dict:
@@ -40,13 +27,13 @@ def code(source: str) -> dict:
 def main() -> None:
     cells = [
         markdown(
-            """# ARC26 clean global LoRA on the validation 48
+            """# ARC26 clean global LoRA on all 120 evaluation tasks
 
 This notebook trains one rank-256 LoRA on leave-one-out records made only from
-the provided training pairs of the established 48 validation tasks. It starts
-from the published Vanilla V2 model: no Repair adapter, no validation test
-outputs, and no per-puzzle TTFT. Twenty deterministic views per eligible task
-give 960 records before any one-pair exclusion. The adapter includes the same
+the provided training pairs of all 120 public evaluation tasks. It starts from
+the published Vanilla V2 model: no Repair adapter, no evaluation test outputs,
+and no per-puzzle TTFT. Eight deterministic views per task give exactly 960
+records. The adapter includes the same
 seven projection families, `embed_tokens`, and `lm_head` used by Vanilla V2."""
         ),
         code(
@@ -68,26 +55,21 @@ os.environ["OMP_NUM_THREADS"] = "3"
 CODE_DATASET_ROOT = Path("/kaggle/input/datasets/yuvraj/arc2026")
 MODEL_PATH = Path("/kaggle/input/models/sorokin/qwen3_4b_grids15_sft139/transformers/bfloat16/1")
 COMP_ROOT = Path("/kaggle/input/competitions/arc-prize-2026-arc-agi-2")
-VALIDATION_KEYS = {VALIDATION_KEYS!r}
+CHALLENGES_PATH = COMP_ROOT / "arc-agi_evaluation_challenges.json"
 
-WORK_ROOT = Path("/kaggle/working/arc26_global48_vanilla")
+WORK_ROOT = Path("/kaggle/working/arc26_global120_vanilla")
 WORK_CODE_DIR = WORK_ROOT / "ARC-AGI1/qwen_baseline"
-SUBSET_PATH = Path("/kaggle/working/global48_challenges.json")
-OUTPUT_ROOT = Path("/kaggle/working/global48_vanilla_lora")
+OUTPUT_ROOT = Path("/kaggle/working/global120_vanilla_lora")
 
 for path in [WORK_ROOT, OUTPUT_ROOT]:
     shutil.rmtree(path, ignore_errors=True)
-SUBSET_PATH.unlink(missing_ok=True)
 shutil.copytree(CODE_DATASET_ROOT, WORK_ROOT)
 
-challenges = json.loads((COMP_ROOT / "arc-agi_evaluation_challenges.json").read_text())
-missing = sorted(set(VALIDATION_KEYS) - set(challenges))
-if missing:
-    raise KeyError(f"Validation keys missing from evaluation challenges: {{missing}}")
-subset = {{key: challenges[key] for key in VALIDATION_KEYS}}
-SUBSET_PATH.write_text(json.dumps(subset))
-print("global task count =", len(subset))
-print("global nominal records =", len(subset) * 20)
+challenges = json.loads(CHALLENGES_PATH.read_text())
+if len(challenges) != 120:
+    raise RuntimeError(f"Expected 120 evaluation tasks, found {{len(challenges)}}")
+print("global task count =", len(challenges))
+print("global nominal records =", len(challenges) * 8)
 """
         ),
         code(
@@ -125,9 +107,9 @@ command = [
     "--nproc_per_node", "4",
     str(WORK_CODE_DIR / "train_global_eval_curriculum.py"),
     "--model-path", str(MODEL_PATH),
-    "--challenges-path", str(SUBSET_PATH),
+    "--challenges-path", str(CHALLENGES_PATH),
     "--output-dir", str(OUTPUT_ROOT),
-    "--views-per-task", "20",
+    "--views-per-task", "8",
     "--score-batch-size", "2",
     "--max-seq-length", "8192",
     "--epochs", "1.0",
@@ -143,8 +125,8 @@ elapsed = time.perf_counter() - started
 print("global wall_s =", round(elapsed, 3))
 (OUTPUT_ROOT / "global_notebook_runtime.json").write_text(json.dumps({
     "global_notebook_wall_s": elapsed,
-    "task_count": len(subset),
-    "views_per_task": 20,
+    "task_count": len(challenges),
+    "views_per_task": 8,
 }, indent=2))
 """
         ),

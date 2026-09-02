@@ -8,7 +8,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 SOURCE = HERE.parent / "arc26-vanilla-v2-q9-24-submit-competition.ipynb"
-OUTPUT = HERE.parent / "arc26-global48-local80-q9-24-validation.ipynb"
+OUTPUT = HERE.parent / "arc26-global120-local80-q9-24-validation.ipynb"
 
 VALIDATION_KEYS = [
     "0934a4d8", "135a2760", "136b0064", "13e47133", "142ca369",
@@ -36,22 +36,22 @@ def code(source: str) -> dict:
 
 def main() -> None:
     notebook = json.loads(SOURCE.read_text())
-    notebook["cells"][0]["source"] = """# ARC26 clean global-LoRA + local-80 validation
+    notebook["cells"][0]["source"] = """# ARC26 global-120 LoRA + local-80 validation
 
-Controlled 48-task comparison against the 31.94 Vanilla V2 stack. A separately
-trained rank-256 global LoRA is merged into the untouched published model, then
-each puzzle receives ordinary 80-step local TTFT. Candidate generation and
-selection are unchanged: q_len=9, threshold 0.2, eight geometries by three
-colour/order variants, and `score_kgmon`. No Repair or scheduled sampling is
-used.
+Controlled evaluation on the established 48 tasks against the 31.94 Vanilla V2
+stack. A separately trained rank-256 global LoRA covering all 120 evaluation
+tasks is merged into the untouched published model, then each evaluated puzzle
+receives ordinary 80-step local TTFT. Candidate generation and selection are
+unchanged: q_len=9, threshold 0.2, eight geometries by three colour/order
+variants, and `score_kgmon`. No Repair or scheduled sampling is used.
 """
     notebook["cells"][2]["source"] = f'''MODE = "validation"
 
 CODE_DATASET_ROOT = "/kaggle/input/datasets/yuvraj/arc2026"
 BASE_MODEL_PATH = "/kaggle/input/models/sorokin/qwen3_4b_grids15_sft139/transformers/bfloat16/1"
-GLOBAL_RUN_ROOT = "/kaggle/input/notebooks/yuvraj/arc26-global48-vanilla-lora/global48_vanilla_lora"
+GLOBAL_RUN_ROOT = "/kaggle/input/notebooks/yuvraj/arc26-global120-vanilla-lora/global120_vanilla_lora"
 GLOBAL_ADAPTER = GLOBAL_RUN_ROOT + "/adapter"
-MODEL_PATH = "/kaggle/working/global48_vanilla_merged_model"
+MODEL_PATH = "/kaggle/working/global120_vanilla_merged_model"
 COMP_ROOT = "/kaggle/input/competitions/arc-prize-2026-arc-agi-2"
 
 VALIDATION_KEYS = {VALIDATION_KEYS!r}
@@ -67,9 +67,9 @@ VALIDATION_END_TIME_HOURS = 4.0
 SUBMIT_COMPETITION_END_TIME_HOURS = 11 + 50 / 60
 RESET_RUN_ARTIFACTS = True
 
-WORK_NOTEBOOK_ROOT = "/kaggle/working/arc2026_run_global48_local80_q9_24"
-WORK_CODE_DIR = "/kaggle/working/arc2026_run_global48_local80_q9_24/ARC-AGI1/qwen_baseline"
-WRITABLE_UNSLOTH_PARENT = "/kaggle/working/global48_local80_q9_24_stack"
+WORK_NOTEBOOK_ROOT = "/kaggle/working/arc2026_run_global120_local80_q9_24"
+WORK_CODE_DIR = "/kaggle/working/arc2026_run_global120_local80_q9_24/ARC-AGI1/qwen_baseline"
+WRITABLE_UNSLOTH_PARENT = "/kaggle/working/global120_local80_q9_24_stack"
 '''
 
     setup = notebook["cells"][4]["source"]
@@ -80,7 +80,7 @@ WRITABLE_UNSLOTH_PARENT = "/kaggle/working/global48_local80_q9_24_stack"
     )
     setup = setup.replace(
         'for path in [WORK_NOTEBOOK_ROOT, OUTPUT_DIR, WRITABLE_UNSLOTH_PARENT]:',
-        'for path in [WORK_NOTEBOOK_ROOT, OUTPUT_DIR, WRITABLE_UNSLOTH_PARENT, MODEL_PATH, "/kaggle/working/global48_adapter_compat"]:',
+        'for path in [WORK_NOTEBOOK_ROOT, OUTPUT_DIR, WRITABLE_UNSLOTH_PARENT, MODEL_PATH, "/kaggle/working/global120_adapter_compat"]:',
     )
     notebook["cells"][4]["source"] = setup
 
@@ -100,7 +100,7 @@ from unsloth import FastLanguageModel
 
 base_path = os.environ["ARC_BASE_MODEL_PATH"]
 adapter_path = Path(os.environ["ARC_GLOBAL_ADAPTER_PATH"])
-compat_path = Path("/kaggle/working/global48_adapter_compat")
+compat_path = Path("/kaggle/working/global120_adapter_compat")
 output_path = Path(os.environ["ARC_MERGED_MODEL_PATH"])
 
 # Modern PEFT writes extra config fields which the pinned Vanilla V2 PEFT does
