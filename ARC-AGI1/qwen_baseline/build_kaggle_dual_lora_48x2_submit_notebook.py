@@ -287,6 +287,8 @@ else:
         "model_sources": [
             "sorokin/qwen3_4b_grids15_sft139/Transformers/bfloat16/1"
         ],
+        "docker_image_pinning_type": "original",
+        "docker_image": "gcr.io/kaggle-private-byod/python@sha256:320043e14c68293f1c946585b9257123385205a58af4b94b17d31868cae4e868",
         "machine_shape": "NvidiaL4",
     }
     (UPLOAD_DIR / "kernel-metadata.json").write_text(
