@@ -41,11 +41,7 @@ from arc_repair_ttft import (
 from arc_selected_augmentations import load_selected_augmentations, prepare_selected_eval_ds
 from arc_sglang import ArcSglangBackend, SglangConfig, SglangRescorer, inference_sglang_dfs, inference_sglang_speculative_dfs
 from arc_search import ASSISTANT_TOKEN_ID, EOS_ID, USER_TOKEN_ID, default_max_score, inference_turbo_dfs
-from arc_search_multitoken import (
-    inference_turbo_dfs_multitoken,
-    resume_turbo_dfs_multitoken,
-)
-from arc_scheduled_sampling import make_one_pass_scheduled_sampling_trainer_class
+from arc_search_multitoken import inference_turbo_dfs_multitoken
 
 logging.disable(logging.WARNING)
 
@@ -65,7 +61,6 @@ def runtime_config():
     ttft_method = os.environ.get("ARC_TTFT_METHOD", "full_sft")
     valid_ttft_methods = {
         "full_sft",
-        "one_pass_ss",
         "reduced_sft",
         "reduced_plus_sft_c",
         "reduced_plus_opsd",
@@ -84,44 +79,24 @@ def runtime_config():
             "ARC_EVAL_COLOR_PERMUTATIONS must be positive, "
             f"got {eval_color_permutations}"
         )
-    adaptive_threshold = float(os.environ.get("ARC_ADAPTIVE_DFS_PROB_THRESHOLD", "0.1"))
-    if not 0.0 < adaptive_threshold < 1.0:
-        raise ValueError(
-            "ARC_ADAPTIVE_DFS_PROB_THRESHOLD must be in (0, 1), "
-            f"got {adaptive_threshold}"
-        )
     return {
         "use_speculative_dfs": _env_flag("ARC_USE_SPECULATIVE_DFS", default=False),
         "use_unsloth_multitoken_dfs": _env_flag("ARC_USE_UNSLOTH_MULTITOKEN_DFS", default=False),
-        "use_unsloth_structured_rows": _env_flag("ARC_USE_UNSLOTH_STRUCTURED_ROWS", default=False),
-        "prune_structural_invalid": _env_flag(
-            "ARC_PRUNE_STRUCTURAL_INVALID", default=False
-        ),
         "unsloth_multitoken_repeat_len": int(os.environ.get("ARC_UNSLOTH_MULTITOKEN_REPEAT_LEN", "9")),
         "use_sglang": _env_flag("ARC_USE_SGLANG", default=False),
         "profile_timings": _env_flag("ARC_PROFILE_TIMINGS", default=False),
         "dfs_prob_threshold": dfs_prob_threshold,
         "eval_color_permutations": eval_color_permutations,
-        "shared_eval_augmentations": _env_flag(
-            "ARC_SHARED_EVAL_AUGMENTATIONS", default=False
+        "train_color_permutations": int(
+            os.environ.get("ARC_TRAIN_COLOR_PERMUTATIONS", "16")
         ),
-        "adaptive_output_dir": os.environ.get("ARC_ADAPTIVE_OUTPUT_DIR"),
-        "adaptive_resume_frontier": _env_flag(
-            "ARC_ADAPTIVE_RESUME_FRONTIER", default=False
+        "train_augmentation_seed": int(
+            os.environ.get("ARC_TRAIN_AUGMENTATION_SEED", "1")
         ),
-        "adaptive_dfs_prob_threshold": adaptive_threshold,
-        "adaptive_color_permutations": int(
-            os.environ.get("ARC_ADAPTIVE_COLOR_PERMUTATIONS", "3")
+        "eval_augmentation_seed": int(
+            os.environ.get("ARC_EVAL_AUGMENTATION_SEED", "2")
         ),
-        "adaptive_min_unique_candidates": int(
-            os.environ.get("ARC_ADAPTIVE_MIN_UNIQUE_CANDIDATES", "2")
-        ),
-        "compare_structured_output_dir": os.environ.get(
-            "ARC_COMPARE_STRUCTURED_OUTPUT_DIR"
-        ),
-        "compare_fresh_adaptive_output_dir": os.environ.get(
-            "ARC_COMPARE_FRESH_ADAPTIVE_OUTPUT_DIR"
-        ),
+        "trainer_seed": int(os.environ.get("ARC_TRAINER_SEED", "42")),
         "model_path": os.environ.get("ARC_MODEL_PATH", "../input/qwen3_4b_grids15_sft139/"),
         "test_path": os.environ.get("ARC_TEST_PATH", "../input/arc-prize-2024/arc-agi_evaluation_challenges.json"),
         "output_dir": os.environ.get("ARC_OUTPUT_DIR", "../inference_outputs"),
@@ -146,7 +121,6 @@ def runtime_config():
         "opsd_lambda_ce": float(os.environ.get("ARC_OPSD_LAMBDA_CE", "0.0")),
         "opsd_log_dir": os.environ.get("ARC_OPSD_LOG_DIR", "../opsd_logs"),
         "repair_ttft_log_dir": os.environ.get("ARC_REPAIR_TTFT_LOG_DIR", "../repair_ttft_logs"),
-        "full_sft_total_steps": int(os.environ.get("ARC_FULL_SFT_TOTAL_STEPS", "128")),
         "repair_ttft_total_steps": int(os.environ.get("ARC_REPAIR_TTFT_TOTAL_STEPS", "128")),
         "repair_ttft_loo_stage1_steps": int(os.environ.get("ARC_REPAIR_TTFT_LOO_STAGE1_STEPS", "64")),
         "repair_ttft_warm_stage1_steps": int(os.environ.get("ARC_REPAIR_TTFT_WARM_STAGE1_STEPS", "32")),
@@ -162,21 +136,8 @@ def runtime_config():
         "repair_ttft_warm_views_per_pair": int(
             os.environ.get("ARC_REPAIR_TTFT_WARM_VIEWS_PER_PAIR", "8")
         ),
-        "scheduled_sampling_warmup_steps": int(
-            os.environ.get("ARC_SCHEDULED_SAMPLING_WARMUP_STEPS", "32")
-        ),
-        "scheduled_sampling_total_steps": int(
-            os.environ.get("ARC_SCHEDULED_SAMPLING_TOTAL_STEPS", "128")
-        ),
-        "scheduled_sampling_mix_probability": float(
-            os.environ.get("ARC_SCHEDULED_SAMPLING_MIX_PROBABILITY", "0.5")
-        ),
-        "scheduled_sampling_log_dir": os.environ.get(
-            "ARC_SCHEDULED_SAMPLING_LOG_DIR", "../scheduled_sampling_logs"
-        ),
         "fixed_candidate_dir": os.environ.get("ARC_FIXED_CANDIDATE_DIR"),
         "selected_augmentations_path": os.environ.get("ARC_SELECTED_AUGMENTATIONS_PATH"),
-        "canon_ac_state": os.environ.get("ARC_CANON_AC_STATE"),
     }
 
 
@@ -405,25 +366,6 @@ def _prepare_eval_ds(puzzle_ds, formatter, max_seq_length: int, max_new_tokens: 
     return puzzle_ds_multi, eval_ds
 
 
-def _prepare_shared_eval_ds(
-    puzzle_ds,
-    formatter,
-    max_seq_length: int,
-    max_new_tokens: int,
-    color_permutations: int,
-    seed: int,
-):
-    puzzle_ds_multi = puzzle_ds.split_multi_replies()
-    eval_ds = puzzle_ds.augment(n=color_permutations, seed=seed)
-    eval_ds = eval_ds.split_multi_replies_shared_views()
-    eval_ds = eval_ds.cut_to_len(
-        formatter=formatter,
-        name="input",
-        max_len=max_seq_length - max_new_tokens,
-    )
-    return puzzle_ds_multi, eval_ds
-
-
 def _rescore_fixed_candidate_pool(
     model,
     tokenizer,
@@ -491,206 +433,6 @@ def _rescore_fixed_candidate_pool(
     count_stats["fixed_pool_unique_candidates"] += len(known_scores)
     for rescorer in rescorers.values():
         print(rescorer.format_stats())
-
-
-def _consume_hf_dfs_result(
-    *,
-    rank,
-    subkeys,
-    dfs_result,
-    model,
-    tokenizer,
-    formatter,
-    puzzle_ds_multi,
-    output_dir,
-    max_seq_length,
-    max_new_tokens,
-    timing_stats,
-    count_stats,
-    timing_prefix,
-    known_scores,
-    rescorers,
-):
-    prefix = f"{timing_prefix}_" if timing_prefix else ""
-    for subkey_id, scored_beams in dfs_result:
-        subkey = subkeys[subkey_id]
-        base_key = subkey.split(".")[0]
-        decoded_result = []
-        count_stats[f"{prefix}subkeys_scored"] += 1
-
-        if base_key not in rescorers:
-            rescorer_started_at = time.perf_counter()
-            rescorers[base_key] = FullPassRescorer(
-                model=model,
-                tokenizer=tokenizer,
-                formatter=formatter,
-                puzzle_ds_multi=puzzle_ds_multi,
-                base_key=base_key,
-                max_seq_length=max_seq_length,
-                max_new_tokens=max_new_tokens,
-                seed=stable_seed_from_key(base_key),
-            )
-            timing_stats[f"{prefix}rescorer_init_s"] += (
-                time.perf_counter() - rescorer_started_at
-            )
-            count_stats[f"{prefix}rescorers_created"] += 1
-
-        for beam_score, beam_tokens in scored_beams:
-            count_stats[f"{prefix}beam_candidates_seen"] += 1
-            array = formatter.convert_tokens_to_array(beam_tokens)
-            if array is None:
-                count_stats[f"{prefix}beam_candidates_invalid"] += 1
-                continue
-
-            solution = puzzle_ds_multi.invert_mod(array, subkey, inv_perm=True)
-            grid_id = (base_key, tuple(map(tuple, solution)))
-            count_stats[f"{prefix}beam_candidates_valid"] += 1
-            if grid_id in known_scores:
-                augmented_scores = known_scores[grid_id]
-                count_stats[f"{prefix}rescoring_cache_hits"] += 1
-            else:
-                print(
-                    f"[Rank {rank}] {timing_prefix or 'primary'} scoring "
-                    f"{subkey} #{len(decoded_result)}"
-                )
-                rescore_started_at = time.perf_counter()
-                augmented_scores = rescorers[base_key].score_solution(solution)
-                timing_stats[f"{prefix}rescoring_s"] += (
-                    time.perf_counter() - rescore_started_at
-                )
-                known_scores[grid_id] = augmented_scores
-                count_stats[f"{prefix}rescoring_cache_misses"] += 1
-
-            decoded_result.append(
-                {
-                    "beam_score": beam_score,
-                    "score_aug": augmented_scores,
-                    "solution": solution,
-                }
-            )
-
-        if decoded_result:
-            write_started_at = time.perf_counter()
-            with bz2.BZ2File(os.path.join(output_dir, subkey), "w") as output_file:
-                pickle.dump(decoded_result, output_file)
-            timing_stats[f"{prefix}write_results_s"] += (
-                time.perf_counter() - write_started_at
-            )
-            count_stats[f"{prefix}subkeys_written"] += 1
-
-
-def _run_hf_eval_batches(
-    *,
-    rank,
-    key,
-    model,
-    tokenizer,
-    formatter,
-    puzzle_ds_multi,
-    eval_ds,
-    output_dir,
-    max_seq_length,
-    max_new_tokens,
-    max_score,
-    use_multitoken,
-    use_structured_rows,
-    prune_structural_invalid,
-    repeat_len,
-    start_time,
-    end_time,
-    timing_stats,
-    count_stats,
-    timing_prefix="",
-    known_scores=None,
-    rescorers=None,
-    frontier_max_score=None,
-    frontier_batches=None,
-):
-    """Decode one primary or adaptive view set using the live TTFT model."""
-    os.makedirs(output_dir, exist_ok=True)
-    batches = _build_eval_batches(eval_ds, tokenizer=tokenizer, formatter=formatter)
-    known_scores = {} if known_scores is None else known_scores
-    rescorers = {} if rescorers is None else rescorers
-    if frontier_max_score is not None and frontier_batches is None:
-        frontier_batches = []
-    prefix = f"{timing_prefix}_" if timing_prefix else ""
-
-    for subkeys in batches:
-        spend_time = time.time() - start_time
-        if spend_time > 1200 or time.time() > end_time:
-            print(f"[Rank {rank}] timeout after {spend_time:.1f}s for puzzle {key}")
-            break
-
-        print(f"[Rank {rank}] {timing_prefix or 'primary'} decoding {subkeys}")
-        count_stats[f"{prefix}batches"] += 1
-
-        tokenize_started_at = time.perf_counter()
-        tokens = [
-            tokenizer.encode(eval_ds.get(subkey, formatter)["input"])
-            for subkey in subkeys
-        ]
-        timing_stats[f"{prefix}tokenize_inputs_s"] += (
-            time.perf_counter() - tokenize_started_at
-        )
-
-        dfs_started_at = time.perf_counter()
-        if use_multitoken:
-            multitoken_stats = {}
-            search_result = inference_turbo_dfs_multitoken(
-                model,
-                tokens,
-                max_new_tokens,
-                max_score,
-                end_time,
-                repeat_len=repeat_len,
-                stats=multitoken_stats,
-                structured_rows=use_structured_rows,
-                prune_structural_invalid=prune_structural_invalid,
-                frontier_max_score=frontier_max_score,
-                return_frontier=frontier_max_score is not None,
-            )
-            if frontier_max_score is not None:
-                dfs_result, batch_frontier = search_result
-                frontier_batches.append(
-                    {
-                        "subkeys": list(subkeys),
-                        "tokens": tokens,
-                        "frontier": batch_frontier,
-                    }
-                )
-            else:
-                dfs_result = search_result
-            for name, value in multitoken_stats.items():
-                if name == "model_time_s":
-                    timing_stats[f"{prefix}dfs_multitoken_model_s"] += value
-                else:
-                    count_stats[f"{prefix}dfs_multitoken_{name}"] += value
-        else:
-            dfs_result = inference_turbo_dfs(
-                model, tokens, max_new_tokens, max_score, end_time
-            )
-        timing_stats[f"{prefix}dfs_s"] += time.perf_counter() - dfs_started_at
-        count_stats[f"{prefix}dfs_calls"] += 1
-
-        _consume_hf_dfs_result(
-            rank=rank,
-            subkeys=subkeys,
-            dfs_result=dfs_result,
-            model=model,
-            tokenizer=tokenizer,
-            formatter=formatter,
-            puzzle_ds_multi=puzzle_ds_multi,
-            output_dir=output_dir,
-            max_seq_length=max_seq_length,
-            max_new_tokens=max_new_tokens,
-            timing_stats=timing_stats,
-            count_stats=count_stats,
-            timing_prefix=timing_prefix,
-            known_scores=known_scores,
-            rescorers=rescorers,
-        )
-
-    return known_scores, rescorers
 
 
 def _run_sglang_batches(
@@ -957,7 +699,7 @@ def worker_sglang(rank, queue, end_time, config):
         optim="adamw_torch",
         weight_decay=0.0,
         lr_scheduler_type="cosine",
-        seed=42,
+        seed=config["trainer_seed"],
         report_to="none",
         save_strategy="no",
         eval_strategy="no",
@@ -1124,7 +866,11 @@ def worker_sglang(rank, queue, end_time, config):
                     formatter = QwenFormatter(tokenizer=tokenizer)
                     max_new_tokens = formatter.max_new_tokens()
                     model = FastLanguageModel.for_training(model, use_gradient_checkpointing=True)
-                    train_ds = puzzle_ds.augment(n=16, shfl_keys=True, seed=1)
+                    train_ds = puzzle_ds.augment(
+                        n=config["train_color_permutations"],
+                        shfl_keys=True,
+                        seed=config["train_augmentation_seed"],
+                    )
                     train_ds = train_ds.cut_to_len(formatter=formatter, name="text", max_len=max_seq_length)
 
                     training_started_at = time.perf_counter()
@@ -1307,7 +1053,7 @@ def worker(rank, queue, end_time):
         optim="adamw_torch",
         weight_decay=0.0,
         lr_scheduler_type="cosine",
-        seed=42,
+        seed=config["trainer_seed"],
         report_to="none",
         save_strategy="no",
         eval_strategy="no",
@@ -1325,9 +1071,6 @@ def worker(rank, queue, end_time):
     FastLanguageModel = training_stack["FastLanguageModel"]
     UnslothTrainingArguments = training_stack["UnslothTrainingArguments"]
     UnslothFixedTrainer = training_stack["UnslothFixedTrainer"]
-    OnePassScheduledSamplingTrainer = make_one_pass_scheduled_sampling_trainer_class(
-        UnslothFixedTrainer
-    )
     QwenDataCollatorForCompletionOnlyLM = training_stack["QwenDataCollatorForCompletionOnlyLM"]
     get_peft_model_state_dict = training_stack["get_peft_model_state_dict"]
     set_peft_model_state_dict = training_stack["set_peft_model_state_dict"]
@@ -1342,42 +1085,7 @@ def worker(rank, queue, end_time):
     )
     _restore_qwen_role_tokens(model, tokenizer)
 
-    canon_hooks = None
-    default_canon_weights = None
-    if config["canon_ac_state"]:
-        from arc_canon import (
-            add_canon_ac_modules,
-            canon_parameters,
-            canon_state_dict,
-            install_canon_ac_training_hooks,
-            load_canon_state,
-            load_canon_state_dict,
-        )
-
-        canon_path = os.path.abspath(config["canon_ac_state"])
-        if not os.path.isfile(canon_path):
-            raise FileNotFoundError(canon_path)
-        add_canon_ac_modules(model, kernel_size=4, zero_init=True)
-        load_canon_state(model, canon_path)
-        canon_hooks = install_canon_ac_training_hooks(model)
-        print(f"[Rank {rank}] loaded residual Canon-AC from {canon_path}", flush=True)
-
     model = FastLanguageModel.get_peft_model(model, **peft_params)
-    if config["canon_ac_state"]:
-        # PEFT freezes every base-model parameter when it installs the fresh
-        # per-task adapter. Canon is deliberately trainable during TTFT, so it
-        # must be re-enabled explicitly after get_peft_model.
-        for parameter in canon_parameters(model):
-            parameter.requires_grad = True
-        default_canon_weights = {
-            key: value.clone().detach()
-            for key, value in canon_state_dict(model).items()
-        }
-        print(
-            f"[Rank {rank}] Canon TTFT trainable parameters="
-            f"{sum(parameter.numel() for parameter in canon_parameters(model))}",
-            flush=True,
-        )
     for _name, param in model.named_parameters():
         if param.dtype == torch.float32:
             param.data = param.data.to(torch.bfloat16)
@@ -1396,14 +1104,7 @@ def worker(rank, queue, end_time):
     print(
         f"[Rank {rank}] config: speculative_dfs={config['use_speculative_dfs']} "
         f"dfs_prob_threshold={config['dfs_prob_threshold']} "
-        f"multitoken_dfs={config['use_unsloth_multitoken_dfs']} "
-        f"structured_rows={config['use_unsloth_structured_rows']} "
-        f"prune_structural_invalid={config['prune_structural_invalid']} "
-        f"ttft_method={config['ttft_method']} fixed_candidate_dir={config['fixed_candidate_dir']} "
-        f"full_sft_total_steps={config['full_sft_total_steps']} "
-        f"shared_eval_augmentations={config['shared_eval_augmentations']} "
-        f"adaptive_output_dir={config['adaptive_output_dir']} "
-        f"canon_ac={config['canon_ac_state'] is not None}"
+        f"ttft_method={config['ttft_method']} fixed_candidate_dir={config['fixed_candidate_dir']}"
     )
     if config["ttft_method"] != "full_sft" and config["use_sglang"]:
         raise ValueError("Reduced-pair and OPSD TTFT modes require the gradient-capable Unsloth/HF worker")
@@ -1432,24 +1133,14 @@ def worker(rank, queue, end_time):
             default_weights.copy(),
             adapter_name="default",
         )
-        if default_canon_weights is not None:
-            load_canon_state_dict(model, default_canon_weights)
 
         model = FastLanguageModel.for_training(model, use_gradient_checkpointing=True)
         activate_adapter(model, "default", trainable=True)
-        if default_canon_weights is not None:
-            for parameter in canon_parameters(model):
-                parameter.requires_grad = True
         puzzle_ds = arc_test_set.change_keys([key])
         num_train_pairs = len(puzzle_ds.queries[key]["train"])
         effective_ttft_method = config["ttft_method"]
         opsd_split = None
-        if effective_ttft_method in {
-            "reduced_sft",
-            "reduced_plus_sft_c",
-            "reduced_plus_opsd",
-            "loo_repair_mix",
-        } and num_train_pairs < config["opsd_min_train_pairs"]:
+        if effective_ttft_method != "full_sft" and num_train_pairs < config["opsd_min_train_pairs"]:
             print(
                 f"[Rank {rank}] {key}: falling back to full_sft because it has "
                 f"{num_train_pairs} training pairs (< {config['opsd_min_train_pairs']})"
@@ -1470,7 +1161,11 @@ def worker(rank, queue, end_time):
         else:
             initial_sft_ds = puzzle_ds
 
-        train_ds = initial_sft_ds.augment(n=16, shfl_keys=True, seed=1)
+        train_ds = initial_sft_ds.augment(
+            n=config["train_color_permutations"],
+            shfl_keys=True,
+            seed=config["train_augmentation_seed"],
+        )
         train_ds = train_ds.cut_to_len(formatter=formatter, name="text", max_len=max_seq_length)
         train_rows = train_ds.as_list(formatter)
         repair_ttft_stats = None
@@ -1506,100 +1201,20 @@ def worker(rank, queue, end_time):
 
         training_started_at = time.perf_counter()
         with io.StringIO() as buf, redirect_stdout(buf), redirect_stderr(buf):
-            trainer_class = (
-                OnePassScheduledSamplingTrainer
-                if effective_ttft_method == "one_pass_ss"
-                else UnslothFixedTrainer
-            )
-            trainer_kwargs = {}
-            if effective_ttft_method == "one_pass_ss":
-                if not (
-                    0 <= config["scheduled_sampling_warmup_steps"]
-                    < config["scheduled_sampling_total_steps"]
-                    <= len(train_rows)
-                ):
-                    raise ValueError(
-                        "One-pass scheduled-sampling steps must satisfy "
-                        "0 <= warmup < total <= available training rows; got "
-                        f"warmup={config['scheduled_sampling_warmup_steps']}, "
-                        f"total={config['scheduled_sampling_total_steps']}, "
-                        f"rows={len(train_rows)}"
-                    )
-                trainer_kwargs = {
-                    "scheduled_sampling_warmup_steps": config["scheduled_sampling_warmup_steps"],
-                    "scheduled_sampling_mix_probability": config[
-                        "scheduled_sampling_mix_probability"
-                    ],
-                    "scheduled_sampling_seed": stable_seed_from_key(f"{key}:one-pass-ss"),
-                }
-            initial_train_args = dict(train_args)
-            if effective_ttft_method == "full_sft" and config["full_sft_total_steps"] < 128:
-                if config["full_sft_total_steps"] > len(train_rows):
-                    raise ValueError(
-                        f"Requested {config['full_sft_total_steps']} full-SFT steps but "
-                        f"only {len(train_rows)} training rows are available for {key}"
-                    )
-                initial_train_args["max_steps"] = config["full_sft_total_steps"]
-            if effective_ttft_method == "one_pass_ss":
-                initial_train_args["max_steps"] = config["scheduled_sampling_total_steps"]
-            trainer = trainer_class(
+            trainer = UnslothFixedTrainer(
                 model=model,
                 tokenizer=tokenizer,
                 data_collator=collator,
                 train_dataset=Dataset.from_list(train_rows),
                 dataset_text_field="text",
                 max_seq_length=max_seq_length,
-                args=UnslothTrainingArguments(**initial_train_args),
-                **trainer_kwargs,
+                args=UnslothTrainingArguments(**train_args),
             )
 
             stats = trainer.train()
-            scheduled_sampling_stats = (
-                trainer.scheduled_sampling_summary()
-                if effective_ttft_method == "one_pass_ss"
-                else None
-            )
             model = trainer.accelerator.unwrap_model(model, keep_fp32_wrapper=False)
             del trainer
         timing_stats["training_s"] += time.perf_counter() - training_started_at
-
-        if default_canon_weights is not None:
-            adapted_canon_weights = canon_state_dict(model)
-            canon_delta_l2 = sum(
-                (adapted_canon_weights[name].float() - default_canon_weights[name].float())
-                .square()
-                .sum()
-                .item()
-                for name in default_canon_weights
-            ) ** 0.5
-            print(
-                f"[Rank {rank}] {key}: Canon TTFT delta_l2={canon_delta_l2:.8f}",
-                flush=True,
-            )
-
-        if scheduled_sampling_stats is not None:
-            scheduled_sampling_stats.update(
-                {
-                    "puzzle_key": key,
-                    "num_train_pairs": num_train_pairs,
-                    "training_s": timing_stats["training_s"],
-                    "trainer_global_step": int(stats.global_step),
-                    "trainer_training_loss": float(stats.training_loss),
-                }
-            )
-            os.makedirs(config["scheduled_sampling_log_dir"], exist_ok=True)
-            with open(
-                os.path.join(config["scheduled_sampling_log_dir"], f"{_safe_path_key(key)}.json"),
-                "w",
-            ) as log_file:
-                json.dump(scheduled_sampling_stats, log_file, indent=2, sort_keys=True)
-                log_file.write("\n")
-            print(
-                f"[Rank {rank}] {key}: one-pass SS "
-                f"steps={scheduled_sampling_stats['scheduled_sampling_steps']} "
-                f"digit_accuracy={scheduled_sampling_stats['teacher_forced_digit_accuracy']} "
-                f"changed_fraction={scheduled_sampling_stats['realized_change_fraction']}"
-            )
 
         if effective_ttft_method in REPAIR_TTFT_METHODS:
             mining_started_at = time.perf_counter()
@@ -1634,7 +1249,11 @@ def worker(rank, queue, end_time):
             repair_ttft_stats["timing_s"]["repair_mining_s"] = mining_elapsed
             repair_ttft_stats["mining"] = mining_stats
 
-            ordinary_source = puzzle_ds.augment(n=16, shfl_keys=True, seed=1)
+            ordinary_source = puzzle_ds.augment(
+                n=config["train_color_permutations"],
+                shfl_keys=True,
+                seed=config["train_augmentation_seed"],
+            )
             ordinary_source = ordinary_source.cut_to_len(
                 formatter=formatter,
                 name="text",
@@ -1815,10 +1434,6 @@ def worker(rank, queue, end_time):
 
         prep_started_at = time.perf_counter()
         model = FastLanguageModel.for_inference(model)
-        if config["canon_ac_state"]:
-            from arc_canon import prepare_canon_inference
-
-            prepare_canon_inference(model)
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -1827,20 +1442,14 @@ def worker(rank, queue, end_time):
         torch.cuda.reset_peak_memory_stats()
         print(f"[Rank {rank}] training stats for puzzle {key}: {stats}")
 
-        if config["shared_eval_augmentations"]:
-            puzzle_ds_multi, eval_ds = _prepare_shared_eval_ds(
-                puzzle_ds,
-                formatter,
-                max_seq_length,
-                max_new_tokens,
-                color_permutations=config["eval_color_permutations"],
-                seed=2,
-            )
-        else:
-            puzzle_ds_multi, eval_ds = _prepare_eval_ds(
-                puzzle_ds, formatter, max_seq_length, max_new_tokens
-            )
+        puzzle_ds_multi = puzzle_ds.split_multi_replies()
+        eval_ds = puzzle_ds_multi.augment(
+            n=config["eval_color_permutations"],
+            seed=config["eval_augmentation_seed"],
+        )
+        eval_ds = eval_ds.cut_to_len(formatter=formatter, name="input", max_len=max_seq_length - max_new_tokens)
         timing_stats["eval_prep_s"] += time.perf_counter() - prep_started_at
+        batches = _build_eval_batches(eval_ds, tokenizer=tokenizer, formatter=formatter)
 
         if config["fixed_candidate_dir"]:
             print(f"[Rank {rank}] rescoring fixed candidate pool for {key}")
@@ -1859,248 +1468,107 @@ def worker(rank, queue, end_time):
                     count_stats=count_stats,
                 )
             # Phase 1 deliberately freezes the candidate pool; do not run DFS.
-            eval_ds = eval_ds.change_keys([])
+            batches = []
 
         with torch.inference_mode():
-            frontier_batches = []
-            known_scores, rescorers = _run_hf_eval_batches(
-                rank=rank,
-                key=key,
-                model=model,
-                tokenizer=tokenizer,
-                formatter=formatter,
-                puzzle_ds_multi=puzzle_ds_multi,
-                eval_ds=eval_ds,
-                output_dir=dir_outputs,
-                max_seq_length=max_seq_length,
-                max_new_tokens=max_new_tokens,
-                max_score=max_score,
-                use_multitoken=config["use_unsloth_multitoken_dfs"],
-                use_structured_rows=config["use_unsloth_structured_rows"],
-                prune_structural_invalid=config["prune_structural_invalid"],
-                repeat_len=config["unsloth_multitoken_repeat_len"],
-                start_time=start_time,
-                end_time=end_time,
-                timing_stats=timing_stats,
-                count_stats=count_stats,
-                frontier_max_score=(
-                    default_max_score(config["adaptive_dfs_prob_threshold"])
-                    if config["adaptive_resume_frontier"]
-                    else None
-                ),
-                frontier_batches=frontier_batches,
-            )
+            known_scores = {}
+            rescorers = {}
 
-            adaptive_output_dir = config["adaptive_output_dir"]
-            starved = set()
-            if adaptive_output_dir:
-                # Frontier-resume writes decoded candidates directly via
-                # _consume_hf_dfs_result rather than through
-                # _run_hf_eval_batches, so create its output directory here.
-                os.makedirs(adaptive_output_dir, exist_ok=True)
-                unique_counts = {
-                    base_key: sum(1 for candidate_key in known_scores if candidate_key[0] == base_key)
-                    for base_key in puzzle_ds_multi.keys
-                }
-                starved = {
-                    base_key
-                    for base_key, unique_count in unique_counts.items()
-                    if unique_count < config["adaptive_min_unique_candidates"]
-                }
-                print(
-                    f"[Rank {rank}] primary unique candidates for {key}: "
-                    f"{unique_counts}; adaptive_outputs={sorted(starved)}"
-                )
-                if starved and time.time() < end_time and time.time() - start_time <= 1200:
-                    if config["adaptive_resume_frontier"]:
-                        for frontier_batch in frontier_batches:
-                            filtered_frontier = [
-                                entry
-                                for entry in frontier_batch["frontier"]
-                                if frontier_batch["subkeys"][entry["lane"]].split(".")[0]
-                                in starved
-                            ]
-                            if not filtered_frontier:
-                                continue
-                            resume_started_at = time.perf_counter()
-                            resume_stats = {}
-                            resumed = resume_turbo_dfs_multitoken(
-                                model=model,
-                                prefix_tokens=frontier_batch["tokens"],
-                                frontier=filtered_frontier,
-                                max_new_tokens=max_new_tokens,
-                                max_score=default_max_score(
-                                    config["adaptive_dfs_prob_threshold"]
-                                ),
-                                end_time=end_time,
-                                repeat_len=config["unsloth_multitoken_repeat_len"],
-                                stats=resume_stats,
-                            )
-                            timing_stats["adaptive_dfs_s"] += (
-                                time.perf_counter() - resume_started_at
-                            )
-                            for name, value in resume_stats.items():
-                                if name.endswith("_time_s"):
-                                    timing_stats[f"adaptive_{name}"] += value
-                                else:
-                                    count_stats[f"adaptive_{name}"] += value
-                            _consume_hf_dfs_result(
-                                rank=rank,
-                                subkeys=frontier_batch["subkeys"],
-                                dfs_result=resumed,
-                                model=model,
-                                tokenizer=tokenizer,
-                                formatter=formatter,
-                                puzzle_ds_multi=puzzle_ds_multi,
-                                output_dir=adaptive_output_dir,
-                                max_seq_length=max_seq_length,
-                                max_new_tokens=max_new_tokens,
-                                timing_stats=timing_stats,
-                                count_stats=count_stats,
-                                timing_prefix="adaptive",
-                                known_scores=known_scores,
-                                rescorers=rescorers,
-                            )
-                    else:
-                        adaptive_prep_started_at = time.perf_counter()
-                        _, adaptive_eval_ds = _prepare_shared_eval_ds(
-                            puzzle_ds,
-                            formatter,
-                            max_seq_length,
-                            max_new_tokens,
-                            color_permutations=config["adaptive_color_permutations"],
-                            seed=3,
-                        )
-                        adaptive_eval_ds = adaptive_eval_ds.change_keys(
-                            [
-                                subkey
-                                for subkey in adaptive_eval_ds.keys
-                                if subkey.split(".")[0] in starved
-                            ]
-                        )
-                        timing_stats["adaptive_eval_prep_s"] += (
-                            time.perf_counter() - adaptive_prep_started_at
-                        )
-                        _run_hf_eval_batches(
-                            rank=rank,
-                            key=key,
+            for subkeys in batches:
+                spend_time = time.time() - start_time
+                if spend_time > 1200 or time.time() > end_time:
+                    print(f"[Rank {rank}] timeout after {spend_time:.1f}s for puzzle {key}")
+                    break
+
+                print(f"[Rank {rank}] decoding {subkeys}")
+                count_stats["batches"] += 1
+
+                tokenize_started_at = time.perf_counter()
+                tokens = []
+                for subkey in subkeys:
+                    data = eval_ds.get(subkey, formatter)
+                    tokens.append(tokenizer.encode(data["input"]))
+                timing_stats["tokenize_inputs_s"] += time.perf_counter() - tokenize_started_at
+
+                dfs_started_at = time.perf_counter()
+                if config["use_unsloth_multitoken_dfs"]:
+                    multitoken_stats = {}
+                    dfs_result = inference_turbo_dfs_multitoken(
+                        model,
+                        tokens,
+                        max_new_tokens,
+                        max_score,
+                        end_time,
+                        repeat_len=config["unsloth_multitoken_repeat_len"],
+                        stats=multitoken_stats,
+                    )
+                    for name, value in multitoken_stats.items():
+                        if name == "model_time_s":
+                            timing_stats["dfs_multitoken_model_s"] += value
+                        else:
+                            count_stats[f"dfs_multitoken_{name}"] += value
+                else:
+                    dfs_result = inference_turbo_dfs(model, tokens, max_new_tokens, max_score, end_time)
+                timing_stats["dfs_s"] += time.perf_counter() - dfs_started_at
+                count_stats["dfs_calls"] += 1
+
+                for subkey_id, scored_beams in dfs_result:
+                    subkey = subkeys[subkey_id]
+                    bk = subkey.split(".")[0]
+                    decoded_result = []
+                    count_stats["subkeys_scored"] += 1
+
+                    if bk not in rescorers:
+                        rescorer_started_at = time.perf_counter()
+                        rescorers[bk] = FullPassRescorer(
                             model=model,
                             tokenizer=tokenizer,
                             formatter=formatter,
                             puzzle_ds_multi=puzzle_ds_multi,
-                            eval_ds=adaptive_eval_ds,
-                            output_dir=adaptive_output_dir,
+                            base_key=bk,
                             max_seq_length=max_seq_length,
                             max_new_tokens=max_new_tokens,
-                            max_score=default_max_score(
-                                config["adaptive_dfs_prob_threshold"]
-                            ),
-                            use_multitoken=config["use_unsloth_multitoken_dfs"],
-                            use_structured_rows=config["use_unsloth_structured_rows"],
-                            prune_structural_invalid=config["prune_structural_invalid"],
-                            repeat_len=config["unsloth_multitoken_repeat_len"],
-                            start_time=start_time,
-                            end_time=end_time,
-                            timing_stats=timing_stats,
-                            count_stats=count_stats,
-                            timing_prefix="adaptive",
-                            known_scores=known_scores,
-                            rescorers=rescorers,
+                            seed=stable_seed_from_key(bk),
+                        )
+                        timing_stats["rescorer_init_s"] += time.perf_counter() - rescorer_started_at
+                        count_stats["rescorers_created"] += 1
+
+                    for beam_score, beam_tokens in scored_beams:
+                        count_stats["beam_candidates_seen"] += 1
+                        array = formatter.convert_tokens_to_array(beam_tokens)
+                        if array is None:
+                            count_stats["beam_candidates_invalid"] += 1
+                            continue
+
+                        solution = puzzle_ds_multi.invert_mod(array, subkey, inv_perm=True)
+                        grid_id = (bk, tuple(map(tuple, solution)))
+                        count_stats["beam_candidates_valid"] += 1
+
+                        if grid_id in known_scores:
+                            augmented_scores = known_scores[grid_id]
+                            count_stats["rescoring_cache_hits"] += 1
+                        else:
+                            print(f"[Rank {rank}] scoring {subkey} #{len(decoded_result)}")
+                            rescore_started_at = time.perf_counter()
+                            augmented_scores = rescorers[bk].score_solution(solution)
+                            timing_stats["rescoring_s"] += time.perf_counter() - rescore_started_at
+                            known_scores[grid_id] = augmented_scores
+                            count_stats["rescoring_cache_misses"] += 1
+
+                        decoded_result.append(
+                            {
+                                "beam_score": beam_score,
+                                "score_aug": augmented_scores,
+                                "solution": solution,
+                            }
                         )
 
-            compare_fresh_dir = config["compare_fresh_adaptive_output_dir"]
-            if compare_fresh_dir and starved and time.time() < end_time:
-                fresh_eval_ds = eval_ds.change_keys(
-                    [
-                        subkey
-                        for subkey in eval_ds.keys
-                        if subkey.split(".")[0] in starved
-                    ]
-                )
-                fresh_timing_stats = defaultdict(float)
-                fresh_count_stats = defaultdict(int)
-                _run_hf_eval_batches(
-                    rank=rank,
-                    key=key,
-                    model=model,
-                    tokenizer=tokenizer,
-                    formatter=formatter,
-                    puzzle_ds_multi=puzzle_ds_multi,
-                    eval_ds=fresh_eval_ds,
-                    output_dir=compare_fresh_dir,
-                    max_seq_length=max_seq_length,
-                    max_new_tokens=max_new_tokens,
-                    max_score=default_max_score(
-                        config["adaptive_dfs_prob_threshold"]
-                    ),
-                    use_multitoken=config["use_unsloth_multitoken_dfs"],
-                    use_structured_rows=False,
-                    prune_structural_invalid=config["prune_structural_invalid"],
-                    repeat_len=config["unsloth_multitoken_repeat_len"],
-                    start_time=time.time(),
-                    end_time=end_time,
-                    timing_stats=fresh_timing_stats,
-                    count_stats=fresh_count_stats,
-                    timing_prefix="fresh_compare",
-                    known_scores={},
-                    rescorers={},
-                )
-                diagnostics_dir = f"{compare_fresh_dir}_diagnostics"
-                os.makedirs(diagnostics_dir, exist_ok=True)
-                with open(os.path.join(diagnostics_dir, f"{key}.json"), "w") as f:
-                    json.dump(
-                        {
-                            "timing": dict(fresh_timing_stats),
-                            "counts": dict(fresh_count_stats),
-                            "starved_outputs": sorted(starved),
-                        },
-                        f,
-                        indent=2,
-                        sort_keys=True,
-                    )
-
-            compare_structured_dir = config["compare_structured_output_dir"]
-            if compare_structured_dir and time.time() < end_time:
-                structured_timing_stats = defaultdict(float)
-                structured_count_stats = defaultdict(int)
-                _run_hf_eval_batches(
-                    rank=rank,
-                    key=key,
-                    model=model,
-                    tokenizer=tokenizer,
-                    formatter=formatter,
-                    puzzle_ds_multi=puzzle_ds_multi,
-                    eval_ds=eval_ds,
-                    output_dir=compare_structured_dir,
-                    max_seq_length=max_seq_length,
-                    max_new_tokens=max_new_tokens,
-                    max_score=max_score,
-                    use_multitoken=True,
-                    use_structured_rows=True,
-                    prune_structural_invalid=False,
-                    repeat_len=config["unsloth_multitoken_repeat_len"],
-                    start_time=time.time(),
-                    end_time=end_time,
-                    timing_stats=structured_timing_stats,
-                    count_stats=structured_count_stats,
-                    timing_prefix="structured_compare",
-                    known_scores={},
-                    rescorers={},
-                )
-                diagnostics_dir = f"{compare_structured_dir}_diagnostics"
-                os.makedirs(diagnostics_dir, exist_ok=True)
-                with open(os.path.join(diagnostics_dir, f"{key}.json"), "w") as f:
-                    json.dump(
-                        {
-                            "control_timing": dict(timing_stats),
-                            "control_counts": dict(count_stats),
-                            "structured_timing": dict(structured_timing_stats),
-                            "structured_counts": dict(structured_count_stats),
-                        },
-                        f,
-                        indent=2,
-                        sort_keys=True,
-                    )
+                    if len(decoded_result):
+                        write_started_at = time.perf_counter()
+                        with bz2.BZ2File(os.path.join(dir_outputs, subkey), "w") as f:
+                            pickle.dump(decoded_result, f)
+                        timing_stats["write_results_s"] += time.perf_counter() - write_started_at
+                        count_stats["subkeys_written"] += 1
 
         memory_allocated = torch.cuda.max_memory_allocated() // 1024**2
         print(f"[Rank {rank}] allocated {memory_allocated}MB for inference")
@@ -2120,13 +1588,6 @@ def worker(rank, queue, end_time):
                 "rescorer_init_s",
                 "rescoring_s",
                 "write_results_s",
-                "adaptive_eval_prep_s",
-                "adaptive_tokenize_inputs_s",
-                "adaptive_dfs_s",
-                "adaptive_dfs_multitoken_model_s",
-                "adaptive_rescorer_init_s",
-                "adaptive_rescoring_s",
-                "adaptive_write_results_s",
                 "total_wall_s",
             ]
             timings_text = " ".join(f"{name}={timing_stats[name]:.3f}s" for name in ordered_timings)
@@ -2147,15 +1608,6 @@ def worker(rank, queue, end_time):
                     "rescoring_cache_hits",
                     "rescoring_cache_misses",
                     "rescorers_created",
-                    "adaptive_batches",
-                    "adaptive_dfs_calls",
-                    "adaptive_subkeys_scored",
-                    "adaptive_subkeys_written",
-                    "adaptive_beam_candidates_seen",
-                    "adaptive_beam_candidates_valid",
-                    "adaptive_beam_candidates_invalid",
-                    "adaptive_rescoring_cache_hits",
-                    "adaptive_rescoring_cache_misses",
                     "fixed_pool_source_files",
                     "fixed_pool_unique_candidates",
                 ]

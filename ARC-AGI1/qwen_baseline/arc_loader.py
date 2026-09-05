@@ -178,31 +178,6 @@ class ArcDataset:
             replies={f"{k}_{i}": [self.replies[k][i]] for k, i in key_indices if k in self.replies},
         )
 
-    def split_multi_replies_shared_views(self):
-        """Split an already-augmented puzzle while preserving one view tag.
-
-        Applying ``augment`` before this method makes every test output use the
-        same geometry, colour permutation, and demonstration order.  The
-        output index is inserted before the modifiers so existing decoding and
-        inversion code continues to see keys shaped like ``puzzle_0.<view>``.
-        """
-        keys = []
-        queries = {}
-        replies = {}
-        for augmented_key in self.keys:
-            base_key, separator, modifiers = augmented_key.partition(".")
-            suffix = f".{modifiers}" if separator else ""
-            for output_index, test_item in enumerate(self.queries[augmented_key]["test"]):
-                split_key = f"{base_key}_{output_index}{suffix}"
-                keys.append(split_key)
-                queries[split_key] = {
-                    "train": self.queries[augmented_key]["train"],
-                    "test": [test_item],
-                }
-                if augmented_key in self.replies:
-                    replies[split_key] = [self.replies[augmented_key][output_index]]
-        return self.__class__(queries=queries, replies=replies, keys=keys)
-
     def shuffled(self):
         return self.__class__(queries=self.queries, replies=self.replies, keys=shuffled(self.keys))
 

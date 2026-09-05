@@ -50,26 +50,6 @@ def _load_selected_keys(args, data):
     return keys
 
 
-def _estimated_task_work(task):
-    def grid_tokens(grid):
-        return len(grid) * (len(grid[0]) + 1)
-
-    train_tokens = sum(
-        grid_tokens(pair["input"]) + grid_tokens(pair["output"])
-        for pair in task["train"]
-    )
-    ratios = sorted(
-        grid_tokens(pair["output"]) / max(1, grid_tokens(pair["input"]))
-        for pair in task["train"]
-    )
-    median_ratio = ratios[len(ratios) // 2]
-    test_tokens = sum(
-        grid_tokens(item["input"]) * (1 + median_ratio)
-        for item in task["test"]
-    )
-    return train_tokens * 16 + test_tokens * 8 * len(task["test"])
-
-
 def _load_manifest_jobs(args):
     with open(args.sglang_infer_from_manifest, "r") as f:
         data = json.load(f)
@@ -137,8 +117,6 @@ if __name__ == "__main__":
     parser.add_argument("--cuda-device-offset", type=int, default=0)
     parser.add_argument("--use-speculative-dfs", action="store_true")
     parser.add_argument("--use-unsloth-multitoken-dfs", action="store_true")
-    parser.add_argument("--use-unsloth-structured-rows", action="store_true")
-    parser.add_argument("--prune-structural-invalid", action="store_true")
     parser.add_argument("--unsloth-multitoken-repeat-len", type=int, default=9)
     parser.add_argument("--use-sglang", action="store_true")
     parser.add_argument("--sglang-tp-size", type=int, default=1)
@@ -156,21 +134,16 @@ if __name__ == "__main__":
     parser.add_argument("--sglang-dynamic-repeat", action="store_true")
     parser.add_argument("--dfs-prob-threshold", type=float, default=0.2)
     parser.add_argument("--eval-color-permutations", type=int, default=2)
-    parser.add_argument("--shared-eval-augmentations", action="store_true")
-    parser.add_argument("--adaptive-output-dir", type=str, default=None)
-    parser.add_argument("--adaptive-resume-frontier", action="store_true")
-    parser.add_argument("--adaptive-dfs-prob-threshold", type=float, default=0.1)
-    parser.add_argument("--adaptive-color-permutations", type=int, default=3)
-    parser.add_argument("--adaptive-min-unique-candidates", type=int, default=2)
-    parser.add_argument("--compare-structured-output-dir", type=str, default=None)
-    parser.add_argument("--compare-fresh-adaptive-output-dir", type=str, default=None)
-    parser.add_argument("--cheap-first", action="store_true")
+    parser.add_argument("--train-color-permutations", type=int, default=16)
+    parser.add_argument("--train-augmentation-seed", type=int, default=1)
+    parser.add_argument("--eval-augmentation-seed", type=int, default=2)
+    parser.add_argument("--trainer-seed", type=int, default=42)
+    parser.add_argument("--sentinel-tag", type=str, default="")
     parser.add_argument("--profile-timings", action="store_true")
     parser.add_argument(
         "--ttft-method",
         choices=[
             "full_sft",
-            "one_pass_ss",
             "reduced_sft",
             "reduced_plus_sft_c",
             "reduced_plus_opsd",
@@ -191,7 +164,6 @@ if __name__ == "__main__":
     parser.add_argument("--opsd-top-p", type=float, default=1.0)
     parser.add_argument("--opsd-lambda-ce", type=float, default=0.0)
     parser.add_argument("--repair-ttft-log-dir", type=str, default="../repair_ttft_logs")
-    parser.add_argument("--full-sft-total-steps", type=int, default=128)
     parser.add_argument("--repair-ttft-total-steps", type=int, default=128)
     parser.add_argument("--repair-ttft-loo-stage1-steps", type=int, default=64)
     parser.add_argument("--repair-ttft-warm-stage1-steps", type=int, default=32)
@@ -199,16 +171,6 @@ if __name__ == "__main__":
     parser.add_argument("--repair-ttft-loo-heldout-views", type=int, default=16)
     parser.add_argument("--repair-ttft-loo-seen-views", type=int, default=4)
     parser.add_argument("--repair-ttft-warm-views-per-pair", type=int, default=8)
-    parser.add_argument("--scheduled-sampling-warmup-steps", type=int, default=32)
-    parser.add_argument("--scheduled-sampling-total-steps", type=int, default=128)
-    parser.add_argument("--scheduled-sampling-mix-probability", type=float, default=0.5)
-    parser.add_argument("--scheduled-sampling-log-dir", type=str, default="../scheduled_sampling_logs")
-    parser.add_argument(
-        "--canon-ac-state",
-        type=str,
-        default=None,
-        help="Path to canon_ac.pt produced by staged global Canon training.",
-    )
     args = parser.parse_args()
     if args.sglang_train_adapters_only and args.sglang_reuse_adapters:
         raise ValueError("--sglang-train-adapters-only and --sglang-reuse-adapters are mutually exclusive")
@@ -231,88 +193,27 @@ if __name__ == "__main__":
         raise ValueError("Reduced-pair TTFT methods are only supported by the Unsloth/HF worker")
     if args.use_unsloth_multitoken_dfs and args.use_sglang:
         raise ValueError("--use-unsloth-multitoken-dfs is only supported by the Unsloth/HF worker")
-    if args.canon_ac_state and args.use_sglang:
-        raise ValueError("Canon-AC is initially supported only by the Unsloth/HF worker")
     if args.unsloth_multitoken_repeat_len < 2:
         raise ValueError("--unsloth-multitoken-repeat-len must be at least 2")
-    if args.use_unsloth_structured_rows and not args.use_unsloth_multitoken_dfs:
-        raise ValueError(
-            "--use-unsloth-structured-rows requires --use-unsloth-multitoken-dfs"
-        )
-    if args.use_unsloth_structured_rows and args.canon_ac_state:
-        raise ValueError(
-            "--use-unsloth-structured-rows is initially a Vanilla-only experiment"
-        )
-    if args.prune_structural_invalid and not args.use_unsloth_multitoken_dfs:
-        raise ValueError(
-            "--prune-structural-invalid requires --use-unsloth-multitoken-dfs"
-        )
-    if args.prune_structural_invalid and args.use_unsloth_structured_rows:
-        raise ValueError(
-            "--prune-structural-invalid and --use-unsloth-structured-rows "
-            "are alternative grammar implementations"
-        )
     if args.eval_color_permutations < 1:
         raise ValueError("--eval-color-permutations must be positive")
-    if args.adaptive_color_permutations < 1:
-        raise ValueError("--adaptive-color-permutations must be positive")
-    if args.adaptive_min_unique_candidates < 1:
-        raise ValueError("--adaptive-min-unique-candidates must be positive")
-    if not 0.0 < args.adaptive_dfs_prob_threshold < 1.0:
-        raise ValueError("--adaptive-dfs-prob-threshold must be in (0, 1)")
-    if args.adaptive_output_dir and not args.shared_eval_augmentations:
-        raise ValueError(
-            "--adaptive-output-dir requires --shared-eval-augmentations"
-        )
-    if args.adaptive_resume_frontier and not args.adaptive_output_dir:
-        raise ValueError(
-            "--adaptive-resume-frontier requires --adaptive-output-dir"
-        )
-    if args.adaptive_resume_frontier and not args.use_unsloth_multitoken_dfs:
-        raise ValueError(
-            "--adaptive-resume-frontier requires --use-unsloth-multitoken-dfs"
-        )
-    if (
-        args.adaptive_resume_frontier
-        and args.adaptive_dfs_prob_threshold >= args.dfs_prob_threshold
-    ):
-        raise ValueError(
-            "--adaptive-resume-frontier requires an adaptive probability "
-            "threshold lower than the primary threshold"
-        )
+    if args.train_color_permutations < 1:
+        raise ValueError("--train-color-permutations must be positive")
     if args.opsd_min_train_pairs < 3:
         raise ValueError("--opsd-min-train-pairs must be at least 3")
     if args.opsd_color_permutations < 1:
         raise ValueError("--opsd-color-permutations must be positive")
     if args.opsd_max_updates < 1:
         raise ValueError("--opsd-max-updates must be positive")
-    if not 1 <= args.full_sft_total_steps <= 128:
-        raise ValueError("--full-sft-total-steps must be between 1 and 128")
     if not 0.0 <= args.opsd_cross_view_probability <= 1.0:
         raise ValueError("--opsd-cross-view-probability must be in [0, 1]")
     if args.repair_ttft_total_steps != 128:
         raise ValueError("--repair-ttft-total-steps must remain 128 for the controlled experiment")
     if not 0.0 <= args.repair_ttft_stage2_repair_fraction <= 1.0:
         raise ValueError("--repair-ttft-stage2-repair-fraction must be in [0, 1]")
-    if args.scheduled_sampling_warmup_steps < 0:
-        raise ValueError("--scheduled-sampling-warmup-steps must be non-negative")
-    if args.scheduled_sampling_total_steps < 1:
-        raise ValueError("--scheduled-sampling-total-steps must be positive")
-    if (
-        args.ttft_method == "one_pass_ss"
-        and args.scheduled_sampling_warmup_steps >= args.scheduled_sampling_total_steps
-    ):
-        raise ValueError(
-            "--scheduled-sampling-warmup-steps must be smaller than "
-            "--scheduled-sampling-total-steps"
-        )
-    if not 0.0 <= args.scheduled_sampling_mix_probability <= 1.0:
-        raise ValueError("--scheduled-sampling-mix-probability must be in [0, 1]")
     end_time = args.end_time if args.end_time is not None else time.time() + 12 * 3600
     os.environ["ARC_USE_SPECULATIVE_DFS"] = "1" if args.use_speculative_dfs else "0"
     os.environ["ARC_USE_UNSLOTH_MULTITOKEN_DFS"] = "1" if args.use_unsloth_multitoken_dfs else "0"
-    os.environ["ARC_USE_UNSLOTH_STRUCTURED_ROWS"] = "1" if args.use_unsloth_structured_rows else "0"
-    os.environ["ARC_PRUNE_STRUCTURAL_INVALID"] = "1" if args.prune_structural_invalid else "0"
     os.environ["ARC_UNSLOTH_MULTITOKEN_REPEAT_LEN"] = str(args.unsloth_multitoken_repeat_len)
     os.environ["ARC_USE_SGLANG"] = "1" if args.use_sglang else "0"
     os.environ["ARC_SGLANG_TP_SIZE"] = str(args.sglang_tp_size)
@@ -332,33 +233,10 @@ if __name__ == "__main__":
     os.environ["ARC_SGLANG_DYNAMIC_REPEAT"] = "1" if args.sglang_dynamic_repeat else "0"
     os.environ["ARC_DFS_PROB_THRESHOLD"] = str(args.dfs_prob_threshold)
     os.environ["ARC_EVAL_COLOR_PERMUTATIONS"] = str(args.eval_color_permutations)
-    os.environ["ARC_SHARED_EVAL_AUGMENTATIONS"] = (
-        "1" if args.shared_eval_augmentations else "0"
-    )
-    if args.adaptive_output_dir is not None:
-        os.environ["ARC_ADAPTIVE_OUTPUT_DIR"] = args.adaptive_output_dir
-    else:
-        os.environ.pop("ARC_ADAPTIVE_OUTPUT_DIR", None)
-    os.environ["ARC_ADAPTIVE_RESUME_FRONTIER"] = (
-        "1" if args.adaptive_resume_frontier else "0"
-    )
-    os.environ["ARC_ADAPTIVE_DFS_PROB_THRESHOLD"] = str(
-        args.adaptive_dfs_prob_threshold
-    )
-    os.environ["ARC_ADAPTIVE_COLOR_PERMUTATIONS"] = str(
-        args.adaptive_color_permutations
-    )
-    os.environ["ARC_ADAPTIVE_MIN_UNIQUE_CANDIDATES"] = str(
-        args.adaptive_min_unique_candidates
-    )
-    if args.compare_structured_output_dir is not None:
-        os.environ["ARC_COMPARE_STRUCTURED_OUTPUT_DIR"] = args.compare_structured_output_dir
-    else:
-        os.environ.pop("ARC_COMPARE_STRUCTURED_OUTPUT_DIR", None)
-    if args.compare_fresh_adaptive_output_dir is not None:
-        os.environ["ARC_COMPARE_FRESH_ADAPTIVE_OUTPUT_DIR"] = args.compare_fresh_adaptive_output_dir
-    else:
-        os.environ.pop("ARC_COMPARE_FRESH_ADAPTIVE_OUTPUT_DIR", None)
+    os.environ["ARC_TRAIN_COLOR_PERMUTATIONS"] = str(args.train_color_permutations)
+    os.environ["ARC_TRAIN_AUGMENTATION_SEED"] = str(args.train_augmentation_seed)
+    os.environ["ARC_EVAL_AUGMENTATION_SEED"] = str(args.eval_augmentation_seed)
+    os.environ["ARC_TRAINER_SEED"] = str(args.trainer_seed)
     os.environ["ARC_PROFILE_TIMINGS"] = "1" if args.profile_timings else "0"
     os.environ["ARC_TEST_PATH"] = args.test_path
     os.environ["ARC_MODEL_PATH"] = args.model_path
@@ -382,7 +260,6 @@ if __name__ == "__main__":
     os.environ["ARC_OPSD_TOP_P"] = str(args.opsd_top_p)
     os.environ["ARC_OPSD_LAMBDA_CE"] = str(args.opsd_lambda_ce)
     os.environ["ARC_REPAIR_TTFT_LOG_DIR"] = args.repair_ttft_log_dir
-    os.environ["ARC_FULL_SFT_TOTAL_STEPS"] = str(args.full_sft_total_steps)
     os.environ["ARC_REPAIR_TTFT_TOTAL_STEPS"] = str(args.repair_ttft_total_steps)
     os.environ["ARC_REPAIR_TTFT_LOO_STAGE1_STEPS"] = str(args.repair_ttft_loo_stage1_steps)
     os.environ["ARC_REPAIR_TTFT_WARM_STAGE1_STEPS"] = str(args.repair_ttft_warm_stage1_steps)
@@ -394,26 +271,10 @@ if __name__ == "__main__":
     os.environ["ARC_REPAIR_TTFT_WARM_VIEWS_PER_PAIR"] = str(
         args.repair_ttft_warm_views_per_pair
     )
-    os.environ["ARC_SCHEDULED_SAMPLING_WARMUP_STEPS"] = str(
-        args.scheduled_sampling_warmup_steps
-    )
-    os.environ["ARC_SCHEDULED_SAMPLING_TOTAL_STEPS"] = str(
-        args.scheduled_sampling_total_steps
-    )
-    os.environ["ARC_SCHEDULED_SAMPLING_MIX_PROBABILITY"] = str(
-        args.scheduled_sampling_mix_probability
-    )
-    os.environ["ARC_SCHEDULED_SAMPLING_LOG_DIR"] = args.scheduled_sampling_log_dir
-    if args.canon_ac_state is not None:
-        os.environ["ARC_CANON_AC_STATE"] = args.canon_ac_state
-    else:
-        os.environ.pop("ARC_CANON_AC_STATE", None)
     print(
         "runtime flags:",
         f"speculative_dfs={os.environ['ARC_USE_SPECULATIVE_DFS']}",
         f"unsloth_multitoken_dfs={os.environ['ARC_USE_UNSLOTH_MULTITOKEN_DFS']}",
-        f"unsloth_structured_rows={os.environ['ARC_USE_UNSLOTH_STRUCTURED_ROWS']}",
-        f"prune_structural_invalid={os.environ['ARC_PRUNE_STRUCTURAL_INVALID']}",
         f"unsloth_multitoken_repeat_len={os.environ['ARC_UNSLOTH_MULTITOKEN_REPEAT_LEN']}",
         f"use_sglang={os.environ['ARC_USE_SGLANG']}",
         f"sglang_tp_size={os.environ['ARC_SGLANG_TP_SIZE']}",
@@ -428,6 +289,10 @@ if __name__ == "__main__":
         f"sglang_dynamic_repeat={os.environ['ARC_SGLANG_DYNAMIC_REPEAT']}",
         f"dfs_prob_threshold={os.environ['ARC_DFS_PROB_THRESHOLD']}",
         f"eval_color_permutations={os.environ['ARC_EVAL_COLOR_PERMUTATIONS']}",
+        f"train_color_permutations={os.environ['ARC_TRAIN_COLOR_PERMUTATIONS']}",
+        f"train_augmentation_seed={os.environ['ARC_TRAIN_AUGMENTATION_SEED']}",
+        f"eval_augmentation_seed={os.environ['ARC_EVAL_AUGMENTATION_SEED']}",
+        f"trainer_seed={os.environ['ARC_TRAINER_SEED']}",
         f"profile_timings={os.environ['ARC_PROFILE_TIMINGS']}",
         f"test_path={os.environ['ARC_TEST_PATH']}",
         f"model_path={os.environ['ARC_MODEL_PATH']}",
@@ -444,11 +309,6 @@ if __name__ == "__main__":
         f"opsd_temperature={os.environ['ARC_OPSD_TEMPERATURE']}",
         f"opsd_top_p={os.environ['ARC_OPSD_TOP_P']}",
         f"opsd_lambda_ce={os.environ['ARC_OPSD_LAMBDA_CE']}",
-        f"scheduled_sampling_warmup_steps={os.environ['ARC_SCHEDULED_SAMPLING_WARMUP_STEPS']}",
-        f"scheduled_sampling_total_steps={os.environ['ARC_SCHEDULED_SAMPLING_TOTAL_STEPS']}",
-        f"scheduled_sampling_mix_probability={os.environ['ARC_SCHEDULED_SAMPLING_MIX_PROBABILITY']}",
-        f"scheduled_sampling_log_dir={os.environ['ARC_SCHEDULED_SAMPLING_LOG_DIR']}",
-        f"canon_ac_state={os.environ.get('ARC_CANON_AC_STATE')}",
     )
 
     if args.use_unsloth_multitoken_dfs:
@@ -477,13 +337,12 @@ if __name__ == "__main__":
         with open(args.test_path, "r") as f:
             data = json.load(f)
         selected_keys = _load_selected_keys(args, data)
-        if args.cheap_first:
-            selected_keys.sort(key=lambda key: (_estimated_task_work(data[key]), key))
-            print("cheap-first task order:", selected_keys, flush=True)
         for key in selected_keys:
             assert key in data, f"Unknown puzzle key: {key}"
             queue.put(key)
-    sentinel_prefix = f"worker_{'infer' if (args.sglang_infer_from_manifest or args.sglang_stream_manifest) else 'train'}_"
+    sentinel_kind = "infer" if (args.sglang_infer_from_manifest or args.sglang_stream_manifest) else "train"
+    sentinel_tag = f"_{args.sentinel_tag}" if args.sentinel_tag else ""
+    sentinel_prefix = f"worker_{sentinel_kind}{sentinel_tag}_"
     if args.sglang_stream_manifest:
         context = mp.spawn(
             local_worker,
