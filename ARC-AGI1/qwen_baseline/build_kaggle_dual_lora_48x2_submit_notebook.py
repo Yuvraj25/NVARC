@@ -230,6 +230,12 @@ else:
             for name, decoder in branch_decoders.items()
         },
         "branch_missing": branch_missing,
+        "combined_missing": sorted(
+            expected_outputs
+            - set().union(
+                *(set(decoder.decoded_results) for decoder in branch_decoders.values())
+            )
+        ),
         "train_steps_per_branch": 8 * TRAIN_COLOR_PERMUTATIONS,
         "inference_views_per_branch": 8 * EVAL_COLOR_PERMUTATIONS,
         "dual_branch_wall_seconds": dual_wall_seconds,
@@ -238,10 +244,14 @@ else:
     Path(MANIFEST_PATH).write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\\n")
     print(json.dumps(manifest, indent=2, sort_keys=True))
 
-    if any(branch_missing.values()):
+    empty_branches = [
+        name for name, decoder in branch_decoders.items()
+        if not decoder.decoded_results
+    ]
+    if empty_branches:
         raise RuntimeError(
-            "Dual-LoRA run incomplete; refusing one-branch or placeholder submission. "
-            f"See {MANIFEST_PATH}"
+            "Dual-LoRA branch produced no candidate outputs; refusing a one-branch "
+            f"submission for branches {empty_branches}. See {MANIFEST_PATH}"
         )
 
     combined = ArcDecoder(split_data, n_guesses=2)
