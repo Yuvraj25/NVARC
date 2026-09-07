@@ -84,6 +84,11 @@ def runtime_config():
         raise ValueError(
             f"ARC_EVAL_BATCH_SIZE must be positive, got {eval_batch_size}"
         )
+    train_batch_size = int(os.environ.get("ARC_TRAIN_BATCH_SIZE", "1"))
+    if train_batch_size < 1:
+        raise ValueError(
+            f"ARC_TRAIN_BATCH_SIZE must be positive, got {train_batch_size}"
+        )
     ttft_order = os.environ.get("ARC_TTFT_ORDER", "trainer_random")
     if ttft_order not in {"trainer_random", "descending_nll"}:
         raise ValueError(
@@ -99,6 +104,7 @@ def runtime_config():
         "dfs_prob_threshold": dfs_prob_threshold,
         "eval_color_permutations": eval_color_permutations,
         "eval_batch_size": eval_batch_size,
+        "train_batch_size": train_batch_size,
         "ttft_order": ttft_order,
         "train_color_permutations": int(
             os.environ.get("ARC_TRAIN_COLOR_PERMUTATIONS", "16")
@@ -195,6 +201,16 @@ def _descending_nll_order(nll_values):
     return sorted(range(len(nll_values)), key=lambda index: (-nll_values[index], index))
 
 
+def _collator_model_features(dataset_row, tokenizer):
+    feature_names = set(tokenizer.model_input_names)
+    feature_names.add("labels")
+    return {
+        name: value
+        for name, value in dataset_row.items()
+        if name in feature_names
+    }
+
+
 def _rank_trainer_dataset_by_global_nll(model, trainer, train_rows, puzzle_key, output_dir):
     if len(trainer.train_dataset) != len(train_rows):
         raise RuntimeError(
@@ -209,7 +225,9 @@ def _rank_trainer_dataset_by_global_nll(model, trainer, train_rows, puzzle_key, 
     model.eval()
     with model.disable_adapter(), torch.inference_mode():
         for original_index in range(len(trainer.train_dataset)):
-            batch = trainer.data_collator([trainer.train_dataset[original_index]])
+            dataset_row = trainer.train_dataset[original_index]
+            model_features = _collator_model_features(dataset_row, trainer.tokenizer)
+            batch = trainer.data_collator([model_features])
             batch = {
                 name: value.to(model.device) if hasattr(value, "to") else value
                 for name, value in batch.items()
@@ -801,7 +819,7 @@ def worker_sglang(rank, queue, end_time, config):
 
     train_args = dict(
         per_device_eval_batch_size=1,
-        per_device_train_batch_size=1,
+        per_device_train_batch_size=config["train_batch_size"],
         gradient_accumulation_steps=1,
         num_train_epochs=1,
         warmup_steps=0,
@@ -1155,7 +1173,7 @@ def worker(rank, queue, end_time):
 
     train_args = dict(
         per_device_eval_batch_size=1,
-        per_device_train_batch_size=1,
+        per_device_train_batch_size=config["train_batch_size"],
         gradient_accumulation_steps=1,
         num_train_epochs=1,
         warmup_steps=0,

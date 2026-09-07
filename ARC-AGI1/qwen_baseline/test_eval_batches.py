@@ -1,5 +1,5 @@
 from arc_loader import ArcDataset
-from arc_solver import _build_eval_batches, _descending_nll_order
+from arc_solver import _build_eval_batches, _collator_model_features, _descending_nll_order
 
 
 class _FakeTokenizer:
@@ -69,6 +69,22 @@ def test_non_16_view_batches_support_batch_eight_without_mixing_lengths():
 
 def test_descending_nll_order_is_stable_for_ties():
     assert _descending_nll_order([0.5, 1.25, 1.25, 0.75]) == [1, 2, 3, 0]
+
+
+def test_collator_model_features_removes_dataset_metadata():
+    tokenizer = _FakeTokenizer()
+    tokenizer.model_input_names = ["input_ids", "attention_mask"]
+    row = {
+        "key": "task_0.view0",
+        "text": "ignored metadata",
+        "input_ids": [1, 2, 3],
+        "attention_mask": [1, 1, 1],
+    }
+
+    assert _collator_model_features(row, tokenizer) == {
+        "input_ids": [1, 2, 3],
+        "attention_mask": [1, 1, 1],
+    }
 
 
 def test_shared_views_match_descriptors_across_test_outputs():

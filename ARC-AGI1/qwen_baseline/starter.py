@@ -135,6 +135,7 @@ if __name__ == "__main__":
     parser.add_argument("--dfs-prob-threshold", type=float, default=0.2)
     parser.add_argument("--eval-color-permutations", type=int, default=2)
     parser.add_argument("--eval-batch-size", type=int, default=4)
+    parser.add_argument("--train-batch-size", type=int, default=1)
     parser.add_argument("--train-color-permutations", type=int, default=16)
     parser.add_argument("--train-augmentation-seed", type=int, default=1)
     parser.add_argument("--eval-augmentation-seed", type=int, default=2)
@@ -205,6 +206,8 @@ if __name__ == "__main__":
         raise ValueError("--eval-color-permutations must be positive")
     if args.eval_batch_size < 1:
         raise ValueError("--eval-batch-size must be positive")
+    if args.train_batch_size < 1:
+        raise ValueError("--train-batch-size must be positive")
     if args.train_color_permutations < 1:
         raise ValueError("--train-color-permutations must be positive")
     if args.opsd_min_train_pairs < 3:
@@ -242,6 +245,7 @@ if __name__ == "__main__":
     os.environ["ARC_DFS_PROB_THRESHOLD"] = str(args.dfs_prob_threshold)
     os.environ["ARC_EVAL_COLOR_PERMUTATIONS"] = str(args.eval_color_permutations)
     os.environ["ARC_EVAL_BATCH_SIZE"] = str(args.eval_batch_size)
+    os.environ["ARC_TRAIN_BATCH_SIZE"] = str(args.train_batch_size)
     os.environ["ARC_TRAIN_COLOR_PERMUTATIONS"] = str(args.train_color_permutations)
     os.environ["ARC_TRAIN_AUGMENTATION_SEED"] = str(args.train_augmentation_seed)
     os.environ["ARC_EVAL_AUGMENTATION_SEED"] = str(args.eval_augmentation_seed)
@@ -300,6 +304,7 @@ if __name__ == "__main__":
         f"dfs_prob_threshold={os.environ['ARC_DFS_PROB_THRESHOLD']}",
         f"eval_color_permutations={os.environ['ARC_EVAL_COLOR_PERMUTATIONS']}",
         f"eval_batch_size={os.environ['ARC_EVAL_BATCH_SIZE']}",
+        f"train_batch_size={os.environ['ARC_TRAIN_BATCH_SIZE']}",
         f"train_color_permutations={os.environ['ARC_TRAIN_COLOR_PERMUTATIONS']}",
         f"train_augmentation_seed={os.environ['ARC_TRAIN_AUGMENTATION_SEED']}",
         f"eval_augmentation_seed={os.environ['ARC_EVAL_AUGMENTATION_SEED']}",

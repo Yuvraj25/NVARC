@@ -57,6 +57,7 @@ LoRA in that fixed sequential order. Evaluation uses q9, 24 views, threshold
                 '        "--eval-color-permutations", str(EVAL_COLOR_PERMUTATIONS),\n',
                 '        "--eval-color-permutations", str(EVAL_COLOR_PERMUTATIONS),\n'
                 '        "--eval-batch-size", "6",\n'
+                '        "--train-batch-size", "2",\n'
                 '        "--ttft-order", "descending_nll",\n',
             )
         if 'assert "--eval-color-permutations" in starter_source' in source:
@@ -64,6 +65,7 @@ LoRA in that fixed sequential order. Evaluation uses q9, 24 views, threshold
                 'assert "--eval-color-permutations" in starter_source\n',
                 'assert "--eval-color-permutations" in starter_source\n'
                 'assert "--eval-batch-size" in starter_source\n'
+                'assert "--train-batch-size" in starter_source\n'
                 'assert "--ttft-order" in starter_source\n',
             )
         cell["source"] = source
