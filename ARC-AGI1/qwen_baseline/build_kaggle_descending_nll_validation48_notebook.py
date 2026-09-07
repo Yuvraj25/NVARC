@@ -103,7 +103,7 @@ assert len(order_files) == len(SELECTED_KEYS), (len(order_files), len(SELECTED_K
     metadata.update(
         {
             "id": "yuvraj/arc26-vanilla-v2-descending-nll-q9-24-validation48",
-            "title": "[ARC26] Vanilla V2 descending NLL q9 24 validation48",
+            "title": "ARC26 Vanilla V2 descending NLL q9 24 validation48",
             "code_file": NOTEBOOK_NAME,
         }
     )
