@@ -95,6 +95,17 @@ def runtime_config():
             "ARC_TTFT_ORDER must be 'trainer_random' or 'descending_nll', "
             f"got {ttft_order!r}"
         )
+    ttft_ema_decay = float(os.environ.get("ARC_TTFT_EMA_DECAY", "0"))
+    if not 0.0 <= ttft_ema_decay < 1.0:
+        raise ValueError(
+            f"ARC_TTFT_EMA_DECAY must be in [0, 1), got {ttft_ema_decay}"
+        )
+    ttft_ema_start_step = int(os.environ.get("ARC_TTFT_EMA_START_STEP", "0"))
+    if ttft_ema_decay > 0.0 and ttft_ema_start_step < 1:
+        raise ValueError(
+            "ARC_TTFT_EMA_START_STEP must be positive when TTFT EMA is enabled, "
+            f"got {ttft_ema_start_step}"
+        )
     return {
         "use_speculative_dfs": _env_flag("ARC_USE_SPECULATIVE_DFS", default=False),
         "use_unsloth_multitoken_dfs": _env_flag("ARC_USE_UNSLOTH_MULTITOKEN_DFS", default=False),
@@ -106,6 +117,8 @@ def runtime_config():
         "eval_batch_size": eval_batch_size,
         "train_batch_size": train_batch_size,
         "ttft_order": ttft_order,
+        "ttft_ema_decay": ttft_ema_decay,
+        "ttft_ema_start_step": ttft_ema_start_step,
         "train_color_permutations": int(
             os.environ.get("ARC_TRAIN_COLOR_PERMUTATIONS", "16")
         ),
@@ -195,6 +208,82 @@ def _make_unsloth_fixed_trainer_class(UnslothTrainer):
             return (loss, outputs) if return_outputs else loss
 
     return UnslothFixedTrainer
+
+
+def _make_bias_corrected_lora_ema_callback_class(TrainerCallback):
+    class BiasCorrectedLoraEmaCallback(TrainerCallback):
+        def __init__(self, decay, start_step):
+            self.decay = decay
+            self.start_step = start_step
+            self.shadow = {}
+            self.mass = 0.0
+            self.update_count = 0
+            self.first_step = None
+            self.last_step = None
+
+        def on_step_end(self, args, state, control, model=None, **kwargs):
+            step = int(state.global_step)
+            if step < self.start_step or step == self.last_step:
+                return control
+            if model is None:
+                raise RuntimeError("TTFT EMA callback did not receive the training model")
+
+            with torch.no_grad():
+                for name, parameter in model.named_parameters():
+                    if not parameter.requires_grad:
+                        continue
+                    if name not in self.shadow:
+                        self.shadow[name] = torch.zeros_like(
+                            parameter.detach(), dtype=torch.float32
+                        )
+                    self.shadow[name].mul_(self.decay).add_(
+                        parameter.detach(), alpha=1.0 - self.decay
+                    )
+
+            self.mass = self.decay * self.mass + (1.0 - self.decay)
+            self.update_count += 1
+            if self.first_step is None:
+                self.first_step = step
+            self.last_step = step
+            return control
+
+        def apply_to(self, model):
+            if self.update_count == 0 or self.mass <= 0.0:
+                raise RuntimeError(
+                    f"TTFT EMA collected no states from step {self.start_step} onward"
+                )
+
+            shadow_bytes = sum(
+                value.numel() * value.element_size()
+                for value in self.shadow.values()
+            )
+            applied_names = set()
+            with torch.no_grad():
+                for name, parameter in model.named_parameters():
+                    if name not in self.shadow:
+                        continue
+                    parameter.copy_(self.shadow[name] / self.mass)
+                    applied_names.add(name)
+            if applied_names != set(self.shadow):
+                missing = sorted(set(self.shadow) - applied_names)
+                raise RuntimeError(
+                    f"TTFT EMA parameters disappeared before application: {missing}"
+                )
+
+            summary = {
+                "decay": self.decay,
+                "start_step": self.start_step,
+                "first_step": self.first_step,
+                "last_step": self.last_step,
+                "update_count": self.update_count,
+                "normalization_mass": self.mass,
+                "parameter_count": len(self.shadow),
+                "shadow_bytes": shadow_bytes,
+            }
+            self.shadow.clear()
+            return summary
+
+    return BiasCorrectedLoraEmaCallback
 
 
 def _descending_nll_order(nll_values):
@@ -356,12 +445,15 @@ def _restore_qwen_role_tokens(model, tokenizer):
 def _get_unsloth_training_stack():
     from unsloth import FastLanguageModel, UnslothTrainer, UnslothTrainingArguments
     from peft import get_peft_model_state_dict, set_peft_model_state_dict
-    from transformers import AutoTokenizer, DataCollatorForLanguageModeling
+    from transformers import AutoTokenizer, DataCollatorForLanguageModeling, TrainerCallback
 
     return {
         "FastLanguageModel": FastLanguageModel,
         "UnslothTrainingArguments": UnslothTrainingArguments,
         "UnslothFixedTrainer": _make_unsloth_fixed_trainer_class(UnslothTrainer),
+        "BiasCorrectedLoraEmaCallback": _make_bias_corrected_lora_ema_callback_class(
+            TrainerCallback
+        ),
         "QwenDataCollatorForCompletionOnlyLM": _make_qwen_data_collator_class(DataCollatorForLanguageModeling),
         "get_peft_model_state_dict": get_peft_model_state_dict,
         "set_peft_model_state_dict": set_peft_model_state_dict,
@@ -1201,6 +1293,7 @@ def worker(rank, queue, end_time):
     FastLanguageModel = training_stack["FastLanguageModel"]
     UnslothTrainingArguments = training_stack["UnslothTrainingArguments"]
     UnslothFixedTrainer = training_stack["UnslothFixedTrainer"]
+    BiasCorrectedLoraEmaCallback = training_stack["BiasCorrectedLoraEmaCallback"]
     QwenDataCollatorForCompletionOnlyLM = training_stack["QwenDataCollatorForCompletionOnlyLM"]
     get_peft_model_state_dict = training_stack["get_peft_model_state_dict"]
     set_peft_model_state_dict = training_stack["set_peft_model_state_dict"]
@@ -1235,6 +1328,8 @@ def worker(rank, queue, end_time):
         f"[Rank {rank}] config: speculative_dfs={config['use_speculative_dfs']} "
         f"dfs_prob_threshold={config['dfs_prob_threshold']} "
         f"ttft_method={config['ttft_method']} ttft_order={config['ttft_order']} "
+        f"ttft_ema_decay={config['ttft_ema_decay']} "
+        f"ttft_ema_start_step={config['ttft_ema_start_step']} "
         f"fixed_candidate_dir={config['fixed_candidate_dir']}"
     )
     if config["ttft_method"] != "full_sft" and config["use_sglang"]:
@@ -1331,7 +1426,18 @@ def worker(rank, queue, end_time):
             }
 
         training_started_at = time.perf_counter()
+        ema_stats = None
         with io.StringIO() as buf, redirect_stdout(buf), redirect_stderr(buf):
+            ema_callback = None
+            callbacks = None
+            if config["ttft_ema_decay"] > 0.0:
+                if effective_ttft_method != "full_sft":
+                    raise ValueError("TTFT EMA currently requires full_sft")
+                ema_callback = BiasCorrectedLoraEmaCallback(
+                    decay=config["ttft_ema_decay"],
+                    start_step=config["ttft_ema_start_step"],
+                )
+                callbacks = [ema_callback]
             trainer = UnslothFixedTrainer(
                 model=model,
                 tokenizer=tokenizer,
@@ -1340,6 +1446,7 @@ def worker(rank, queue, end_time):
                 dataset_text_field="text",
                 max_seq_length=max_seq_length,
                 args=UnslothTrainingArguments(**train_args),
+                callbacks=callbacks,
             )
 
             if config["ttft_order"] == "descending_nll":
@@ -1359,8 +1466,14 @@ def worker(rank, queue, end_time):
                 print(f"[Rank {rank}] descending-NLL order saved to {manifest_path}")
 
             stats = trainer.train()
+            if ema_callback is not None:
+                ema_stats = ema_callback.apply_to(model)
             model = trainer.accelerator.unwrap_model(model, keep_fp32_wrapper=False)
-            del trainer
+            del trainer, ema_callback
+        if ema_stats is not None:
+            print(f"[Rank {rank}] {key}: TTFT EMA {ema_stats}")
+            gc.collect()
+            torch.cuda.empty_cache()
         timing_stats["training_s"] += time.perf_counter() - training_started_at
 
         if effective_ttft_method in REPAIR_TTFT_METHODS:

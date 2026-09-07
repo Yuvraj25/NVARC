@@ -1,5 +1,12 @@
+import torch
+
 from arc_loader import ArcDataset
-from arc_solver import _build_eval_batches, _collator_model_features, _descending_nll_order
+from arc_solver import (
+    _build_eval_batches,
+    _collator_model_features,
+    _descending_nll_order,
+    _make_bias_corrected_lora_ema_callback_class,
+)
 
 
 class _FakeTokenizer:
@@ -85,6 +92,33 @@ def test_collator_model_features_removes_dataset_metadata():
         "input_ids": [1, 2, 3],
         "attention_mask": [1, 1, 1],
     }
+
+
+def test_bias_corrected_lora_ema_uses_steps_from_start_inclusively():
+    class FakeTrainerCallback:
+        pass
+
+    class FakeState:
+        global_step = 0
+
+    model = torch.nn.Linear(1, 1, bias=False)
+    callback_class = _make_bias_corrected_lora_ema_callback_class(FakeTrainerCallback)
+    callback = callback_class(decay=0.5, start_step=2)
+    state = FakeState()
+
+    for step, value in enumerate([1.0, 2.0, 3.0, 4.0], start=1):
+        model.weight.data.fill_(value)
+        state.global_step = step
+        callback.on_step_end(None, state, None, model=model)
+
+    summary = callback.apply_to(model)
+
+    assert torch.allclose(model.weight, torch.tensor([[24.0 / 7.0]]))
+    assert summary["first_step"] == 2
+    assert summary["last_step"] == 4
+    assert summary["update_count"] == 3
+    assert summary["normalization_mass"] == 0.875
+    assert callback.shadow == {}
 
 
 def test_shared_views_match_descriptors_across_test_outputs():

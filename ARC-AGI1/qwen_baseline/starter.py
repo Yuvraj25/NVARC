@@ -136,6 +136,8 @@ if __name__ == "__main__":
     parser.add_argument("--eval-color-permutations", type=int, default=2)
     parser.add_argument("--eval-batch-size", type=int, default=4)
     parser.add_argument("--train-batch-size", type=int, default=1)
+    parser.add_argument("--ttft-ema-decay", type=float, default=0.0)
+    parser.add_argument("--ttft-ema-start-step", type=int, default=0)
     parser.add_argument("--train-color-permutations", type=int, default=16)
     parser.add_argument("--train-augmentation-seed", type=int, default=1)
     parser.add_argument("--eval-augmentation-seed", type=int, default=2)
@@ -208,6 +210,14 @@ if __name__ == "__main__":
         raise ValueError("--eval-batch-size must be positive")
     if args.train_batch_size < 1:
         raise ValueError("--train-batch-size must be positive")
+    if not 0.0 <= args.ttft_ema_decay < 1.0:
+        raise ValueError("--ttft-ema-decay must be in [0, 1)")
+    if args.ttft_ema_decay > 0.0 and args.ttft_ema_start_step < 1:
+        raise ValueError("--ttft-ema-start-step must be positive when TTFT EMA is enabled")
+    if args.ttft_ema_decay > 0.0 and args.use_sglang:
+        raise ValueError("TTFT EMA is only supported by the Unsloth/HF worker")
+    if args.ttft_ema_decay > 0.0 and args.ttft_method != "full_sft":
+        raise ValueError("TTFT EMA currently requires --ttft-method full_sft")
     if args.train_color_permutations < 1:
         raise ValueError("--train-color-permutations must be positive")
     if args.opsd_min_train_pairs < 3:
@@ -246,6 +256,8 @@ if __name__ == "__main__":
     os.environ["ARC_EVAL_COLOR_PERMUTATIONS"] = str(args.eval_color_permutations)
     os.environ["ARC_EVAL_BATCH_SIZE"] = str(args.eval_batch_size)
     os.environ["ARC_TRAIN_BATCH_SIZE"] = str(args.train_batch_size)
+    os.environ["ARC_TTFT_EMA_DECAY"] = str(args.ttft_ema_decay)
+    os.environ["ARC_TTFT_EMA_START_STEP"] = str(args.ttft_ema_start_step)
     os.environ["ARC_TRAIN_COLOR_PERMUTATIONS"] = str(args.train_color_permutations)
     os.environ["ARC_TRAIN_AUGMENTATION_SEED"] = str(args.train_augmentation_seed)
     os.environ["ARC_EVAL_AUGMENTATION_SEED"] = str(args.eval_augmentation_seed)
@@ -305,6 +317,8 @@ if __name__ == "__main__":
         f"eval_color_permutations={os.environ['ARC_EVAL_COLOR_PERMUTATIONS']}",
         f"eval_batch_size={os.environ['ARC_EVAL_BATCH_SIZE']}",
         f"train_batch_size={os.environ['ARC_TRAIN_BATCH_SIZE']}",
+        f"ttft_ema_decay={os.environ['ARC_TTFT_EMA_DECAY']}",
+        f"ttft_ema_start_step={os.environ['ARC_TTFT_EMA_START_STEP']}",
         f"train_color_permutations={os.environ['ARC_TRAIN_COLOR_PERMUTATIONS']}",
         f"train_augmentation_seed={os.environ['ARC_TRAIN_AUGMENTATION_SEED']}",
         f"eval_augmentation_seed={os.environ['ARC_EVAL_AUGMENTATION_SEED']}",
