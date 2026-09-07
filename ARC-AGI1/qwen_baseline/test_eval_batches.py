@@ -1,5 +1,5 @@
 from arc_loader import ArcDataset
-from arc_solver import _build_eval_batches
+from arc_solver import _build_eval_batches, _descending_nll_order
 
 
 class _FakeTokenizer:
@@ -45,6 +45,30 @@ def test_non_16_view_batches_require_tokenizer_aware_grouping():
         assert "tokenizer-aware batching" in str(error)
     else:
         raise AssertionError("Expected non-16-view batching to reject missing tokenizer")
+
+
+def test_non_16_view_batches_support_batch_eight_without_mixing_lengths():
+    lengths = {
+        **{f"task_0.view{i}": 100 for i in range(12)},
+        **{f"task_0.rot90.view{i}": 104 for i in range(12)},
+    }
+    dataset = _FakeDataset(lengths)
+
+    batches = _build_eval_batches(
+        dataset,
+        tokenizer=_FakeTokenizer(),
+        formatter=object(),
+        batch_size=8,
+    )
+
+    flattened = [key for batch in batches for key in batch]
+    assert sorted(flattened) == sorted(dataset.keys)
+    assert [len(batch) for batch in batches] == [8, 4, 8, 4]
+    assert all(len({lengths[key] for key in batch}) == 1 for batch in batches)
+
+
+def test_descending_nll_order_is_stable_for_ties():
+    assert _descending_nll_order([0.5, 1.25, 1.25, 0.75]) == [1, 2, 3, 0]
 
 
 def test_shared_views_match_descriptors_across_test_outputs():

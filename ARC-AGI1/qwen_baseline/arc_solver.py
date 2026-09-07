@@ -79,6 +79,17 @@ def runtime_config():
             "ARC_EVAL_COLOR_PERMUTATIONS must be positive, "
             f"got {eval_color_permutations}"
         )
+    eval_batch_size = int(os.environ.get("ARC_EVAL_BATCH_SIZE", "4"))
+    if eval_batch_size < 1:
+        raise ValueError(
+            f"ARC_EVAL_BATCH_SIZE must be positive, got {eval_batch_size}"
+        )
+    ttft_order = os.environ.get("ARC_TTFT_ORDER", "trainer_random")
+    if ttft_order not in {"trainer_random", "descending_nll"}:
+        raise ValueError(
+            "ARC_TTFT_ORDER must be 'trainer_random' or 'descending_nll', "
+            f"got {ttft_order!r}"
+        )
     return {
         "use_speculative_dfs": _env_flag("ARC_USE_SPECULATIVE_DFS", default=False),
         "use_unsloth_multitoken_dfs": _env_flag("ARC_USE_UNSLOTH_MULTITOKEN_DFS", default=False),
@@ -87,6 +98,8 @@ def runtime_config():
         "profile_timings": _env_flag("ARC_PROFILE_TIMINGS", default=False),
         "dfs_prob_threshold": dfs_prob_threshold,
         "eval_color_permutations": eval_color_permutations,
+        "eval_batch_size": eval_batch_size,
+        "ttft_order": ttft_order,
         "train_color_permutations": int(
             os.environ.get("ARC_TRAIN_COLOR_PERMUTATIONS", "16")
         ),
@@ -149,6 +162,14 @@ def _get_auto_tokenizer():
 
 def _make_unsloth_fixed_trainer_class(UnslothTrainer):
     class UnslothFixedTrainer(UnslothTrainer):
+        def _get_train_sampler(self, train_dataset=None):
+            if getattr(self, "_use_sequential_train_sampler", False):
+                from torch.utils.data import SequentialSampler
+
+                dataset = self.train_dataset if train_dataset is None else train_dataset
+                return SequentialSampler(dataset)
+            return super()._get_train_sampler(train_dataset)
+
         def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
             if self.label_smoother is not None and "labels" in inputs:
                 labels = inputs.pop("labels")
@@ -168,6 +189,93 @@ def _make_unsloth_fixed_trainer_class(UnslothTrainer):
             return (loss, outputs) if return_outputs else loss
 
     return UnslothFixedTrainer
+
+
+def _descending_nll_order(nll_values):
+    return sorted(range(len(nll_values)), key=lambda index: (-nll_values[index], index))
+
+
+def _rank_trainer_dataset_by_global_nll(model, trainer, train_rows, puzzle_key, output_dir):
+    if len(trainer.train_dataset) != len(train_rows):
+        raise RuntimeError(
+            f"Tokenized TTFT row count changed for {puzzle_key}: "
+            f"raw={len(train_rows)} tokenized={len(trainer.train_dataset)}"
+        )
+
+    was_training = model.training
+    nll_values = []
+    manifest_rows = []
+    scoring_started_at = time.perf_counter()
+    model.eval()
+    with model.disable_adapter(), torch.inference_mode():
+        for original_index in range(len(trainer.train_dataset)):
+            batch = trainer.data_collator([trainer.train_dataset[original_index]])
+            batch = {
+                name: value.to(model.device) if hasattr(value, "to") else value
+                for name, value in batch.items()
+            }
+            labels = batch["labels"]
+            supervised_tokens = int(labels[:, 1:].ne(-100).sum().item())
+            if supervised_tokens < 1:
+                raise RuntimeError(f"No supervised TTFT tokens for {puzzle_key} row {original_index}")
+            outputs = model(**batch, use_cache=False)
+            nll = float(outputs.loss.detach().float().cpu())
+            if not np.isfinite(nll):
+                raise RuntimeError(
+                    f"Non-finite initial NLL for {puzzle_key} row {original_index}: {nll}"
+                )
+            input_ids = batch["input_ids"][0].detach().cpu().tolist()
+            nll_values.append(nll)
+            manifest_rows.append(
+                {
+                    "augmentation_key": train_rows[original_index]["key"],
+                    "original_index": original_index,
+                    "text_sha256": hashlib.sha256(
+                        train_rows[original_index]["text"].encode("utf-8")
+                    ).hexdigest(),
+                    "token_ids_sha256": hashlib.sha256(
+                        json.dumps(input_ids, separators=(",", ":")).encode("utf-8")
+                    ).hexdigest(),
+                    "token_count": len(input_ids),
+                    "supervised_tokens": supervised_tokens,
+                    "initial_mean_nll": nll,
+                }
+            )
+
+    if was_training:
+        model.train()
+    order = _descending_nll_order(nll_values)
+    trainer.train_dataset = trainer.train_dataset.select(order)
+    trainer._use_sequential_train_sampler = True
+    sampler_indices = list(trainer._get_train_sampler(trainer.train_dataset))
+    if sampler_indices != list(range(len(order))):
+        raise RuntimeError(f"Sequential TTFT sampler verification failed for {puzzle_key}")
+    ordered_nll = [nll_values[index] for index in order]
+    if any(left < right for left, right in zip(ordered_nll, ordered_nll[1:])):
+        raise RuntimeError(f"Descending-NLL order verification failed for {puzzle_key}")
+
+    rank_by_index = {original_index: rank for rank, original_index in enumerate(order)}
+    for row in manifest_rows:
+        row["descending_nll_rank"] = rank_by_index[row["original_index"]]
+    manifest_rows.sort(key=lambda row: row["descending_nll_rank"])
+
+    manifest_dir = f"{output_dir}_ttft_descending_nll"
+    os.makedirs(manifest_dir, exist_ok=True)
+    manifest_path = os.path.join(manifest_dir, f"{puzzle_key}.json")
+    with open(manifest_path, "w", encoding="utf-8") as output_file:
+        json.dump(
+            {
+                "puzzle_key": puzzle_key,
+                "row_count": len(manifest_rows),
+                "scoring_seconds": time.perf_counter() - scoring_started_at,
+                "rows": manifest_rows,
+            },
+            output_file,
+            indent=2,
+            sort_keys=True,
+        )
+        output_file.write("\n")
+    return manifest_path
 
 
 def _make_qwen_data_collator_class(DataCollatorForLanguageModeling):
@@ -306,13 +414,17 @@ def _path_size_bytes(path: str) -> int:
     return total
 
 
-def _build_eval_batches(eval_ds, tokenizer=None, formatter=None):
+def _build_eval_batches(eval_ds, tokenizer=None, formatter=None, batch_size=4):
+    if batch_size < 1:
+        raise ValueError("Inference batch size must be positive")
     test_id_to_subkeys = defaultdict(list)
     for subkey in sorted(eval_ds.keys):
         test_id = subkey.split(".")[0].split("_")[1]
         test_id_to_subkeys[test_id].append(subkey)
 
-    if any(len(subkeys) != 16 for subkeys in test_id_to_subkeys.values()):
+    if batch_size != 4 or any(
+        len(subkeys) != 16 for subkeys in test_id_to_subkeys.values()
+    ):
         if tokenizer is None or formatter is None:
             raise ValueError(
                 "Non-16-view inference requires tokenizer-aware batching so "
@@ -328,8 +440,8 @@ def _build_eval_batches(eval_ds, tokenizer=None, formatter=None):
             for token_length in sorted(length_to_subkeys):
                 matching_subkeys = length_to_subkeys[token_length]
                 batches.extend(
-                    matching_subkeys[offset : offset + 4]
-                    for offset in range(0, len(matching_subkeys), 4)
+                    matching_subkeys[offset : offset + batch_size]
+                    for offset in range(0, len(matching_subkeys), batch_size)
                 )
         return batches
 
@@ -1104,7 +1216,8 @@ def worker(rank, queue, end_time):
     print(
         f"[Rank {rank}] config: speculative_dfs={config['use_speculative_dfs']} "
         f"dfs_prob_threshold={config['dfs_prob_threshold']} "
-        f"ttft_method={config['ttft_method']} fixed_candidate_dir={config['fixed_candidate_dir']}"
+        f"ttft_method={config['ttft_method']} ttft_order={config['ttft_order']} "
+        f"fixed_candidate_dir={config['fixed_candidate_dir']}"
     )
     if config["ttft_method"] != "full_sft" and config["use_sglang"]:
         raise ValueError("Reduced-pair and OPSD TTFT modes require the gradient-capable Unsloth/HF worker")
@@ -1210,6 +1323,22 @@ def worker(rank, queue, end_time):
                 max_seq_length=max_seq_length,
                 args=UnslothTrainingArguments(**train_args),
             )
+
+            if config["ttft_order"] == "descending_nll":
+                if effective_ttft_method != "full_sft":
+                    raise ValueError("Descending-NLL TTFT ordering currently requires full_sft")
+                scoring_started_at = time.perf_counter()
+                manifest_path = _rank_trainer_dataset_by_global_nll(
+                    model=model,
+                    trainer=trainer,
+                    train_rows=train_rows,
+                    puzzle_key=key,
+                    output_dir=dir_outputs,
+                )
+                scoring_elapsed = time.perf_counter() - scoring_started_at
+                timing_stats["nll_scoring_s"] += scoring_elapsed
+                training_started_at += scoring_elapsed
+                print(f"[Rank {rank}] descending-NLL order saved to {manifest_path}")
 
             stats = trainer.train()
             model = trainer.accelerator.unwrap_model(model, keep_fp32_wrapper=False)
@@ -1449,7 +1578,12 @@ def worker(rank, queue, end_time):
         )
         eval_ds = eval_ds.cut_to_len(formatter=formatter, name="input", max_len=max_seq_length - max_new_tokens)
         timing_stats["eval_prep_s"] += time.perf_counter() - prep_started_at
-        batches = _build_eval_batches(eval_ds, tokenizer=tokenizer, formatter=formatter)
+        batches = _build_eval_batches(
+            eval_ds,
+            tokenizer=tokenizer,
+            formatter=formatter,
+            batch_size=config["eval_batch_size"],
+        )
 
         if config["fixed_candidate_dir"]:
             print(f"[Rank {rank}] rescoring fixed candidate pool for {key}")
@@ -1578,6 +1712,7 @@ def worker(rank, queue, end_time):
         if config["profile_timings"]:
             timing_stats["total_wall_s"] = time.perf_counter() - puzzle_started_at
             ordered_timings = [
+                "nll_scoring_s",
                 "training_s",
                 "opsd_correction_s",
                 "sft_c_correction_s",

@@ -134,10 +134,16 @@ if __name__ == "__main__":
     parser.add_argument("--sglang-dynamic-repeat", action="store_true")
     parser.add_argument("--dfs-prob-threshold", type=float, default=0.2)
     parser.add_argument("--eval-color-permutations", type=int, default=2)
+    parser.add_argument("--eval-batch-size", type=int, default=4)
     parser.add_argument("--train-color-permutations", type=int, default=16)
     parser.add_argument("--train-augmentation-seed", type=int, default=1)
     parser.add_argument("--eval-augmentation-seed", type=int, default=2)
     parser.add_argument("--trainer-seed", type=int, default=42)
+    parser.add_argument(
+        "--ttft-order",
+        choices=["trainer_random", "descending_nll"],
+        default="trainer_random",
+    )
     parser.add_argument("--sentinel-tag", type=str, default="")
     parser.add_argument("--profile-timings", action="store_true")
     parser.add_argument(
@@ -197,6 +203,8 @@ if __name__ == "__main__":
         raise ValueError("--unsloth-multitoken-repeat-len must be at least 2")
     if args.eval_color_permutations < 1:
         raise ValueError("--eval-color-permutations must be positive")
+    if args.eval_batch_size < 1:
+        raise ValueError("--eval-batch-size must be positive")
     if args.train_color_permutations < 1:
         raise ValueError("--train-color-permutations must be positive")
     if args.opsd_min_train_pairs < 3:
@@ -233,10 +241,12 @@ if __name__ == "__main__":
     os.environ["ARC_SGLANG_DYNAMIC_REPEAT"] = "1" if args.sglang_dynamic_repeat else "0"
     os.environ["ARC_DFS_PROB_THRESHOLD"] = str(args.dfs_prob_threshold)
     os.environ["ARC_EVAL_COLOR_PERMUTATIONS"] = str(args.eval_color_permutations)
+    os.environ["ARC_EVAL_BATCH_SIZE"] = str(args.eval_batch_size)
     os.environ["ARC_TRAIN_COLOR_PERMUTATIONS"] = str(args.train_color_permutations)
     os.environ["ARC_TRAIN_AUGMENTATION_SEED"] = str(args.train_augmentation_seed)
     os.environ["ARC_EVAL_AUGMENTATION_SEED"] = str(args.eval_augmentation_seed)
     os.environ["ARC_TRAINER_SEED"] = str(args.trainer_seed)
+    os.environ["ARC_TTFT_ORDER"] = args.ttft_order
     os.environ["ARC_PROFILE_TIMINGS"] = "1" if args.profile_timings else "0"
     os.environ["ARC_TEST_PATH"] = args.test_path
     os.environ["ARC_MODEL_PATH"] = args.model_path
@@ -289,10 +299,12 @@ if __name__ == "__main__":
         f"sglang_dynamic_repeat={os.environ['ARC_SGLANG_DYNAMIC_REPEAT']}",
         f"dfs_prob_threshold={os.environ['ARC_DFS_PROB_THRESHOLD']}",
         f"eval_color_permutations={os.environ['ARC_EVAL_COLOR_PERMUTATIONS']}",
+        f"eval_batch_size={os.environ['ARC_EVAL_BATCH_SIZE']}",
         f"train_color_permutations={os.environ['ARC_TRAIN_COLOR_PERMUTATIONS']}",
         f"train_augmentation_seed={os.environ['ARC_TRAIN_AUGMENTATION_SEED']}",
         f"eval_augmentation_seed={os.environ['ARC_EVAL_AUGMENTATION_SEED']}",
         f"trainer_seed={os.environ['ARC_TRAINER_SEED']}",
+        f"ttft_order={os.environ['ARC_TTFT_ORDER']}",
         f"profile_timings={os.environ['ARC_PROFILE_TIMINGS']}",
         f"test_path={os.environ['ARC_TEST_PATH']}",
         f"model_path={os.environ['ARC_MODEL_PATH']}",
