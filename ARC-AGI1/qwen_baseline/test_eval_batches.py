@@ -2,6 +2,7 @@ import torch
 
 from arc_loader import ArcDataset
 from arc_solver import (
+    _ascending_nll_order,
     _build_eval_batches,
     _collator_model_features,
     _descending_nll_order,
@@ -76,6 +77,10 @@ def test_non_16_view_batches_support_batch_eight_without_mixing_lengths():
 
 def test_descending_nll_order_is_stable_for_ties():
     assert _descending_nll_order([0.5, 1.25, 1.25, 0.75]) == [1, 2, 3, 0]
+
+
+def test_ascending_nll_order_is_stable_for_ties():
+    assert _ascending_nll_order([0.5, 1.25, 1.25, 0.75]) == [0, 3, 1, 2]
 
 
 def test_collator_model_features_removes_dataset_metadata():

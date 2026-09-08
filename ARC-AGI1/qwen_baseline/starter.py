@@ -136,6 +136,11 @@ if __name__ == "__main__":
     parser.add_argument("--eval-color-permutations", type=int, default=2)
     parser.add_argument("--eval-batch-size", type=int, default=4)
     parser.add_argument("--train-batch-size", type=int, default=1)
+    parser.add_argument(
+        "--ttft-lr-scheduler-type",
+        choices=["cosine", "constant_with_warmup"],
+        default="cosine",
+    )
     parser.add_argument("--ttft-ema-decay", type=float, default=0.0)
     parser.add_argument("--ttft-ema-start-step", type=int, default=0)
     parser.add_argument("--train-color-permutations", type=int, default=16)
@@ -144,7 +149,7 @@ if __name__ == "__main__":
     parser.add_argument("--trainer-seed", type=int, default=42)
     parser.add_argument(
         "--ttft-order",
-        choices=["trainer_random", "descending_nll"],
+        choices=["trainer_random", "ascending_nll", "descending_nll"],
         default="trainer_random",
     )
     parser.add_argument("--sentinel-tag", type=str, default="")
@@ -256,6 +261,7 @@ if __name__ == "__main__":
     os.environ["ARC_EVAL_COLOR_PERMUTATIONS"] = str(args.eval_color_permutations)
     os.environ["ARC_EVAL_BATCH_SIZE"] = str(args.eval_batch_size)
     os.environ["ARC_TRAIN_BATCH_SIZE"] = str(args.train_batch_size)
+    os.environ["ARC_TTFT_LR_SCHEDULER_TYPE"] = args.ttft_lr_scheduler_type
     os.environ["ARC_TTFT_EMA_DECAY"] = str(args.ttft_ema_decay)
     os.environ["ARC_TTFT_EMA_START_STEP"] = str(args.ttft_ema_start_step)
     os.environ["ARC_TRAIN_COLOR_PERMUTATIONS"] = str(args.train_color_permutations)
@@ -317,6 +323,7 @@ if __name__ == "__main__":
         f"eval_color_permutations={os.environ['ARC_EVAL_COLOR_PERMUTATIONS']}",
         f"eval_batch_size={os.environ['ARC_EVAL_BATCH_SIZE']}",
         f"train_batch_size={os.environ['ARC_TRAIN_BATCH_SIZE']}",
+        f"ttft_lr_scheduler_type={os.environ['ARC_TTFT_LR_SCHEDULER_TYPE']}",
         f"ttft_ema_decay={os.environ['ARC_TTFT_EMA_DECAY']}",
         f"ttft_ema_start_step={os.environ['ARC_TTFT_EMA_START_STEP']}",
         f"train_color_permutations={os.environ['ARC_TRAIN_COLOR_PERMUTATIONS']}",

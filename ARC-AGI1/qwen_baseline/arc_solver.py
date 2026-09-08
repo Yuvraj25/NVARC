@@ -90,10 +90,17 @@ def runtime_config():
             f"ARC_TRAIN_BATCH_SIZE must be positive, got {train_batch_size}"
         )
     ttft_order = os.environ.get("ARC_TTFT_ORDER", "trainer_random")
-    if ttft_order not in {"trainer_random", "descending_nll"}:
+    if ttft_order not in {"trainer_random", "ascending_nll", "descending_nll"}:
         raise ValueError(
-            "ARC_TTFT_ORDER must be 'trainer_random' or 'descending_nll', "
+            "ARC_TTFT_ORDER must be 'trainer_random', 'ascending_nll', or "
+            "'descending_nll', "
             f"got {ttft_order!r}"
+        )
+    ttft_lr_scheduler_type = os.environ.get("ARC_TTFT_LR_SCHEDULER_TYPE", "cosine")
+    if ttft_lr_scheduler_type not in {"cosine", "constant_with_warmup"}:
+        raise ValueError(
+            "ARC_TTFT_LR_SCHEDULER_TYPE must be 'cosine' or "
+            f"'constant_with_warmup', got {ttft_lr_scheduler_type!r}"
         )
     ttft_ema_decay = float(os.environ.get("ARC_TTFT_EMA_DECAY", "0"))
     if not 0.0 <= ttft_ema_decay < 1.0:
@@ -116,6 +123,7 @@ def runtime_config():
         "eval_color_permutations": eval_color_permutations,
         "eval_batch_size": eval_batch_size,
         "train_batch_size": train_batch_size,
+        "ttft_lr_scheduler_type": ttft_lr_scheduler_type,
         "ttft_order": ttft_order,
         "ttft_ema_decay": ttft_ema_decay,
         "ttft_ema_start_step": ttft_ema_start_step,
@@ -290,6 +298,10 @@ def _descending_nll_order(nll_values):
     return sorted(range(len(nll_values)), key=lambda index: (-nll_values[index], index))
 
 
+def _ascending_nll_order(nll_values):
+    return sorted(range(len(nll_values)), key=lambda index: (nll_values[index], index))
+
+
 def _collator_model_features(dataset_row, tokenizer):
     feature_names = set(tokenizer.model_input_names)
     feature_names.add("labels")
@@ -300,7 +312,9 @@ def _collator_model_features(dataset_row, tokenizer):
     }
 
 
-def _rank_trainer_dataset_by_global_nll(model, trainer, train_rows, puzzle_key, output_dir):
+def _rank_trainer_dataset_by_global_nll(
+    model, trainer, train_rows, puzzle_key, output_dir, direction
+):
     if len(trainer.train_dataset) != len(train_rows):
         raise RuntimeError(
             f"Tokenized TTFT row count changed for {puzzle_key}: "
@@ -351,28 +365,42 @@ def _rank_trainer_dataset_by_global_nll(model, trainer, train_rows, puzzle_key, 
 
     if was_training:
         model.train()
-    order = _descending_nll_order(nll_values)
+    if direction == "ascending_nll":
+        order = _ascending_nll_order(nll_values)
+    elif direction == "descending_nll":
+        order = _descending_nll_order(nll_values)
+    else:
+        raise ValueError(f"Unsupported NLL ordering direction: {direction}")
     trainer.train_dataset = trainer.train_dataset.select(order)
     trainer._use_sequential_train_sampler = True
     sampler_indices = list(trainer._get_train_sampler(trainer.train_dataset))
     if sampler_indices != list(range(len(order))):
         raise RuntimeError(f"Sequential TTFT sampler verification failed for {puzzle_key}")
     ordered_nll = [nll_values[index] for index in order]
-    if any(left < right for left, right in zip(ordered_nll, ordered_nll[1:])):
-        raise RuntimeError(f"Descending-NLL order verification failed for {puzzle_key}")
+    if direction == "ascending_nll":
+        invalid_order = any(
+            left > right for left, right in zip(ordered_nll, ordered_nll[1:])
+        )
+    else:
+        invalid_order = any(
+            left < right for left, right in zip(ordered_nll, ordered_nll[1:])
+        )
+    if invalid_order:
+        raise RuntimeError(f"{direction} order verification failed for {puzzle_key}")
 
     rank_by_index = {original_index: rank for rank, original_index in enumerate(order)}
     for row in manifest_rows:
-        row["descending_nll_rank"] = rank_by_index[row["original_index"]]
-    manifest_rows.sort(key=lambda row: row["descending_nll_rank"])
+        row[f"{direction}_rank"] = rank_by_index[row["original_index"]]
+    manifest_rows.sort(key=lambda row: row[f"{direction}_rank"])
 
-    manifest_dir = f"{output_dir}_ttft_descending_nll"
+    manifest_dir = f"{output_dir}_ttft_{direction}"
     os.makedirs(manifest_dir, exist_ok=True)
     manifest_path = os.path.join(manifest_dir, f"{puzzle_key}.json")
     with open(manifest_path, "w", encoding="utf-8") as output_file:
         json.dump(
             {
                 "puzzle_key": puzzle_key,
+                "direction": direction,
                 "row_count": len(manifest_rows),
                 "scoring_seconds": time.perf_counter() - scoring_started_at,
                 "rows": manifest_rows,
@@ -920,7 +948,7 @@ def worker_sglang(rank, queue, end_time, config):
         learning_rate=5e-5,
         optim="adamw_torch",
         weight_decay=0.0,
-        lr_scheduler_type="cosine",
+        lr_scheduler_type=config["ttft_lr_scheduler_type"],
         seed=config["trainer_seed"],
         report_to="none",
         save_strategy="no",
@@ -1274,7 +1302,7 @@ def worker(rank, queue, end_time):
         learning_rate=5e-5,
         optim="adamw_torch",
         weight_decay=0.0,
-        lr_scheduler_type="cosine",
+        lr_scheduler_type=config["ttft_lr_scheduler_type"],
         seed=config["trainer_seed"],
         report_to="none",
         save_strategy="no",
@@ -1449,9 +1477,9 @@ def worker(rank, queue, end_time):
                 callbacks=callbacks,
             )
 
-            if config["ttft_order"] == "descending_nll":
+            if config["ttft_order"] in {"ascending_nll", "descending_nll"}:
                 if effective_ttft_method != "full_sft":
-                    raise ValueError("Descending-NLL TTFT ordering currently requires full_sft")
+                    raise ValueError("NLL TTFT ordering currently requires full_sft")
                 scoring_started_at = time.perf_counter()
                 manifest_path = _rank_trainer_dataset_by_global_nll(
                     model=model,
@@ -1459,11 +1487,12 @@ def worker(rank, queue, end_time):
                     train_rows=train_rows,
                     puzzle_key=key,
                     output_dir=dir_outputs,
+                    direction=config["ttft_order"],
                 )
                 scoring_elapsed = time.perf_counter() - scoring_started_at
                 timing_stats["nll_scoring_s"] += scoring_elapsed
                 training_started_at += scoring_elapsed
-                print(f"[Rank {rank}] descending-NLL order saved to {manifest_path}")
+                print(f"[Rank {rank}] {config['ttft_order']} saved to {manifest_path}")
 
             stats = trainer.train()
             if ema_callback is not None:
