@@ -85,7 +85,6 @@ required_files = [
     "arc_solver.py",
     "arc_rescoring.py",
     "analyze_qwen_trm_mean_nll.py",
-    "qwen_trm_validation48_fixed_candidates.zip",
 ]
 for name in required_files:
     assert Path(WORK_CODE_DIR, name).is_file(), f"arc2026 is stale: missing {name}"
@@ -97,11 +96,10 @@ assert "--fixed-candidate-mean-nll" in starter_source
 assert "fixed_candidate_mean_nll" in solver_source
 assert "normalize_by_answer_tokens" in rescoring_source
 
+candidate_source_dir = Path(WORK_CODE_DIR, "qwen_trm_validation48_fixed_candidates")
+assert candidate_source_dir.is_dir(), "arc2026 is stale: missing expanded candidate directory"
 shutil.rmtree(FIXED_CANDIDATE_DIR, ignore_errors=True)
-shutil.unpack_archive(
-    Path(WORK_CODE_DIR, "qwen_trm_validation48_fixed_candidates.zip"),
-    FIXED_CANDIDATE_DIR,
-)
+shutil.copytree(candidate_source_dir, FIXED_CANDIDATE_DIR)
 assert len(list(Path(FIXED_CANDIDATE_DIR).iterdir())) == 1581
 print("fixed candidate pool ready:", FIXED_CANDIDATE_DIR)
 '''
