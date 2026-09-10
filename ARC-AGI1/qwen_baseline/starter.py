@@ -167,6 +167,7 @@ if __name__ == "__main__":
         default="full_sft",
     )
     parser.add_argument("--fixed-candidate-dir", type=str, default=None)
+    parser.add_argument("--fixed-candidate-mean-nll", action="store_true")
     parser.add_argument("--selected-augmentations-path", type=str, default=None)
     parser.add_argument("--opsd-log-dir", type=str, default="../opsd_logs")
     parser.add_argument("--opsd-min-train-pairs", type=int, default=3)
@@ -278,6 +279,9 @@ if __name__ == "__main__":
         os.environ["ARC_FIXED_CANDIDATE_DIR"] = args.fixed_candidate_dir
     else:
         os.environ.pop("ARC_FIXED_CANDIDATE_DIR", None)
+    os.environ["ARC_FIXED_CANDIDATE_MEAN_NLL"] = str(
+        args.fixed_candidate_mean_nll
+    )
     if args.selected_augmentations_path is not None:
         os.environ["ARC_SELECTED_AUGMENTATIONS_PATH"] = args.selected_augmentations_path
     else:
@@ -337,6 +341,7 @@ if __name__ == "__main__":
         f"output_dir={os.environ['ARC_OUTPUT_DIR']}",
         f"ttft_method={os.environ['ARC_TTFT_METHOD']}",
         f"fixed_candidate_dir={os.environ.get('ARC_FIXED_CANDIDATE_DIR')}",
+        f"fixed_candidate_mean_nll={os.environ['ARC_FIXED_CANDIDATE_MEAN_NLL']}",
         f"selected_augmentations_path={os.environ.get('ARC_SELECTED_AUGMENTATIONS_PATH')}",
         f"opsd_log_dir={os.environ['ARC_OPSD_LOG_DIR']}",
         f"opsd_min_train_pairs={os.environ['ARC_OPSD_MIN_TRAIN_PAIRS']}",

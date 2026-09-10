@@ -177,6 +177,9 @@ def runtime_config():
             os.environ.get("ARC_REPAIR_TTFT_WARM_VIEWS_PER_PAIR", "8")
         ),
         "fixed_candidate_dir": os.environ.get("ARC_FIXED_CANDIDATE_DIR"),
+        "fixed_candidate_mean_nll": _env_flag(
+            "ARC_FIXED_CANDIDATE_MEAN_NLL", default=False
+        ),
         "selected_augmentations_path": os.environ.get("ARC_SELECTED_AUGMENTATIONS_PATH"),
     }
 
@@ -628,6 +631,7 @@ def _rescore_fixed_candidate_pool(
     max_new_tokens: int,
     timing_stats,
     count_stats,
+    normalize_by_answer_tokens: bool = False,
 ):
     if not os.path.isdir(candidate_dir):
         raise FileNotFoundError(f"Fixed candidate directory does not exist: {candidate_dir}")
@@ -657,6 +661,7 @@ def _rescore_fixed_candidate_pool(
                 max_seq_length=max_seq_length,
                 max_new_tokens=max_new_tokens,
                 seed=stable_seed_from_key(base_key),
+                normalize_by_answer_tokens=normalize_by_answer_tokens,
             )
             timing_stats["rescorer_init_s"] += time.perf_counter() - started_at
             count_stats["rescorers_created"] += 1
@@ -1760,6 +1765,7 @@ def worker(rank, queue, end_time):
                     max_new_tokens=max_new_tokens,
                     timing_stats=timing_stats,
                     count_stats=count_stats,
+                    normalize_by_answer_tokens=config["fixed_candidate_mean_nll"],
                 )
             # Phase 1 deliberately freezes the candidate pool; do not run DFS.
             batches = []

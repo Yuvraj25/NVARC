@@ -8,7 +8,7 @@ from arc_search import PAD_ID
 
 
 @torch.no_grad()
-def calc_scores(queries, answers, tokenizer, model):
+def calc_scores(queries, answers, tokenizer, model, normalize_by_answer_tokens=False):
     batch_query_tokens = []
     batch_answer_tokens = []
     batch_tokens = []
@@ -33,7 +33,10 @@ def calc_scores(queries, answers, tokenizer, model):
         query_length = len(query_tokens)
         answer_logits = logits[query_length - 1 : query_length - 1 + len(answer_tokens)]
         answer_score = answer_logits[torch.arange(len(answer_tokens)), answer_tokens].sum()
-        result.append(-answer_score.item())
+        score = -answer_score.item()
+        if normalize_by_answer_tokens:
+            score /= len(answer_tokens)
+        result.append(score)
     return result
 
 
@@ -44,7 +47,7 @@ class FullPassEntry:
 
 
 class BaseRescorer:
-    def __init__(self, model, tokenizer, formatter: QwenFormatter, puzzle_ds_multi: ArcDataset, base_key: str, max_seq_length: int, max_new_tokens: int, seed: int):
+    def __init__(self, model, tokenizer, formatter: QwenFormatter, puzzle_ds_multi: ArcDataset, base_key: str, max_seq_length: int, max_new_tokens: int, seed: int, normalize_by_answer_tokens: bool = False):
         self.model = model
         self.tokenizer = tokenizer
         self.formatter = formatter
@@ -53,6 +56,7 @@ class BaseRescorer:
         self.max_seq_length = max_seq_length
         self.max_new_tokens = max_new_tokens
         self.seed = seed
+        self.normalize_by_answer_tokens = normalize_by_answer_tokens
         self.stats = {
             "score_calls": 0,
             "score_time_s": 0.0,
@@ -119,7 +123,15 @@ class FullPassRescorer(BaseRescorer):
             answers.append(self.formatter.fmt_reply([augmented_solution]))
         scores = []
         for offset in range(0, len(queries), 4):
-            scores.extend(calc_scores(queries[offset : offset + 4], answers[offset : offset + 4], tokenizer=self.tokenizer, model=self.model))
+            scores.extend(
+                calc_scores(
+                    queries[offset : offset + 4],
+                    answers[offset : offset + 4],
+                    tokenizer=self.tokenizer,
+                    model=self.model,
+                    normalize_by_answer_tokens=self.normalize_by_answer_tokens,
+                )
+            )
         elapsed = time.perf_counter() - started_at
         self.stats["score_calls"] += 1
         self.stats["score_time_s"] += elapsed
