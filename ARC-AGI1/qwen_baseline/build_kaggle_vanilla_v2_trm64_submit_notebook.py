@@ -1,3 +1,4 @@
+import ast
 import hashlib
 import json
 from pathlib import Path
@@ -16,6 +17,7 @@ METADATA_TEMPLATE = Path(
 OUTPUT_METADATA = Path(
     "/Users/banna/kaggle/temp/kaggle_vanilla_v2_trm64_submit/kernel-metadata.json"
 )
+SMOKE_DIR = Path("/Users/banna/kaggle/temp/kaggle_vanilla_v2_trm64_phase_smoke")
 EXPECTED_SOURCE_CELLS_SHA256 = "80753fa51e47f214d8272a2ec6293c6f1199b41d178ff654adc967367f756991"
 
 
@@ -42,6 +44,16 @@ def conditional_source(source):
     return "if RUN_INFERENCE:\n" + "\n".join(
         f"    {line}" if line else "" for line in source.splitlines()
     ) + "\n"
+
+
+def validate_code_cells(notebook):
+    for index, cell in enumerate(notebook["cells"]):
+        if cell["cell_type"] != "code":
+            continue
+        try:
+            ast.parse(cell["source"])
+        except SyntaxError as exc:
+            raise RuntimeError(f"Generated notebook cell {index} is invalid") from exc
 
 
 def main():
@@ -120,26 +132,47 @@ shutil.rmtree(TRM_WORK, ignore_errors=True)
 TRM_WORK.mkdir(parents=True)
 os.chdir(TRM_WORK)
 
-TRM_ROOT = Path("/kaggle/input/trm-code/20251211_trm_handover/TinyRecursiveModels")
+TRM_ROOT = Path(
+    "/kaggle/input/datasets/chanhainguyen/trm-code/"
+    "20251211_trm_handover/TinyRecursiveModels"
+)
 assert TRM_ROOT.is_dir(), TRM_ROOT
 observed_trm_hash = hashlib.sha256(
     (TRM_ROOT / "models/recursive_reasoning/trm.py").read_bytes()
 ).hexdigest()
 assert observed_trm_hash == "3454818b64a1abb45c062782d380aa4bb560e2cb35db9cc309cf367ca3ac262c"
-for name in ["models", "puzzle_dataset.py", "dataset", "utils", "evaluators", "assets", "config", "kaggle"]:
+for name in ["models", "utils", "assets", "config", "kaggle"]:
     os.symlink(TRM_ROOT / name, name)
+shutil.copy2(TRM_ROOT / "puzzle_dataset.py", "puzzle_dataset.py")
+puzzle_dataset = Path("puzzle_dataset.py")
+puzzle_dataset.write_text(
+    puzzle_dataset.read_text().replace("from argdantic import ArgParser\\n", "")
+)
+shutil.copytree(TRM_ROOT / "dataset", "dataset")
+dataset_builder = Path("dataset/build_arc_dataset.py")
+dataset_source = dataset_builder.read_text()
+dataset_source = dataset_source.replace("from argdantic import ArgParser\\n", "")
+dataset_source = dataset_source.replace("\\ncli = ArgParser()\\n", "")
+dataset_source = dataset_source[:dataset_source.index("\\n@cli.command(singleton=True)")]
+dataset_builder.write_text(dataset_source)
+shutil.copytree(TRM_ROOT / "evaluators", "evaluators")
+arc_evaluator = Path("evaluators/arc.py")
+arc_evaluator_source = arc_evaluator.read_text()
+arc_evaluator_source = arc_evaluator_source.replace("from numba import njit\\n", "")
+arc_evaluator_source = arc_evaluator_source.replace("@njit\\n", "")
+arc_evaluator.write_text(arc_evaluator_source)
 
 data_dir = Path("data1")
 data_dir.mkdir()
 shutil.copy2(TEST_PATH, data_dir / "arc-agi_test_challenges.json")
-subprocess.run([
-    sys.executable, "-m", "dataset.build_arc_dataset",
-    "--input-file-prefix", "./data1/arc-agi",
-    "--output-dir", "data1/arc2test-aug-64",
-    "--subsets", "test",
-    "--test-set-name", "test",
-    "--num-aug", str(TRM_AUGMENTATIONS),
-], check=True)
+from dataset.build_arc_dataset import DataProcessConfig, convert_dataset
+convert_dataset(DataProcessConfig(
+    input_file_prefix="./data1/arc-agi",
+    output_dir="data1/arc2test-aug-64",
+    subsets=["test"],
+    test_set_name="test",
+    num_aug=TRM_AUGMENTATIONS,
+))
 print("TRM dataset ready; elapsed_hours =", (time.time() - NOTEBOOK_START_TIME) / 3600)
 """)))
 
@@ -147,6 +180,16 @@ print("TRM dataset ready; elapsed_hours =", (time.time() - NOTEBOOK_START_TIME) 
     assert eval_source.startswith("%%writefile eval-arc.py\n")
     eval_source = eval_source.removeprefix("%%writefile eval-arc.py\n")
     eval_source = eval_source.replace("import copy\n", "import copy\nimport time\n", 1)
+    evaluator_setup = """    try:
+        evaluators = create_evaluators(config, eval_metadata)
+    except:
+        print("No evaluator found")
+        evaluators = []
+"""
+    evaluator_setup_strict = """    evaluators = create_evaluators(config, eval_metadata)
+"""
+    assert evaluator_setup in eval_source
+    eval_source = eval_source.replace(evaluator_setup, evaluator_setup_strict, 1)
     marker = """            if config.ema:
                 ema_helper.update(train_state.model)
 """
@@ -182,12 +225,12 @@ cmd = [
     "arch=trm", "data_paths=[./data1/arc2test-aug-64]",
     "arch.L_layers=2", "arch.H_cycles=4", "arch.L_cycles=4",
     "arch.halt_max_steps=10", "freeze_weights=False",
-    "+load_checkpoint=/kaggle/input/arc-prize-trm-031/step_220708",
+    "+load_checkpoint=/kaggle/input/datasets/cpmpml/arc-prize-trm-031/step_220708",
     "+checkpoint_path=./eval_checkpoint", "eval_interval=4000", "epochs=4000",
     "global_batch_size=128", "ema=True", "lr_warmup_steps=200", "lr=0.0001",
 ]
 print("TRM seconds available for setup/training =", max(0, trm_deadline - time.time()))
-result = subprocess.run(cmd, env=env, check=False)
+result = subprocess.run(cmd, env=env, check=True)
 print("TRM returncode =", result.returncode)
 """)))
 
@@ -210,7 +253,8 @@ if not RUN_INFERENCE:
 else:
     qwen_submission = json.loads(QWEN_SUBMISSION_PATH.read_text())
     submission_files = sorted(Path("eval_checkpoint").glob("evaluator_*/submission.json"))
-    trm_submission = json.loads(submission_files[-1].read_text()) if submission_files else {}
+    assert len(submission_files) == 1, submission_files
+    trm_submission = json.loads(submission_files[0].read_text())
 
     trm_used = 0
     fallback_used = 0
@@ -241,12 +285,13 @@ print("submission_path =", FINAL_SUBMISSION_PATH)
         if cell["cell_type"] == "code":
             cell["outputs"] = []
             cell["execution_count"] = None
+    validate_code_cells(notebook)
     notebook_payload = json.dumps(notebook, indent=1) + "\n"
     OUTPUT_NOTEBOOK.write_text(notebook_payload)
 
     metadata = json.loads(METADATA_TEMPLATE.read_text())
     metadata.update({
-        "id": "yuvraj/arc26-vanilla-v2-q9-24-trm64-submit",
+        "id": "yuvraj/arc26-vanilla-v2-b6-q9-24-plus-trm64",
         "title": "ARC26 Vanilla V2 b6 q9 24 plus TRM64",
         "code_file": OUTPUT_NOTEBOOK.name,
         "dataset_sources": [
@@ -258,8 +303,49 @@ print("submission_path =", FINAL_SUBMISSION_PATH)
     OUTPUT_METADATA.parent.mkdir(parents=True, exist_ok=True)
     (OUTPUT_METADATA.parent / OUTPUT_NOTEBOOK.name).write_text(notebook_payload)
     OUTPUT_METADATA.write_text(json.dumps(metadata, indent=2) + "\n")
+
+    smoke = json.loads(notebook_payload)
+    smoke["cells"][0]["source"] = "# TRM64 post-Qwen phase smoke\n"
+    smoke["cells"][1]["source"] = smoke["cells"][1]["source"].replace(
+        "TRM_TRAIN_STOP_HOURS = 11 + 25 / 60",
+        "TRM_TRAIN_STOP_HOURS = 0.03",
+    )
+    smoke["cells"].insert(5, code_cell("""import json
+from pathlib import Path
+
+source = Path(TEST_PATH)
+all_tasks = json.loads(source.read_text())
+smoke_key = sorted(all_tasks)[0]
+smoke_path = Path("/kaggle/working/trm64_smoke_challenges.json")
+smoke_path.write_text(json.dumps({smoke_key: all_tasks[smoke_key]}))
+TEST_PATH = str(smoke_path)
+RUN_INFERENCE = True
+print("TRM64 smoke task =", smoke_key)
+"""))
+    smoke["cells"][9]["source"] = smoke["cells"][9]["source"].replace(
+        "if RUN_INFERENCE:", "if False:", 1
+    )
+    for cell in smoke["cells"]:
+        if cell["cell_type"] == "code":
+            cell["outputs"] = []
+            cell["execution_count"] = None
+    validate_code_cells(smoke)
+
+    smoke_name = "arc26-trm64-post-qwen-phase-smoke.ipynb"
+    smoke_metadata = dict(metadata)
+    smoke_metadata.update({
+        "id": "yuvraj/arc26-trm64-post-qwen-phase-smoke",
+        "title": "ARC26 TRM64 post Qwen phase smoke",
+        "code_file": smoke_name,
+    })
+    SMOKE_DIR.mkdir(parents=True, exist_ok=True)
+    (SMOKE_DIR / smoke_name).write_text(json.dumps(smoke, indent=1) + "\n")
+    (SMOKE_DIR / "kernel-metadata.json").write_text(
+        json.dumps(smoke_metadata, indent=2) + "\n"
+    )
     print(OUTPUT_NOTEBOOK)
     print(OUTPUT_METADATA)
+    print(SMOKE_DIR)
 
 
 if __name__ == "__main__":
